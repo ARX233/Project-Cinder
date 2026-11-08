@@ -38,6 +38,12 @@ public final class DataManifest {
         files=Collections.unmodifiableSortedMap(new TreeMap<String,Entry>(f));
     }
     public SortedMap<String,Entry> files() { return files; }
+    /** Rebind a trusted inventory to one checked installation name; file ownership
+     * and the archive identity are unchanged. This does not verify disk contents. */
+    public DataManifest rebindDirectory(String directory) throws IOException {
+        identity(directory,canonicalId);
+        return new DataManifest(zipSha256,directory,canonicalId,files);
+    }
     public Entry find(String relativePath) throws IOException { path(relativePath, false); return files.get(relativePath); }
     private static IOException bad(String message) { return new IOException(message); }
     private static MessageDigest sha() { try { return MessageDigest.getInstance("SHA-256"); } catch (NoSuchAlgorithmException e) { throw new AssertionError(e); } }
@@ -124,7 +130,13 @@ public final class DataManifest {
     }
     /** Strictly read a complete canonical private manifest, under the external lock. */
     public static DataManifest read(Path file, Limits limits) throws IOException {
-        byte[] bytes; try(InputStream in=Files.newInputStream(file,LinkOption.NOFOLLOW_LINKS)) { bytes=bounded(in,limits.maxManifestBytes); }
+        try(InputStream in=Files.newInputStream(file,LinkOption.NOFOLLOW_LINKS)) { return read(in,limits); }
+    }
+    /** Read a bounded complete inventory, e.g. from a signed APK catalog entry.
+     * The caller owns the stream. The checksum detects damage, not authenticity. */
+    public static DataManifest read(InputStream input, Limits limits) throws IOException {
+        if(input==null) throw bad("null manifest stream");
+        byte[] bytes=bounded(input,limits.maxManifestBytes);
         if(bytes.length<40) throw bad("incomplete manifest"); byte[] body=Arrays.copyOf(bytes,bytes.length-32);
         if(!MessageDigest.isEqual(sha().digest(body),Arrays.copyOfRange(bytes,bytes.length-32,bytes.length))) throw bad("manifest checksum");
         DataInputStream in=new DataInputStream(new ByteArrayInputStream(body)); if(in.readInt()!=MAGIC || in.readInt()!=VERSION) throw bad("unknown manifest version");

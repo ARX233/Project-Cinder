@@ -68,7 +68,9 @@ def encode(p):
         lo, hi = col.min(axis=0), col.max(axis=0)
         if (hi - lo).max() <= 6:
             c = tuple(int(round(v)) for v in (lo + hi) / 2)
-            return 1, c, al.round().clip(0, 255).astype(np.uint8).tobytes()
+            # Android's NumPy can read past the buffer when rounding strided alpha.
+            alpha = np.ascontiguousarray(al)
+            return 1, c, alpha.round().clip(0, 255).astype(np.uint8).tobytes()
     return 0, (0, 0, 0), p.round().clip(0, 255).astype(np.uint8).tobytes()
 
 

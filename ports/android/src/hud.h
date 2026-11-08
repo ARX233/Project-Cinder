@@ -17,8 +17,9 @@ typedef struct {
   float steer_v, wheel_turn, wheel_last, stick_x0, stick_y0, stick_x, stick_y;
   void *throttle_touch, *brake_touch;
   int shift_up, shift_down; /* pending presses, consumed by hud_input */
-  int camera_pressed, reset_pressed, trans_pressed;
+  int camera_pressed, reset_pressed;
   int pause_pressed; /* the pause button (only it: a tap in the middle paused by mistake) */
+  int pause_disabled; /* online VS */
   float screen_w, screen_h;
   /* the gyro steering (the OPTION screen's): the iPad turned like a wheel steers, the steer
    * buttons go, the brake takes their place and the shift buttons the brake's. tilt: the
@@ -29,6 +30,7 @@ typedef struct {
    * (the key's foot 0, its top and above 1); the pedals' last travels */
   int slide;
   float throttle_v, brake_v;
+  int passing_available, passing_pressed; /* VS intrusion switch */
 } hud_state;
 
 void hud_init(hud_state *h, float screen_w, float screen_h);
@@ -98,6 +100,10 @@ void hud_time_extend(float total);
 int hud_sign_blinks(int sign);
 /* The course's RECORD TIME and the player's own (YOUR RECORD), in s; 0 shows dashes. */
 void hud_set_records(float record, float yours);
+/* The same personal-best run's cumulative checkpoint times, starting at zero. */
+void hud_set_record_splits(int count, const float *at);
+/* Returns 1 on a new intermediate TA checkpoint and opens the extend banner. */
+int hud_ta_checkpoint(const car_race *race);
 /* A story race: the time attack's records and course name are left out. */
 void hud_set_story(int story);
 /* A story race's rivals by slot: ECharacter, box visibility, select, original
@@ -119,6 +125,10 @@ typedef struct {
   int title, plate, hp, grade, power, handling, steps, seat;
 } hud_vs_box;
 void hud_set_vs(const hud_vs_box *box, int n);
+/* The original Target console uses the same card art as a VS box, but
+ * receives one frozen rival profile and a separate native signed gap. */
+void hud_set_ghost_card(const hud_vs_box *box, int crown_area); /* -1 for an ordinary ghost */
+void hud_set_ghost_gap(float gap_mm);
 /* The 10-in-a-row rivals' lines (Cut::clCutIn): `frames` arcade frames of them, from the
  * race's cut-in info (car_race cut_*); hud_draw draws them. */
 void hud_ten_cutin(const car_race *r, int frames);
@@ -154,9 +164,12 @@ void hud_fade(const hud_state *h, float grey, float alpha);
 void hud_rival_view(const float view[16], const float proj[16]);
 /* -1: hidden/unknown; otherwise leader's remaining metres (0..600).
  * story_excluded marks original non-ranking story slots; trailing receives
- * whether a competing opponent leads; ties count as not trailing. */
+ * whether a competing opponent leads; ties count as not trailing.
+ * ghost_gap_mm is NULL outside Ghost Battle. */
 int hud_finish_result(const car_race *r, int story, int count, unsigned story_excluded,
-                      int ten, int versus, int *trailing);
+                      int ten, int versus, const float *ghost_gap_mm, int *trailing);
+/* One fixed 60 Hz visual tick; draw entry points do not advance these clocks. */
+void hud_visual_tick(const car_state *car);
 void hud_draw(const hud_state *h, const car_state *car, const car_input *in, float fps);
 
 /* Race console transforms in 1024x768 layout points; identity is (1,0,0). */
@@ -171,10 +184,13 @@ void hud_race_layout_clamp(int group, float k, float *dx, float *dy);
 void hud_draw_race_layout(float screen_w, float screen_h, int sel);
 
 enum { HUD_KEYS_TOP, HUD_KEYS_LEFT, HUD_KEYS_RIGHT, HUD_KEY_GROUPS };
-enum { HUD_EDIT_SHIFT = 3 };
+enum { HUD_EDIT_SHIFT = HUD_KEY_GROUPS, HUD_EDIT_SHIFT_UP, HUD_EDIT_SHIFT_DOWN,
+       HUD_EDIT_PAUSE, HUD_EDIT_CAMERA, HUD_EDIT_GROUPS };
 void hud_set_stick_deadzone_percent(int percent);
 /* Separate transform is absolute, anchored like the right keys; disabled inherits them. */
 void hud_shift_layout_set(int separate, float k, float dx, float dy);
+void hud_button_layout_set(int group, int separate, float k, float dx, float dy);
+void hud_set_button_opacity_percent(int percent);
 #define HUD_KEY_K_MIN 0.6f
 #define HUD_KEY_K_MAX 1.6f
 void hud_layout_set(int group, float k, float dx, float dy);

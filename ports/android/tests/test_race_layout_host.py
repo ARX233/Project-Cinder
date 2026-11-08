@@ -108,7 +108,7 @@ prefix = prefix.replace('enum { HUD_RACE_MAP,HUD_RACE_RANK,HUD_RACE_TIME,HUD_RAC
 body='\n'.join(fn(n) for n in names)
 # Guard ownership and ordering in the actual interleaved rendering paths.
 assert 'race_rank_anm' not in fn('draw_info_box')
-assert 'race_rank_anm' not in fn('draw_vs_box')
+assert 'race_rank_anm' not in fn('draw_rival_card')
 assert 'race_rank_anm' in fn('draw_vs_place')
 ten = fn('draw_ten')
 assert ten.index('race_rank_anm') < ten.index('anm_draw_xf(men') < ten.index('race_time_anm') < ten.index('anm_draw_xf(split') < ten.index('draw_rival_info')

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -37,13 +38,22 @@
 #include "storymovie.h"
 #include "storyinfo.h"
 #include "gl.h"
+#ifdef WMMT_NATIVE_VK
+#include "native_vk.h"
+#endif
 #include "hud.h"
 #ifdef __ANDROID__
 #include "stick_center_store.h"
 #include "junction_ui.h"
 #include "junction_barrier.h"
 #include "tire_track.h"
+#include "tire_smoke_asset.h"
+#include "render_ghost_paint.h"
+#include "ghost_catalog.h"
+#include "tail_trail_scene.h"
 #include "junction_table_private.h" /* derived privately from the verified arcade ELF */
+/* Game-thread notification; the Android player applies it on the UI thread. */
+void android_story_bgm_pause(void);
 #endif
 #include "lights.h"
 #include "spark.h"
@@ -57,11 +67,30 @@
 #include "gk.h"
 #include "net.h"
 #include "vs_host.h"
+#ifdef __ANDROID__
+#include <math.h>
+#endif
 #include "render.h"
+#include "ghost_paint.h"
+#include "app_ghost_paint.h"
+#include "player_body_paint.h"
+#include "player_paint_resource.h"
 /* Implemented by the renderer; independent of the original HQ switches. */
 void render_enhance(int on);
 #include "sound.h"
 #include "title.h"
+#include "timing60.h"
+#include "presentation60.h"
+
+/* Legacy app_frame still draws; app_present runs its fixed logic without draws. */
+static int app_tick_only;
+static car_input app_display_input;
+static timing60_sim app_clock;
+static car_state app_previous, app_display_car;
+static int app_history_valid;
+static float app_display_dt;
+static void app_draw_frame(float dt, const car_input *input, int steps, double physics_ms, const car_state *c);
+static void menu_present(double frame_start);
 
 #define MAX_ARROWS 128
 
@@ -187,6 +216,14 @@ typedef struct {
 } vs_dress_t;
 enum { WHEEL_FREE, WHEEL_READY, WHEEL_UP, WHEEL_WARM, WHEEL_MISSING };
 
+/* Frozen APP race presentation/config, never a transport compatibility alias. */
+typedef struct {
+  vs4_nonce incarnation;
+  uint64_t membership, term, round, config;
+  uint32_t seed;
+  int ramp, zone, km, song, n, pcb;
+  net_player player[NET_PLAYERS]; /* immutable baseline P/H remain in each member */
+} app_vs_round;
 static struct {
   wpk_scene track; /* the map of track_city and track_zone */
   int track_city, track_zone;
@@ -282,7 +319,7 @@ static struct {
   int gov_frames, gov_slow, gov_level, gov_floor, gov_since_up;
   double present_ms; /* the last frame's wait in presentRenderbuffer (app_frame_done) */
   double seg[8];     /* the race frame's render, by part (perf_frame) */
-  int race_frames; /* frames since the race started */
+  int race_frames; /* presented race frames: GPU warm-up/reflection/perf only, never RC time */
   /* the overhead reflection (render_overhead, not the arcade's): off for a test
    * (WMMT_NO_OVERHEAD); this frame's map drawn for the player's car, its batches and ms */
   int no_over, over_drawn, over_draws, over_tris;
@@ -307,6 +344,7 @@ static struct {
   int ten_white;    /* frames since the 10-in-a-row's white went up (0: none) */
   int sign, sign_t; /* the route sign over the car, and frames to its next sound */
   int best_ms[CAR_COURSES]; /* the player's best time on each course (data_dir/records), 0 = none */
+  struct { int count; float at[CAR_SECTIONS + 1]; } best_splits[CAR_COURSES];
   /* the machine's best time of each car type (model pack) on each course, from data_dir/records */
   struct { int course, pack, ms; } car_best[CAR_BEST_MAX];
   int n_car_best;
@@ -338,7 +376,7 @@ static struct {
   car_rival race_rv[CAR_RIVALS];
   int race_nrv, race_course;
   wpk_scene *movie_model[CAR_RIVALS];
-  int movie_paint[CAR_RIVALS];
+  int movie_paint[CAR_RIVALS], movie_pack[CAR_RIVALS];
   wpk_scene *rival_model[CAR_RIVALS];
   /* the 10-in-a-row's rivals in order (its one rival on the road changes each round): their
    * car models and paints */
@@ -348,19 +386,39 @@ static struct {
    * the host started (net_take_go), and the other cars in the race on the road (0: no versus;
    * they are rivals 0.. in PCB order) */
   uint32_t vs_id;
-  double vs_asked, vs_abort_note_until, vs_wait_note_until;
+  double vs_asked, vs_abort_note_until, vs_wait_note_until, vs_no_go_note_until;
   /* the area vote, as its host: when it opened, when the result was out; the time zone vote's
   * the same and when the race was asked for */
   double vs_area_at, vs_final_at;
   double vs_day_at, vs_day_final_at, vs_day_started;
   /* the race loaded: frames waited for the others', the machines (by PCB) seen loaded */
   int vs_wait, vs_seen_loaded;
-  int vs_gk; /* the Bluetooth session: VS_GK_OFF .. VS_GK_HOST */
-  net_go vs_go;
+  app_vs_round vs_go;
   int vs_race;
   int vs_song;      /* the host's: its song for everyone's race */
   int vs_closed;    /* a race's frames since the host closed the game (or went quiet): its notice */
 } G;
+/* Fifth-mode hooks are implemented in app_ghost.inc after the load/VS helpers. */
+static int app_ghost_mode(void);
+static int app_ghost_rival_pack(int *paint);
+static int app_ghost_arcade_dressed(void);
+static void app_ghost_arcade_apply_dress(vs_dress_t *out);
+static void app_ghost_context_reset(void);
+static int app_ghost_arcade_aero(int *pack,int *set);
+static void app_arcade_paint_drop(int context_lost);
+#include "app_story_body_runtime.inc"
+
+static void app_body_drop(int context_lost);
+static void app_body_evict_pack(int pack);
+static void app_body_evict_scene(wpk_scene *scene);
+static void app_body_reset(int context_lost);
+static player_body_paint_identity app_body_identity(const menu_body_color_view *v);
+static int app_body_prepare(player_body_paint_cache *cache,const menu_body_color_view *v,wpk_scene *scene);
+static int app_body_menu_prepare(const menu_scene *shown);
+static int app_body_start_ready(void);
+static int app_body_race_prepare(void);
+static int app_body_menu_apply(const menu_car *car,wpk_scene *scene,app_player_paint_scope *scope);
+static int app_body_race_apply(wpk_scene *scene,app_player_paint_scope *scope);
 #ifdef __ANDROID__
 static junction_ui race_junction_ui;
 static junction_barrier race_junction_barrier;
@@ -531,6 +589,7 @@ static wpk_scene backfire_scene;
 static int backfire_ready;
 static char backfire_body[BFX_MAX_CARS][BFX_NAME];
 
+static wpk_scene *menu_aero(int pack, int set);
 static void backfire_reset(void) {
   bfx_reset(&backfire_play);
   memset(backfire_body, 0, sizeof backfire_body);
@@ -546,6 +605,7 @@ static int backfire_child(const char *root, const char *path) {
   return !strncmp(r, p, n) && p[n] == '/' && p[n+1];
 }
 #ifdef __ANDROID__
+#include "app_tire_smoke.inc"
 /* clTireTrackManager is created for the player's car only. Its texture is a
  * separately packed copy of the original tirepattern.tga; failure simply
  * disables this optional effect, never the race. */
@@ -553,9 +613,19 @@ static TireTrack player_tracks;
 static wpk_scene track_scene;
 static uint32_t track_texture;
 
-static void player_tracks_reset(void) { tire_track_enable(&player_tracks, 1); }
+static TailTrailScene race_tail_trails;
+static struct {vs4_nonce incarnation;uint64_t round,config,membership,term;int camera;} race_tail_scope;
+static void race_tail_reset(void) {
+  tail_trail_scene_reset(&race_tail_trails);
+  memset(&race_tail_scope,0,sizeof race_tail_scope);
+}
+static void player_tracks_reset(void) {
+  tire_track_enable(&player_tracks, 1);
+  player_smoke_reset();
+  race_tail_reset(); /* all fresh race/movie starts also drop the previous history */
+}
 
-#ifdef WMMT_VK
+#if defined(WMMT_VK) && !defined(WMMT_NATIVE_VK)
 extern int vkgl_error_pending(void);
 extern uint64_t vkgl_error_epoch(void);
 #endif
@@ -584,10 +654,15 @@ static void player_tracks_open(const char *data_dir) {
     return;
   }
 #ifdef WMMT_VK
-  /* Do not consume an earlier sticky error. Any observed adapter error during
-   * this upload disables the effect; completion on the GPU remains unknown. */
+  /* Do not consume an earlier error. Any new rejection during the upload
+   * disables the effect; this CPU check does not certify GPU completion. */
+#ifdef WMMT_NATIVE_VK
+  uint64_t epoch = cinder_vk_error_epoch();
+  if (epoch == UINT64_MAX || cinder_vk_error_pending()) {
+#else
   uint64_t epoch = vkgl_error_epoch();
   if (epoch == UINT64_MAX || vkgl_error_pending()) {
+#endif
     fprintf(stderr, "tire tracks: Vulkan adapter already in error; effect disabled\n");
     return;
   }
@@ -599,7 +674,9 @@ static void player_tracks_open(const char *data_dir) {
   }
   if (track_scene.n_tex != 1 || !track_scene.textures || !track_scene.loaded ||
       !track_scene.textures[0] || track_scene.loaded[0] != track_scene.textures[0]
-#ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+      || cinder_vk_error_pending() || cinder_vk_error_epoch() != epoch
+#elif defined(WMMT_VK)
       || vkgl_error_pending() || vkgl_error_epoch() != epoch
 #endif
       ) {
@@ -667,35 +744,98 @@ static void player_tracks_draw(const mat4 *vp, render_params *rp) {
     render_tire_tracks(vp, vertices, n, track_texture, rp);
   }
 }
+
+/* clRaceThread::init turns off this display effect for a four-car Link race. */
+static int race_tail_active(int movie) {
+  if (movie || G.in_menu || G.paused || G.menu.finish || G.vs_closed || G.vs_wait ||
+      G.car.race.over || G.car.race.state != CAR_RACE_RUN || G.car.race.play_state != 2) return 0;
+  if (!G.vs_race) return 1;
+  return G.vs_go.round && G.vs_go.n >= 2 && G.vs_go.n <= NET_PLAYERS && G.vs_go.n != 4 &&
+         G.vs_go.pcb >= 0 && G.vs_go.pcb < G.vs_go.n && G.vs_id &&
+         G.vs_go.player[G.vs_go.pcb].id == G.vs_id;
+}
+static const char *race_tail_pack(int pack) {
+  return pack >= 0 && pack < CARDB_NPACKS ? CARDB_PACKS[pack] : NULL;
+}
+static void race_tail_tick(int movie) {
+  if (!race_tail_active(movie)) { race_tail_reset(); return; }
+  /* Original resets all histories when PLAY_VIEW changes. A new Link round
+   * also invalidates every slot even if the same members or cars come back. */
+  int new_link_round = G.vs_race &&
+      (race_tail_scope.round != G.vs_go.round || race_tail_scope.config != G.vs_go.config ||
+       race_tail_scope.membership != G.vs_go.membership || race_tail_scope.term != G.vs_go.term ||
+       memcmp(race_tail_scope.incarnation.b, G.vs_go.incarnation.b, sizeof G.vs_go.incarnation.b));
+  if (race_tail_scope.camera != G.camera || new_link_round) {
+    race_tail_reset();
+    race_tail_scope.camera = G.camera;
+    if (G.vs_race) {
+      race_tail_scope.incarnation = G.vs_go.incarnation;
+      race_tail_scope.round = G.vs_go.round;
+      race_tail_scope.config = G.vs_go.config;
+      race_tail_scope.membership = G.vs_go.membership;
+      race_tail_scope.term = G.vs_go.term;
+    }
+  }
+  tail_trail_scene_tick(&race_tail_trails, 0, G.vs_race ? G.vs_id : 1, 1,
+                        race_tail_pack(G.race_pack), (unsigned)G.aero_set, G.camera,
+                        G.car.body, G.car.cam_view, G.car.cam_pos);
+  int rivals_dressed = G.vs_race || app_ghost_arcade_dressed();
+  for (int i = 0; i < CAR_RIVALS; ++i) {
+    uint64_t id = (uint64_t)i + 2;
+    int pack = G.rival_pack[i];
+    int shown = i < G.n_rival && G.car.rival_shown[i] && G.rival_model[i];
+    if (G.vs_race) {
+      int pcb = i + (i >= G.vs_go.pcb);
+      id = pcb < G.vs_go.n ? G.vs_go.player[pcb].id : 0;
+      shown = shown && i < G.vs_race;
+    } else if (G.n_ten) {
+      int opponent = G.car.race.ten_rival;
+      shown = shown && i == 0 && opponent >= 0 && opponent < G.n_ten && opponent < CAR_TEN_RIVALS;
+      if (shown) {
+        id = UINT64_C(0x100) + (unsigned)opponent;
+        pack = G.ten_pack[opponent];
+      }
+    }
+    int requested = rivals_dressed ? G.rival_dress[i].aero : 0;
+    unsigned body = shown && requested && menu_aero(pack, requested) ? (unsigned)requested : 0;
+    tail_trail_scene_tick(&race_tail_trails, (unsigned)i + 1, id, shown,
+                          race_tail_pack(pack), body, G.camera, G.car.rival_body[i],
+                          G.car.cam_view, G.car.cam_pos);
+  }
+}
+static void race_tail_draw(const mat4 *projection, render_params *rp, int movie, int player_visible) {
+  if (!race_tail_active(movie)) { race_tail_reset(); return; }
+  if (race_tail_scope.camera != G.camera) return;
+  TailTrailVertex vertices[2 * TAIL_TRAIL_MAX_VERTICES];
+  for (int slot = 0; slot < TAIL_TRAIL_SCENE_CARS; ++slot) {
+    if (!slot && (!player_visible || !G.race_model)) continue;
+    if (slot && (!G.car.rival_shown[slot-1] || !G.rival_model[slot-1])) continue;
+    const TailTrail *trail = &race_tail_trails.slot[slot].trail;
+    size_t n = tail_trail_triangles(trail, 0, vertices, 2 * TAIL_TRAIL_MAX_VERTICES);
+    n += tail_trail_triangles(trail, 1, vertices + n, 2 * TAIL_TRAIL_MAX_VERTICES - n);
+    if (n) (void)render_tail_triangles(projection, vertices, n, rp);
+  }
+}
+#endif
+
+#ifndef __ANDROID__
+void app_smoke_release(int context_lost) { (void)context_lost; }
 #endif
 
 static void backfire_open(const char *data_dir) {
-  char dir[4096], bfx[4096], wpk[4096];
+  char bfx[4096], wpk[4096];
   backfire_reset();
 #ifdef __ANDROID__
-  char root[4096], sidecar[4096], marker[4096], id[65];
-  if (snprintf(root, sizeof root, "%s", data_dir) >= (int)sizeof root) return;
-  char *q = strrchr(root, '/');
-  if (q && !strcmp(q+1, "wmmt")) *q = 0;
-  else if (q) { *q = 0; q = strrchr(root, '/'); if (!q || strcmp(q+1, "re3dxplus-data")) return; *q = 0; }
-  else return;
-  if (!backfire_path(sidecar, sizeof sidecar, root, "wmmt-sidecars") ||
-      !backfire_child(root, sidecar) ||
-      !backfire_path(marker, sizeof marker, sidecar, "backfire-current") ||
-      !backfire_child(sidecar, marker)) return;
-  FILE *f = fopen(marker, "rb"); if (!f) return;
-  size_t count = fread(id, 1, 64, f); int extra = fgetc(f), bad = ferror(f); fclose(f);
-  if (count != 64 || extra != EOF || bad) return;
-  id[64] = 0;
-  for (int i = 0; i < 64; ++i) if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return;
-  int n = snprintf(dir, sizeof dir, "%s/backfire-%s", sidecar, id);
-  if (n < 0 || (size_t)n >= sizeof dir || !backfire_child(sidecar, dir)) return;
+  extern int android_optional_resource_path(const char *, char *, size_t);
+  if (!android_optional_resource_path("backfire.bfx", bfx, sizeof bfx) ||
+      !android_optional_resource_path("backfire.wpk", wpk, sizeof wpk)) return;
 #else
+  char dir[4096];
   if (snprintf(dir, sizeof dir, "%s", data_dir) >= (int)sizeof dir) return;
-#endif
   if (!backfire_path(bfx, sizeof bfx, dir, "backfire.bfx") ||
       !backfire_path(wpk, sizeof wpk, dir, "backfire.wpk") ||
       !backfire_child(dir, bfx) || !backfire_child(dir, wpk)) return;
+#endif
   if (bfx_load(&backfire_asset, bfx) != 0) return;
   if (bfx_wpk_validate(wpk, &backfire_asset) != 0) { bfx_free(&backfire_asset); return; }
   backfire_scene.fd = -1;
@@ -704,6 +844,20 @@ static void backfire_open(const char *data_dir) {
   }
   backfire_scene.two_sided = 1;
   backfire_ready = 1;
+}
+
+static void front_halo_open(const char *data_dir) {
+  char atlas[4096], anchors[4096];
+#ifdef __ANDROID__
+  (void)data_dir;
+  extern int android_optional_resource_path(const char *, char *, size_t);
+  if (!android_optional_resource_path("front_halo.wpk", atlas, sizeof atlas) ||
+      !android_optional_resource_path("front_halo.bin", anchors, sizeof anchors)) return;
+#else
+  if (!backfire_path(atlas, sizeof atlas, data_dir, "front_halo.wpk") ||
+      !backfire_path(anchors, sizeof anchors, data_dir, "front_halo.bin")) return;
+#endif
+  lights_front_halo_load(atlas, anchors);
 }
 static int backfire_key(char *out, size_t cap, int pack, int aero) {
   int n;
@@ -717,6 +871,9 @@ static int backfire_rival_pack(int i) {
   int t = G.car.race.ten_rival;
   return i == 0 && G.n_ten && t >= 0 && t < G.n_ten ? G.ten_pack[t] : G.rival_pack[i];
 }
+static const story_body_view *backfire_body_view(int slot) {
+  return slot ? &ASB.rival[slot - 1] : &ASB.own.view;
+}
 static void backfire_tick_car(int slot, int pack, int aero, const car_effect *e) {
   char key[BFX_NAME] = "";
   if (!e || !backfire_key(key, sizeof key, pack, aero)) key[0] = 0;
@@ -725,14 +882,21 @@ static void backfire_tick_car(int slot, int pack, int aero, const car_effect *e)
     memset(backfire_play.type[slot], -1, sizeof backfire_play.type[slot]);
     memcpy(backfire_body[slot], key, strlen(key)+1);
   }
-  bfx_step(&backfire_play, &backfire_asset, slot, key, e ? e->backfire_pulse : 0, e ? e->backfire_type : -1);
+  const story_body_view *view = backfire_body_view(slot);
+  int tuned = view->valid && (view->assembly.flags & STORY_ASSEMBLY_MUFFLER);
+  bfx_step(&backfire_play, &backfire_asset, slot, key, tuned,
+           e ? e->backfire_pulse : 0, e ? e->backfire_type : -1);
 }
 static void backfire_tick(void) {
   if (!backfire_ready) return;
   backfire_tick_car(0, G.race_pack, G.aero_set, &G.car.effect);
-  for (int i = 0; i < CAR_RIVALS; ++i)
-    backfire_tick_car(i+1, backfire_rival_pack(i), G.vs_race ? G.rival_dress[i].aero : 0,
+  for (int i = 0; i < CAR_RIVALS; ++i) {
+    int pack = backfire_rival_pack(i);
+    int aero = (G.vs_race || app_ghost_arcade_dressed()) ? G.rival_dress[i].aero : 0;
+    if (aero && !menu_aero(pack, aero)) aero = 0;
+    backfire_tick_car(i + 1, pack, aero,
                       G.car.rival_shown[i] ? &G.car.rival_effect[i] : NULL);
+  }
 }
 /* Invert the complete affine mesh transform: animated effect matrices may scale. */
 static int backfire_eye(const mat4 *m, const float *p, float *out) {
@@ -748,11 +912,17 @@ static int backfire_eye(const mat4 *m, const float *p, float *out) {
 }
 static void backfire_draw_car(int slot, const float *body, const mat4 *vp, const float *eye, render_params *rp) {
   mat4 car; memcpy(car.m, body, sizeof car.m);
+  const story_body_view *view = backfire_body_view(slot);
+  int pack = slot ? backfire_rival_pack(slot - 1) : G.race_pack;
+  float y = view->valid ? view->body_y : story_body_height(pack, 0);
+  /* The nozzle is attached to the visible exhaust. Apply the same local
+   * body height as its mesh, without moving the physics posture. */
+  for (int row = 0; row < 3; ++row) car.m[12 + row] += car.m[4 + row] * y;
   for (unsigned i=0; i<backfire_asset.nnozzle; ++i) {
     int frame=backfire_play.frame[slot][i], type=backfire_play.type[slot][i];
     const bfx_nozzle *noz=&backfire_asset.nozzle[i];
     int id=bfx_car_id(noz->car, backfire_body[slot]);
-    if (frame<0 || frame>=BFX_FRAMES || (type!=0 && type!=1) || id<0 || strcmp(noz->muffler,"MUFFLER1")) continue;
+    if (frame<0 || frame>=BFX_FRAMES || (type!=0 && type!=1) || id<0) continue;
     const char *variant = bfx_variant_b(id) ? (type ? "MIDDLE_B" : "SMALL_B") : (type ? "MIDDLE_A" : "SAMLL_A");
     mat4 tr, scale=mat4_identity(); memcpy(tr.m,noz->matrix,sizeof tr.m);
     scale.m[0]=scale.m[5]=scale.m[10]=0.5f;
@@ -769,18 +939,20 @@ static void backfire_draw_car(int slot, const float *body, const mat4 *vp, const
     }
   }
 }
-static void backfire_draw(const mat4 *vp, const float *eye, int movie) {
+static void backfire_draw(const mat4 *vp, const float *eye, int movie, const car_state *c) {
   if (!backfire_ready || movie) return;
   render_begin(&G.rp); render_blend_pass(1);
   render_params p=G.rp; p.range[0]=p.range[1]=p.range[2]=1e9f; p.object_visible=NULL; p.n_objects=0;
-  if (G.camera==0) backfire_draw_car(0,G.car.body,vp,eye,&p);
-  for (int i=0;i<CAR_RIVALS;++i) if (G.car.rival_shown[i] && G.rival_model[i])
-    backfire_draw_car(i+1,G.car.rival_body[i],vp,eye,&p);
+  if (G.camera==0) backfire_draw_car(0,c->body,vp,eye,&p);
+  for (int i=0;i<CAR_RIVALS;++i) if (c->rival_shown[i] && G.rival_model[i])
+    backfire_draw_car(i+1,c->rival_body[i],vp,eye,&p);
   G.rp.draws=p.draws; G.rp.triangles=p.triangles; G.rp.new_chunks=p.new_chunks;
-  render_begin(&G.rp); render_blend_pass(1); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  render_begin(&G.rp); render_blend_pass(1);
+#ifndef WMMT_NATIVE_VK
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+#endif
 }
 
-static void vs_ip_load(void);
 
 /* iOS 6 has no clock_gettime */
 static double now_ms(void) {
@@ -790,7 +962,7 @@ static double now_ms(void) {
   return (double)mach_absolute_time() * tb.numer / tb.denom * 1e-6;
 #else
   struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
+  if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return -1.0;
   return (double)t.tv_sec * 1e3 + (double)t.tv_nsec * 1e-6;
 #endif
 }
@@ -885,10 +1057,17 @@ static void perf_frame(float dt, int steps, double phys, double render, int warm
    * chunk's first draw aside) gives up the next of render_hq's costs; 1200 frames without a
    * miss take one back, unless the level above missed again soon after its last return */
   if (G.console) {
-    G.gov_slow += dt > 1.25f / 60.0f && !rp->new_chunks && !warmed;
-    if (G.gov_since_up) G.gov_since_up++; /* (0: never went up) */
+    /* Quality recovery windows remain 60 Hz elapsed logic intervals, not
+     * 120 Hz display counts. These adjust GPU cost, never the race's state. */
+    int clock_steps = 1;
+#ifdef __ANDROID__
+    clock_steps = steps;
+#endif
+    if (dt > 1.25f / 60.0f && !rp->new_chunks && !warmed) G.gov_slow += clock_steps;
+    if (G.gov_since_up) G.gov_since_up += clock_steps; /* (0: never went up) */
     int window = G.gov_slow ? 120 : 1200, level = G.gov_level;
-    if (++G.gov_frames >= window) {
+    G.gov_frames += clock_steps;
+    if (G.gov_frames >= window) {
       if (G.gov_slow > 3) {
         if (G.gov_since_up && G.gov_since_up < 1800) G.gov_floor = level + 1; /* (it went up too soon) */
         level++;
@@ -1022,7 +1201,12 @@ static void extras_open(int city) {
      * glow), over the sky's colour (the clear, the fog's) blended, not drawn black */
     wpk_blend_texture(&G.sky[z], "hk_sky01_a.tga");
     city_path(path, sizeof path, "arrows", city, z, "wpk");
-    if (wpk_load(&G.arrows[z], path) != 0) fprintf(stderr, "no %s, no junction arrow boards\n", path);
+#ifdef __ANDROID__
+    int arrows_status = wpk_load_course_arrows(&G.arrows[z], path);
+#else
+    int arrows_status = wpk_load(&G.arrows[z], path);
+#endif
+    if (arrows_status != 0) fprintf(stderr, "no %s, no junction arrow boards\n", path);
   }
   /* the junction table's flags are by board index: a city's own (another city's left the
    * boards of the same indices hidden but at their junctions, push87) */
@@ -1075,22 +1259,48 @@ static int track_open(int city, int zone) {
  * which a run places behind when it is slower. ---- */
 #define RANKING_TOP_MS 599999
 
-/* save_dir/records<n> (save n's): a line with the player's best on each course (ms, 0 = none), then a line
- * "car <course> <pack> <ms>" for each car type's best on a course */
+/* Keep the legacy total and car rows first. Optional split rows record the
+ * cumulative times of the same personal-best run, ending at its total. */
+static int records_splits_valid(int count, const float *at, int ms) {
+  if (count < 2 || count > CAR_SECTIONS || ms <= 0 || at[0] != 0.0f) return 0;
+  for (int i = 1; i <= count; ++i)
+    if (!isfinite(at[i]) || at[i] <= at[i - 1]) return 0;
+  float total = at[count] * 1000.0f;
+  return total < (float)INT_MAX && (int)total == ms;
+}
+
 static void records_load(void) {
   char path[1100];
   snprintf(path, sizeof path, "%s/records%d", G.save_dir, G.menu.save_slot);
   FILE *f = G.menu.save_slot ? fopen(path, "r") : NULL;
   for (int i = 0; i < CAR_COURSES; ++i)
     if (!f || fscanf(f, "%d", &G.best_ms[i]) != 1 || G.best_ms[i] < 0) G.best_ms[i] = 0;
+  memset(G.best_splits, 0, sizeof G.best_splits);
   G.n_car_best = 0;
-  int course, pack, ms;
-  while (f && G.n_car_best < CAR_BEST_MAX && fscanf(f, " car %d %d %d", &course, &pack, &ms) == 3)
-    if (course >= 0 && course < CAR_COURSES && ms > 0) {
+  char line[256];
+  while (f && fgets(line, sizeof line, f)) {
+    int course, pack, ms, count, offset = 0;
+    if (sscanf(line, " car %9d %9d %9d", &course, &pack, &ms) == 3 &&
+        course >= 0 && course < CAR_COURSES && ms > 0 && G.n_car_best < CAR_BEST_MAX) {
       G.car_best[G.n_car_best].course = course;
       G.car_best[G.n_car_best].pack = pack;
       G.car_best[G.n_car_best++].ms = ms;
+    } else if (sscanf(line, " split %3d %9d %2d%n", &course, &ms, &count, &offset) == 3 &&
+               course >= 0 && course < CAR_COURSES && ms == G.best_ms[course] &&
+               count >= 2 && count <= CAR_SECTIONS) {
+      float at[CAR_SECTIONS + 1] = {0};
+      char *p = line + offset;
+      for (int i = 1; i <= count; ++i) {
+        char *end;
+        at[i] = strtof(p, &end);
+        p = end;
+      }
+      if (p[strspn(p, " \t\r\n")] == '\0' && records_splits_valid(count, at, ms)) {
+        G.best_splits[course].count = count;
+        memcpy(G.best_splits[course].at, at, sizeof at);
+      }
     }
+  }
   if (f) fclose(f);
 }
 
@@ -1098,11 +1308,24 @@ static void records_save(void) {
   char path[1100];
   if (!G.menu.save_slot) return;
   snprintf(path, sizeof path, "%s/records%d", G.save_dir, G.menu.save_slot);
-  FILE *f = fopen(path, "w");
-  if (!f) return;
+  char tmp[sizeof path + 8];
+  snprintf(tmp, sizeof tmp, "%s.XXXXXX", path);
+  int fd = mkstemp(tmp);
+  if (fd < 0) return;
+  FILE *f = fdopen(fd, "w");
+  if (!f) { close(fd); unlink(tmp); return; }
   for (int i = 0; i < CAR_COURSES; ++i) fprintf(f, "%d%c", G.best_ms[i], i + 1 < CAR_COURSES ? ' ' : '\n');
   for (int i = 0; i < G.n_car_best; ++i) fprintf(f, "car %d %d %d\n", G.car_best[i].course, G.car_best[i].pack, G.car_best[i].ms);
-  fclose(f);
+  for (int course = 0; course < CAR_COURSES; ++course) {
+    int count = G.best_splits[course].count;
+    if (!count) continue;
+    fprintf(f, "split %d %d %d", course, G.best_ms[course], count);
+    for (int i = 1; i <= count; ++i) fprintf(f, " %.9g", G.best_splits[course].at[i]);
+    fputc('\n', f);
+  }
+  int ok = !ferror(f);
+  if (fclose(f) != 0) ok = 0;
+  if (!ok || rename(tmp, path) != 0) unlink(tmp);
 }
 
 int app_model_ta_best_ms(int pack, int course) {
@@ -1118,6 +1341,7 @@ int app_model_ta_best_ms(int pack, int course) {
 static void records_show(int course) {
   float best = (float)G.best_ms[course] * 0.001f;
   hud_set_records(best, best);
+  hud_set_record_splits(G.best_splits[course].count, G.best_splits[course].at);
 }
 
 /* A run reached the goal: clTaResult's figures (the records as they stand after it), and a
@@ -1151,7 +1375,17 @@ static void records_goal(int course, const car_race *race, menu_result *res, int
     res->car_record = car ? ((float)car + 0.5f) * 0.001f : 0.0f;
     return;
   }
-  if (res->new_personal) G.best_ms[course] = ms;
+  int have_splits = records_splits_valid(race->sections, race->split, ms);
+  int save_splits = have_splits &&
+    (res->new_personal || (ms == best && !G.best_splits[course].count));
+  if (res->new_personal) {
+    G.best_ms[course] = ms;
+    G.best_splits[course].count = 0; /* never compare with the old, slower PB */
+  }
+  if (save_splits) {
+    G.best_splits[course].count = race->sections;
+    memcpy(G.best_splits[course].at, race->split, sizeof G.best_splits[course].at);
+  }
   if (res->new_car) {
     if (k == G.n_car_best && k < CAR_BEST_MAX) {
       G.car_best[k].course = course;
@@ -1160,7 +1394,7 @@ static void records_goal(int course, const car_race *race, menu_result *res, int
     }
     if (k < G.n_car_best) G.car_best[k].ms = ms;
   }
-  if (res->new_personal || res->new_car) records_save();
+  if (res->new_personal || res->new_car || save_splits) records_save();
 }
 
 /* ---- the titles (clWorkSpace::judgeTitle, src/title.h): the card as its getters read it,
@@ -1368,20 +1602,31 @@ static void key_layout_clamp_visible(void) {
  * Keep the persisted choice unchanged until the user explicitly edits it. */
 static void custom_layout_clamp_visible(HudCustomLayout *layout, int mode) {
   HudCustomTransform *items[HUD_RACE_GROUPS] = { &layout->map, &layout->rank, &layout->timer, &layout->meter };
-  for (int g = 0; g < HUD_RACE_GROUPS + 1; ++g) {
-    if (g == HUD_RACE_GROUPS && !layout->shift_separate) continue;
-    HudCustomTransform *t = g == HUD_RACE_GROUPS ? &layout->shift : items[g];
-    if (g != HUD_RACE_GROUPS && t->k==100 && !t->dx && !t->dy) continue;
-    if (g != HUD_RACE_GROUPS) {
-      float max_k = hud_race_layout_max_scale(g);
+  _Static_assert(HUD_EDIT_GROUPS - HUD_EDIT_SHIFT_UP == HUD_CUSTOM_BUTTONS, "layout controls match saved slots");
+  for (int g = 0; g < HUD_RACE_GROUPS + 1 + HUD_CUSTOM_BUTTONS; ++g) {
+    const int is_key = g >= HUD_RACE_GROUPS;
+    const int group = is_key ? HUD_EDIT_SHIFT + g - HUD_RACE_GROUPS : g;
+    HudCustomTransform *t;
+    if (!is_key) t = items[g];
+    else if (group == HUD_EDIT_SHIFT) {
+      if (!layout->shift_separate) continue;
+      t = &layout->shift;
+    } else {
+      int i = group - HUD_EDIT_SHIFT_UP;
+      if (!(layout->separate_buttons & (1u << i))) continue;
+      t = &layout->button[i];
+    }
+    if (!is_key && t->k==100 && !t->dx && !t->dy) continue;
+    if (!is_key) {
+      float max_k = hud_race_layout_max_scale(group);
       if (isfinite(max_k) && max_k >= HUD_KEY_K_MIN && t->k * 0.01f > max_k) {
         int max_percent = (int)floorf(max_k * 100.0f + 0.0001f);
         t->k = max_percent < 60 ? 60 : max_percent;
       }
     }
     float x = (float)t->dx, y = (float)t->dy, k = t->k * 0.01f;
-    if (g == HUD_RACE_GROUPS) hud_layout_clamp_mode(HUD_EDIT_SHIFT, mode, k, &x, &y);
-    else hud_race_layout_clamp(g, k, &x, &y);
+    if (is_key) hud_layout_clamp_mode(group, mode, k, &x, &y);
+    else hud_race_layout_clamp(group, k, &x, &y);
     /* Defend the integer conversion even if a backend returns nonfinite values. */
     if (!isfinite(x)) x = 0;
     if (!isfinite(y)) y = 0;
@@ -1389,8 +1634,8 @@ static void custom_layout_clamp_visible(HudCustomLayout *layout, int mode) {
     y = fmaxf(-2000.0f, fminf(2000.0f, y));
     float ix = floorf(x + 0.5f), iy = floorf(y + 0.5f), cx = ix, cy = iy;
     /* Rounding must not put a fractional clamp boundary back off screen. */
-    if (g == HUD_RACE_GROUPS) hud_layout_clamp_mode(HUD_EDIT_SHIFT, mode, k, &cx, &cy);
-    else hud_race_layout_clamp(g, k, &cx, &cy);
+    if (is_key) hud_layout_clamp_mode(group, mode, k, &cx, &cy);
+    else hud_race_layout_clamp(group, k, &cx, &cy);
     if (isfinite(cx)) ix = cx < ix ? floorf(cx) : cx > ix ? ceilf(cx) : ix;
     if (isfinite(cy)) iy = cy < iy ? floorf(cy) : cy > iy ? ceilf(cy) : iy;
     t->dx = (int)fmaxf(-2000.0f, fminf(2000.0f, ix));
@@ -1405,6 +1650,12 @@ static HudCustomLayout custom_layout_merge(HudCustomLayout base, const HudCustom
   if (mask & CUSTOM_DIRTY_RANK) base.rank=view->rank;
   if (mask & CUSTOM_DIRTY_TIME) base.timer=view->timer;
   if (mask & CUSTOM_DIRTY_METER) base.meter=view->meter;
+  if (mask & CUSTOM_DIRTY_OPACITY) base.button_opacity_percent=view->button_opacity_percent;
+  for (int i=0; i<HUD_CUSTOM_BUTTONS; ++i) if (mask & (CUSTOM_DIRTY_BUTTON_0 << i)) {
+    unsigned bit = 1u << i;
+    base.separate_buttons = (base.separate_buttons & ~bit) | (view->separate_buttons & bit);
+    base.button[i] = view->button[i];
+  }
   return base;
 }
 #endif
@@ -1441,13 +1692,16 @@ static int options_load(void) {
   FILE *f = fopen(path, "r");
   if (!f) return 0;
   int a, b, c, d = 1, e = 0, ao = 1, bm = 1, hq[6] = { 1, 1, 0, 1, 1, 1 }, hires = 0;
-  int test = 0, traffic = 0;
-  int n = fscanf(f, "option %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", &a, &b, &c, &d, &e, &ao, &bm, &hq[0], &hq[1],
-                 &hq[2], &hq[3], &hq[4], &hq[5], &hires, &test, &traffic);
+  int test = 0, traffic = 0, frame_rate = 0;
+  char line[512];
+  int n = fgets(line, sizeof line, f) ?
+    sscanf(line, "option %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", &a, &b, &c, &d, &e, &ao, &bm,
+           &hq[0], &hq[1], &hq[2], &hq[3], &hq[4], &hq[5], &hires, &test, &traffic, &frame_rate) : 0;
   fclose(f);
   if (n < 3) return 0;
   G.menu.story_test = test >= 0 && test <= 10 ? test : 0;
   G.menu.ta_traffic = traffic != 0;
+  G.menu.frame_rate_limit = timing60_frame_limit(frame_rate);
   G.menu.hires = hires != 0;
   G.menu.hd_tex = hq[0] != 0, G.menu.bloom_on = hq[1] != 0, G.menu.ssao_on = hq[2] != 0;
   G.menu.wet_on = hq[3] != 0, G.menu.paint_on = hq[4] != 0, G.menu.aa4 = hq[5] != 0;
@@ -1462,10 +1716,10 @@ static int options_load(void) {
 }
 
 static int options_save(void) {
-  static int last[16] = { -1 };
-  int now[16] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
+  static int last[17] = { -1 };
+  int now[17] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
                   G.menu.bm_on, G.menu.hd_tex, G.menu.bloom_on, G.menu.ssao_on, G.menu.wet_on, G.menu.paint_on,
-                  G.menu.aa4, G.menu.hires, G.menu.story_test, G.menu.ta_traffic };
+                  G.menu.aa4, G.menu.hires, G.menu.story_test, G.menu.ta_traffic, G.menu.frame_rate_limit };
   if (G.options_global && !memcmp(now, last, sizeof now)) return 1;
   char path[1100], tmp[1100];
   if (snprintf(path, sizeof path, "%s/option", G.save_dir) >= (int)sizeof path ||
@@ -1487,8 +1741,8 @@ static int options_save(void) {
   if (fd < 0) { free(bytes); return 0; }
   FILE *f = fdopen(fd, "w");
   if (!f) { close(fd); unlink(tmp); free(bytes); return 0; }
-  int ok = fprintf(f, "option %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", now[0], now[1], now[2], now[3], now[4], now[5], now[6],
-          now[7], now[8], now[9], now[10], now[11], now[12], now[13], now[14], now[15]) > 0;
+  int ok = fprintf(f, "option %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", now[0], now[1], now[2], now[3], now[4], now[5], now[6],
+          now[7], now[8], now[9], now[10], now[11], now[12], now[13], now[14], now[15], now[16]) > 0;
   if (tail_n && fwrite(tail, 1, tail_n, f) != tail_n) ok = 0;
   free(bytes);
   if (fflush(f) != 0) ok = 0;
@@ -1500,6 +1754,8 @@ static int options_save(void) {
   G.options_global = 1;
   return 1;
 }
+
+int app_frame_rate_limit(void) { return G.menu.frame_rate_limit; }
 
 /* a garage's "name" line into name (left as it is for another line) */
 static void name_read(const char *line, short name[5]) {
@@ -1543,6 +1799,11 @@ static void garage_load(void) {
         G.menu.own[G.menu.n_own++] = (menu_own){ (signed char)mk, (signed char)c, (signed char)a, born, odo };
       continue;
     }
+    if (sscanf(line, "ccolor %d %199[^\n]", &a, label) == 2) {
+      int mk, c;
+      if (car_by_label(label, &mk, &c)) (void)menu_body_color_restore(&G.menu,mk,c,a);
+      continue; /* additive cosmetic record; never substitutes own[].color */
+    }
     if (sscanf(line, "cstory %d %d %199[^\n]", &a, &b, label) == 3) {
       int mk, c;
       if (car_by_label(label, &mk, &c) && a >= 0) G.menu.st_div_car[mk][c] = a, G.menu.st_bits_car[mk][c] = b & 0xfffff;
@@ -1576,6 +1837,12 @@ static void garage_load(void) {
             G.menu.st_handling[mk][c] = (signed char)b;
             G.menu.st_gauge[mk][c] = (signed char)c3;
           }
+      continue;
+    }
+    if (sscanf(line, "dressp %d %199[^\n]", &a, label) == 2) {
+      int mk, c;
+      if (a >= 0 && a < 1000 && car_by_label(label, &mk, &c))
+        G.menu.dress_points[mk][c] = (unsigned short)a;
       continue;
     }
     if (sscanf(line, "dress %d %d %199[^\n]", &a, &b, label) == 3) {
@@ -1660,6 +1927,8 @@ static void garage_save(void) {
     const menu_own *o = &G.menu.own[k];
     const char *label = CARDB_CARS[o->maker][o->car].label;
     fprintf(f, "own %d %lld %.0f %s\n", o->color, o->born, o->odo, label);
+    if (G.menu.custom_color[o->maker][o->car])
+      fprintf(f, "ccolor %u %s\n", (unsigned)G.menu.custom_color[o->maker][o->car],label);
     fprintf(f, "cstory %d %d %s\n", G.menu.st_div_car[o->maker][o->car], G.menu.st_bits_car[o->maker][o->car], label);
     fprintf(f, "cclass %d %s\n", G.menu.class_car[o->maker][o->car], label);
     /* the versus stars and count (the card's +0x180, +0x17c) */
@@ -1687,6 +1956,10 @@ static void garage_save(void) {
     for (int c = 0; c < CARDB_NCARS[mk]; ++c)
       if (G.menu.dress_lv[mk][c] || G.menu.aero[mk][c])
         fprintf(f, "dress %d %d %s\n", G.menu.dress_lv[mk][c], G.menu.aero[mk][c], CARDB_CARS[mk][c].label);
+  for (int mk = 0; mk < CARDB_ALL; ++mk)
+    for (int c = 0; c < CARDB_NCARS[mk]; ++c)
+      if (G.menu.dress_points[mk][c] && G.menu.dress_lv[mk][c] < 63)
+        fprintf(f, "dressp %u %s\n", (unsigned)G.menu.dress_points[mk][c], CARDB_CARS[mk][c].label);
   for (int mk = 0; mk < CARDB_ALL; ++mk)
     for (int c = 0; c < CARDB_NCARS[mk]; ++c)
       if (G.menu.mirror[mk][c] || G.menu.wing[mk][c] || G.menu.bonnet[mk][c])
@@ -2101,6 +2374,9 @@ int app_card_choice_commit(menu_state *m, int row, int choice, long long born) {
 
 /* the save chosen: loaded, or started over (the OPTION screen's choices kept) */
 static void save_take(void) {
+  app_story_body_clear();
+  app_body_drop(0);
+  menu_body_color_clear_pages(&G.menu);
   G.menu.save_slot = G.menu.save_pick;
   G.menu.save_pick = 0;
   menu_garage_reset(&G.menu);
@@ -2125,7 +2401,11 @@ static void save_take(void) {
   fprintf(stderr, "save %d %s\n", G.menu.save_slot, G.menu.save_pick_new ? "started over" : "loaded");
 }
 
-void app_save_dir(const char *dir) { snprintf(G.save_dir, sizeof G.save_dir, "%s", dir); }
+void app_save_dir(const char *dir) {
+  if (!dir) return;
+  if (strcmp(G.save_dir, dir)) app_ta_rank_release();
+  snprintf(G.save_dir, sizeof G.save_dir, "%s", dir);
+}
 
 void app_console(void) {
   G.console = 1;
@@ -2147,15 +2427,29 @@ void app_wide(float edge, float key_k) {
   }
 }
 
+/* Presentation geometry only. Called on the game thread after the platform has
+ * obtained a valid drawable extent; never reinitialize resources or simulation. */
+int app_viewport(int fb_width, int fb_height, float edge, float key_k) {
+  if (fb_width <= 0 || fb_height <= 0 || !isfinite(edge) || edge < 0.0f ||
+      !isfinite(key_k) || key_k <= 0.0f) return 0;
+  G.fb_w = fb_width;
+  G.fb_h = fb_height;
+  app_wide(edge, key_k);
+  return 1;
+}
+
 #ifdef __ANDROID__
-#include "timing60.h"
 static timing60_sim android_sim;
 #endif
 
 int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, float screen_h) {
+  app_smoke_release(1); /* reset owner before first tick; forget old-context names */
+  app_body_reset(1); /* forget dead-context player handles before names can be reused */
+  app_ghost_context_reset(); /* before any new context can reuse an old texture name */
 #ifdef __ANDROID__
   timing60_sim_reset(&android_sim);
 #endif
+  app_timing_reset();
   char path[1100];
   G.fb_w = fb_width;
   G.fb_h = fb_height;
@@ -2170,6 +2464,7 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   backfire_open(data_dir);
 #ifdef __ANDROID__
   player_tracks_open(data_dir);
+  player_smoke_open(data_dir);
 #endif
   if (!G.save_dir[0]) snprintf(G.save_dir, sizeof G.save_dir, "%s", data_dir);
   /* and the 3D multisampled in half floats, with a bloom over the lights (a file hq_off in
@@ -2212,6 +2507,7 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   if (zone >= zones) zone = 0;
   /* the street lights' sprites (their points come by city, extras_open) */
   if (lights_load(data_dir) != 0) fprintf(stderr, "no lights.wpk/lights.bin, no street lights\n");
+  front_halo_open(data_dir);
   /* the course goes up to GL a little each frame while the maker logos play (app_frame) */
   G.hd_maps = G.hq_on && options_peek(7, 1); /* (the HD TEXTURES: hq_apply after the menus' options) */
   if (track_open(CAR_TOKYO, zone) != 0) {
@@ -2314,7 +2610,6 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   G.race_model = &G.fd3s;
   G.rival = G.rival_env = -1;
   /* the versus: the server last used, this app's id there (fresh each start) */
-  vs_ip_load();
   G.menu.vs.ramp = 6; /* WANGAN_OUT_13 */
   G.menu.vs.km = 13;  /* as the arcade's getJoinDist */
   G.vs_id = (uint32_t)time(NULL) * 2654435761u ^ (uint32_t)getpid() << 16 ^ (uint32_t)(now_ms() * 1000.0);
@@ -2323,9 +2618,16 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   if (getenv("WMMT_RIVAL")) G.rival = G.rival_env = atoi(getenv("WMMT_RIVAL")); /* test: race this RIVALDB rival */
 #endif
   G.in_menu = 1;
+#ifdef WMMT_NATIVE_VK
+  uint32_t api_version = cinder_vk_device_api_version();
+  fprintf(stderr, "native Vulkan %s | %u.%u.%u | tex %u batches %u chunks %u | menu ready\n",
+          cinder_vk_device_name(), VK_VERSION_MAJOR(api_version), VK_VERSION_MINOR(api_version), VK_VERSION_PATCH(api_version),
+          G.track.n_tex, G.track.n_batch, G.track.n_chunk);
+#else
   fprintf(stderr, "GL %s | %s | tex %u batches %u chunks %u | menu ready\n",
           (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION),
           G.track.n_tex, G.track.n_batch, G.track.n_chunk);
+#endif
   return 0;
 }
 
@@ -2362,6 +2664,11 @@ static void hud_options(void) {
     const HudCustomTransform *t[4]={&c->map,&c->rank,&c->timer,&c->meter};
     hud_set_stick_deadzone_percent(c->stick_deadzone_percent);
     hud_shift_layout_set(c->shift_separate,c->shift.k*0.01f,c->shift.dx,c->shift.dy);
+    hud_set_button_opacity_percent(c->button_opacity_percent);
+    for (int i=0; i<HUD_CUSTOM_BUTTONS; ++i) {
+      const HudCustomTransform *b = &c->button[i];
+      hud_button_layout_set(HUD_EDIT_SHIFT_UP+i,c->separate_buttons & (1u << i),b->k*0.01f,b->dx,b->dy);
+    }
     for (int g=0;g<HUD_RACE_GROUPS;++g) hud_race_layout_set(g,t[g]->k*0.01f,t[g]->dx,t[g]->dy);
   }
 #endif
@@ -2381,13 +2688,19 @@ void app_press_start(void) {
 int app_movie(void) { return G.in_menu ? menu_movie(&G.menu) : -1; }
 
 void app_movie_done(void) {
-  if (G.in_menu) menu_movie_done(&G.menu);
+  /* A delayed platform completion is not a transition out of another menu. */
+  if (G.in_menu && G.menu.screen == MENU_MOVIE) menu_movie_done(&G.menu);
 }
 
 /* the race's song stops with the last 10-in-a-row rival (clAudio::stopStream); result2 still
  * plays the result's (0x6d) */
 const char *app_bgm(void) {
   return !G.in_menu && G.ten_bgm_off && !G.menu.finish ? NULL : menu_bgm(&G.menu, !G.in_menu);
+}
+
+int app_bgm_gameplay_paused(void) {
+  return !G.in_menu && !G.menu.finish && !G.vs_race && !G.n_ten &&
+         G.menu.game == MENU_GAME_STORY && G.story_end_freeze > 0;
 }
 
 /* clRaceThread::race's 10-in-a-row white (clFader): white at once as the race starts and after
@@ -2419,14 +2732,22 @@ static wpk_scene *car_pack(int k) {
 /* Tell the menus what is loaded (they see it at their next load_sync): GL is done with it
  * first, as a second context must not use what it has not finished. */
 static void pack_set(int k, int state) {
+#ifdef WMMT_NATIVE_VK
+  if (state == 1 && !cinder_vk_finish()) return;
+#else
   if (state == 1) glFinish();
+#endif
   G.pack_state[k] = (signed char)state;
   pthread_mutex_lock(&G.load_mx);
   G.pub.pack[k] = (signed char)(state == 1 || state == -1 ? state : 0);
   pthread_mutex_unlock(&G.load_mx);
 }
 static void track_set(int state) {
+#ifdef WMMT_NATIVE_VK
+  if (state && !cinder_vk_finish()) return;
+#else
   if (state) glFinish();
+#endif
   G.track_ready = state;
   if (!state) G.start_ready = 0;
   pthread_mutex_lock(&G.load_mx);
@@ -2435,7 +2756,11 @@ static void track_set(int state) {
   pthread_mutex_unlock(&G.load_mx);
 }
 static void start_set(int course1) {
+#ifdef WMMT_NATIVE_VK
+  if (!cinder_vk_finish()) return;
+#else
   glFinish();
+#endif
   G.start_ready = course1;
   pthread_mutex_lock(&G.load_mx);
   G.pub.start = course1;
@@ -2467,6 +2792,7 @@ static void load_pause(void) {
 /* The loading's own framebuffer of one pixel, in each GL context (0 the app's, 1 the
  * thread's): it draws there, so the screen's is done with by then (no second pass over it
  * on the tile GPU). */
+#ifndef WMMT_NATIVE_VK
 static GLuint load_fb(int ctx) {
   static GLuint fb[2];
   if (!fb[ctx]) {
@@ -2480,6 +2806,7 @@ static GLuint load_fb(int ctx) {
   }
   return fb[ctx];
 }
+#endif
 
 /* first draws per step (a car model's, the course's), and the bytes of the course a step
  * hands to GL: a step is a few ms at most, and each ends with a glFlush. A first draw cost
@@ -2517,9 +2844,18 @@ static void pack_step(int k, int ctx) {
   } else if (G.pack_state[k] == 2) {
     if (wpk_upload(s, 1)) pack_set(k, 3);
   } else if (G.pack_state[k] == 3) {
+#ifndef WMMT_NATIVE_VK
     glBindFramebuffer(GL_FRAMEBUFFER, load_fb(ctx));
+#endif
+#ifdef WMMT_NATIVE_VK
+    uint64_t epoch = cinder_vk_error_epoch();
+#endif
     render_warm_begin();
+#ifdef WMMT_NATIVE_VK
+    if (!wpk_warm(s, WARM_STEP) && !cinder_vk_error_pending() && cinder_vk_error_epoch() == epoch) {
+#else
     if (!wpk_warm(s, WARM_STEP)) {
+#endif
       pack_set(k, 1);
       fprintf(stderr, "car model %s ready\n", pack_name(k));
     }
@@ -2527,7 +2863,11 @@ static void pack_step(int k, int ctx) {
 }
 
 static void paint_set(int k, int state) {
+#ifdef WMMT_NATIVE_VK
+  if (state == 1 && !cinder_vk_finish()) return;
+#else
   if (state == 1) glFinish();
+#endif
   G.paint_state[k] = (signed char)state;
   pthread_mutex_lock(&G.load_mx);
   G.pub.paint[k] = (signed char)(state == 1);
@@ -2544,9 +2884,18 @@ static void paint_step(int k, int ctx) {
     if (G.paint_state[k] == 0) paint_set(k, 2);
     if (wpk_upload_paints(s, 1)) paint_set(k, 3);
   } else if (G.paint_state[k] == 3) {
+#ifndef WMMT_NATIVE_VK
     glBindFramebuffer(GL_FRAMEBUFFER, load_fb(ctx));
+#endif
+#ifdef WMMT_NATIVE_VK
+    uint64_t epoch = cinder_vk_error_epoch();
+#endif
     render_warm_begin();
+#ifdef WMMT_NATIVE_VK
+    if (!wpk_warm_paints(s, WARM_STEP) && !cinder_vk_error_pending() && cinder_vk_error_epoch() == epoch) paint_set(k, 1);
+#else
     if (!wpk_warm_paints(s, WARM_STEP)) paint_set(k, 1);
+#endif
   }
 }
 
@@ -2557,7 +2906,12 @@ static void paint_step(int k, int ctx) {
  * race's title page waits for that, start_set), then the rest, nearest that start first.
  * 0 once it all is. */
 static int warm_step(const load_wants *w, int ctx) {
+#ifndef WMMT_NATIVE_VK
   glBindFramebuffer(GL_FRAMEBUFFER, load_fb(ctx));
+#else
+  if (cinder_vk_error_pending()) return 1;
+  uint64_t epoch = cinder_vk_error_epoch();
+#endif
   render_warm_begin();
   const float *at = START[w->course];
   int n = lights_warm();
@@ -2565,9 +2919,20 @@ static int warm_step(const load_wants *w, int ctx) {
   for (int k = 0; !n && k < CAR_TRAFFIC_MODELS; ++k) n = wpk_warm(&G.traffic[k], WARM_STEP_COURSE);
   if (!n) n = wpk_warm_near(&G.track, at, WARM_MARGIN, WARM_STEP_COURSE, &G.rp);
   if (!n) n = wpk_warm_near(&G.arrows[G.track_zone], at, WARM_MARGIN, WARM_STEP_COURSE, &G.rp);
+#ifdef WMMT_NATIVE_VK
+  int start_candidate = !n && G.start_ready != w->course + 1;
+#else
   if (!n && G.start_ready != w->course + 1) start_set(w->course + 1);
+#endif
   if (!n) n = wpk_warm_near(&G.track, at, 0, WARM_STEP_COURSE, NULL);
   if (!n) n = wpk_warm_near(&G.arrows[G.track_zone], at, 0, WARM_STEP_COURSE, NULL);
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_error_pending() || cinder_vk_error_epoch() != epoch) return 1;
+  /* Near-scene readiness still does not require the far warm to finish. Defer
+   * publication until this step's later warm calls cannot introduce an error. */
+  if (start_candidate) start_set(w->course + 1);
+  if (cinder_vk_error_pending() || cinder_vk_error_epoch() != epoch) return 1;
+#endif
   return n;
 }
 
@@ -2597,7 +2962,7 @@ static int aero_load(wpk_scene *s, int pack, int set) {
 
 static wpk_scene *aero_model(int pack, int set) {
   if (set != G.aero_set || pack != G.aero_pack) {
-    if (G.aero_set) wpk_free(&G.aero);
+    if (G.aero_set) { app_body_evict_scene(&G.aero); wpk_free(&G.aero); }
     G.aero_set = 0;
     if (!aero_load(&G.aero, pack, set)) return NULL;
     G.aero_pack = pack;
@@ -2633,12 +2998,19 @@ static void menu_aero_sync(const menu_scene *s) {
     for (int j = 0; j < n; ++j) dup |= pack[j] == s->cars[i].pack && set[j] == a;
     if (!dup && n < MENU_AERO_SLOTS) pack[n] = s->cars[i].pack, set[n++] = a;
   }
+  /* A prepared/active original Ghost owns its exact aero independently of the
+   * player's menu scene; never trim it into a stock-body substitution. */
+  int ghost_pack,ghost_set;
+  if(app_ghost_arcade_aero(&ghost_pack,&ghost_set)) {
+    int duplicate=0;for(int j=0;j<n;j++)duplicate|=pack[j]==ghost_pack&&set[j]==ghost_set;
+    if(!duplicate&&n<MENU_AERO_SLOTS)pack[n]=ghost_pack,set[n++]=ghost_set;
+  }
   /* those no longer shown let go, then those shown and not in loaded into the free slots */
   for (int k = 0; k < MENU_AERO_SLOTS; ++k) {
     int keep = 0;
     for (int j = 0; j < n; ++j) keep |= G.menu_aero_pack[k] == pack[j] && G.menu_aero_set[k] == set[j];
     if (G.menu_aero_in[k] && !keep) {
-      if (G.menu_aero_in[k] == 1) wpk_free(&G.menu_aero[k]);
+      if (G.menu_aero_in[k] == 1) { app_body_evict_scene(&G.menu_aero[k]); wpk_free(&G.menu_aero[k]); }
       G.menu_aero_in[k] = 0;
     }
   }
@@ -2685,12 +3057,22 @@ static int wheel_slot(int wheel, const int *keep, int n_keep) {
 static int wheel_load_step(int k) {
   if (G.wheel_state[k] == WHEEL_UP && wpk_upload(&G.wheel[k], 1)) G.wheel_state[k] = WHEEL_WARM;
   else if (G.wheel_state[k] == WHEEL_WARM) {
+#ifndef WMMT_NATIVE_VK
     GLint screen_fb = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen_fb);
     glBindFramebuffer(GL_FRAMEBUFFER, load_fb(0));
+#endif
+#ifdef WMMT_NATIVE_VK
+    uint64_t epoch = cinder_vk_error_epoch();
+#endif
     render_warm_begin();
+#ifdef WMMT_NATIVE_VK
+    int left = wpk_warm(&G.wheel[k], 1);
+    if (!left && !cinder_vk_error_pending() && cinder_vk_error_epoch() == epoch) G.wheel_state[k] = WHEEL_READY;
+#else
     if (!wpk_warm(&G.wheel[k], 1)) G.wheel_state[k] = WHEEL_READY;
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)screen_fb);
+#endif
   }
   return G.wheel_state[k] == WHEEL_READY;
 }
@@ -2700,7 +3082,16 @@ static int wheel_load_step(int k) {
 static wpk_scene *wheel_model(int wheel) {
   int k = wheel_slot(wheel, NULL, 0);
   if (k < 0) return NULL;
+#ifdef WMMT_NATIVE_VK
+  while (G.wheel_state[k] == WHEEL_UP || G.wheel_state[k] == WHEEL_WARM) {
+    if (cinder_vk_error_pending()) return NULL;
+    uint64_t epoch = cinder_vk_error_epoch();
+    wheel_load_step(k);
+    if (cinder_vk_error_epoch() != epoch || cinder_vk_error_pending()) return NULL;
+  }
+#else
   while (G.wheel_state[k] == WHEEL_UP || G.wheel_state[k] == WHEEL_WARM) wheel_load_step(k);
+#endif
   G.wheel_used[k] = ++G.wheel_tick;
   return G.wheel_state[k] == WHEEL_READY ? &G.wheel[k] : NULL;
 }
@@ -2731,6 +3122,7 @@ static void wheel_sync(menu_scene *shown) {
     }
   }
   for (int i = 0; shown && i < shown->n; ++i) {
+    if (shown->cars[i].ghost_row) continue;
     int w = shown->cars[i].wheel, k = wheel_find(w);
     if (!w || (k >= 0 && G.wheel_state[k] == WHEEL_READY)) G.wheel_shown = w;
     else if (wheel_find(G.wheel_shown) >= 0 && G.wheel_state[wheel_find(G.wheel_shown)] == WHEEL_READY) shown->cars[i].wheel = G.wheel_shown;
@@ -2956,6 +3348,8 @@ static void load_wants_now(const menu_scene *shown, load_wants *w) {
     rival[i] = rival_look(rows[i], &rival_paint[i]);
     WANT(rival[i]);
   }
+  int ghost_paint = 0, ghost_pack = app_ghost_rival_pack(&ghost_paint);
+  WANT(ghost_pack);
   int race_cars = w->n - before;
   /* the phone: only the maker on show, each car in its first paint */
   int reach = G.phone ? 0 : G.low_memory ? 1 : CARDB_MAKERS / 2, first = 0;
@@ -3002,6 +3396,7 @@ static void load_wants_now(const menu_scene *shown, load_wants *w) {
   if (chosen >= 0) {
     w->n_paints = 0;
     if (chosen_color()->paint) w->paints[w->n_paints++] = chosen;
+    if (ghost_pack >= 0 && ghost_paint && ghost_pack != chosen) w->paints[w->n_paints++] = ghost_pack;
     for (int i = 0; i < n_rival; ++i) {
       int dup = rival[i] < 0 || !rival_paint[i] || rival[i] == chosen;
       for (int j = 0; j < w->n_paints; ++j) dup |= w->paints[j] == rival[i];
@@ -3084,11 +3479,26 @@ static int load_unit(const load_wants *w, int ctx) {
  * other paints if `paints` */
 static void pack_load_now(int k, int paints) {
   load_pause();
+#ifdef WMMT_NATIVE_VK
+  while (k >= 0 && k < NPACKS && G.pack_state[k] != 1 && G.pack_state[k] != -1) {
+    if (cinder_vk_error_pending()) return;
+    uint64_t epoch = cinder_vk_error_epoch();
+    pack_step(k, 0);
+    if (cinder_vk_error_epoch() != epoch || cinder_vk_error_pending()) return;
+  }
+  while (paints && k >= 0 && k < NPACKS && G.pack_state[k] == 1 && G.paint_state[k] != 1) {
+    if (cinder_vk_error_pending()) return;
+    uint64_t epoch = cinder_vk_error_epoch();
+    paint_step(k, 0);
+    if (cinder_vk_error_epoch() != epoch || cinder_vk_error_pending()) return;
+  }
+#else
   GLint screen_fb = 0;
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen_fb);
   while (k >= 0 && k < NPACKS && G.pack_state[k] != 1 && G.pack_state[k] != -1) pack_step(k, 0);
   while (paints && k >= 0 && k < NPACKS && G.pack_state[k] == 1 && G.paint_state[k] != 1) paint_step(k, 0);
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)screen_fb);
+#endif
 }
 
 /* whether car model k's paint is in GL as the menus see it (the FD3S standing in has all) */
@@ -3117,7 +3527,7 @@ static void car_packs_trim(int keep_near, const load_wants *w) {
     int paint, rival = rival_look(rows[i], &paint);
     if (rival >= 0) want[rival] = 1;
   }
-  for (int i = 0; G.vs_race && i < G.n_rival; ++i) want[G.rival_pack[i]] = 1;
+  for (int i = 0; (G.vs_race || app_ghost_mode()) && i < G.n_rival; ++i) want[G.rival_pack[i]] = 1;
   for (int d = G.phone ? 0 : -1; keep_near && d <= (G.phone ? 0 : 1); ++d) {
     int maker = ((G.menu.maker + d) % CARDB_MAKERS + CARDB_MAKERS) % CARDB_MAKERS;
     if (G.menu.maker == CARDB_HIDDEN) {
@@ -3136,6 +3546,7 @@ static void car_packs_trim(int keep_near, const load_wants *w) {
   load_pause();
   for (int k = 0; k < NPACKS; ++k)
     if (G.pack_state[k] > 0 && !want[k]) {
+      app_body_evict_pack(k); /* only caches borrowing the evicted pack */
       wpk_free(&G.packs[k]);
       pack_set(k, 0);
       paint_set(k, 0);
@@ -3154,7 +3565,7 @@ static void car_paints_trim(const load_wants *w, int force) {
     int paint, rival = rival_look(rows[i], &paint);
     if (rival >= 0) keep[rival] = 1;
   }
-  for (int i = 0; G.vs_race && i < G.n_rival; ++i) keep[G.rival_pack[i]] = 1;
+  for (int i = 0; (G.vs_race || app_ghost_mode()) && i < G.n_rival; ++i) keep[G.rival_pack[i]] = 1;
   for (int i = 0; w && i < w->n_paints; ++i) keep[w->paints[i]] = 1;
   int painted = 0, extra = 0;
   for (int k = 0; k < NPACKS; ++k) {
@@ -3180,6 +3591,7 @@ void app_memory_warning(void) {
     fflush(G.perf);
   }
   G.low_memory = 1;
+  if(G.in_menu)app_arcade_paint_drop(0);
   car_packs_trim(G.in_menu, G.in_menu ? &G.wants : NULL);
 }
 
@@ -3192,6 +3604,16 @@ void app_memory_warning(void) {
  * the menus keep their 60 fps. */
 static void load_step(double frame_start) {
   double budget = G.load_hurry ? LOAD_PRE_MS : LOAD_MS;
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_error_pending() || !cinder_vk_finish()) return;
+  double t0 = now_ms();
+  for (double t = t0; t - frame_start < budget || t - t0 < LOAD_MIN_MS; t = now_ms()) {
+    if (cinder_vk_error_pending()) break;
+    uint64_t epoch = cinder_vk_error_epoch();
+    if (!load_unit(&G.wants, 0)) break;
+    if (!cinder_vk_finish() || cinder_vk_error_pending() || cinder_vk_error_epoch() != epoch) break;
+  }
+#else
   GLint screen_fb = 0;
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen_fb);
   glBindFramebuffer(GL_FRAMEBUFFER, load_fb(0));
@@ -3202,6 +3624,7 @@ static void load_step(double frame_start) {
     glFinish();
   }
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)screen_fb);
+#endif
 }
 
 /* The thread loads between frames: from the end of a menu frame (app_frame_done, after its
@@ -3229,6 +3652,9 @@ void app_frame_done(double present_ms) {
 }
 
 void app_loader(void) {
+#ifdef WMMT_NATIVE_VK
+  if (!cinder_vk_upload_stream_set(CINDER_VK_UPLOAD_LOADER)) return;
+#endif
   pthread_mutex_lock(&G.load_mx);
   G.loader_up = 1;
   pthread_mutex_unlock(&G.load_mx);
@@ -3241,32 +3667,63 @@ void app_loader(void) {
     load_wants w = G.wants;
     pthread_mutex_unlock(&G.load_mx);
     double t0 = now_ms();
+#ifdef WMMT_NATIVE_VK
+    int did = cinder_vk_error_pending() ? 0 : load_unit(&w, 1);
+#else
     int did = load_unit(&w, 1);
+#endif
     pthread_mutex_lock(&G.load_mx);
     int away = G.away;
     pthread_mutex_unlock(&G.load_mx);
+#ifdef WMMT_NATIVE_VK
+    int synced = away ? cinder_vk_finish() : cinder_vk_flush();
+#else
     if (away) glFinish(); /* the app goes to the background: nothing of the thread's left in flight */
     else glFlush();       /* for the app's context, which may use what it made after a pause */
+#endif
     pthread_mutex_lock(&G.load_mx);
     G.load_units++;
     G.load_ms += now_ms() - t0;
     if (!did) G.load_idle = 1;
+#ifdef WMMT_NATIVE_VK
+    if (!synced) G.load_idle = 1; /* unknown completion never becomes published readiness */
+#endif
     pthread_mutex_unlock(&G.load_mx);
   }
 }
 
+/* Audio presentation follows native sequence lifetimes, never RPM/gear guesses.
+ * A paused/suspended source is muted without restarting its continuous phase. */
+static int app_rotary_sequence_live;
+static void app_rotary_start(void) {
+  snd_rev_start(G.car.se.rev_sequence);
+  app_rotary_sequence_live = 1;
+}
+static void app_rotary_stop(void) {
+  if (app_rotary_sequence_live) snd_rev_stop();
+  app_rotary_sequence_live = 0;
+}
+
 void app_suspend(int away) {
+  app_timing_reset();
 #ifdef __ANDROID__
   timing60_sim_reset(&android_sim);
+  player_smoke_reset();
+  race_tail_reset(); /* no red bridge across a suspended/resumed frame interval */
 #endif
   pthread_mutex_lock(&G.load_mx);
   G.away = away;
   pthread_mutex_unlock(&G.load_mx);
   if (!away) return;
+  snd_rev_quiet(); /* fence gain before the platform's asynchronous audio pause */
   load_pause();
-  /* a race comes back under its pause menu (one already open stays the one) */
-  if (!G.in_menu && !G.paused) G.hud.pause_pressed++;
+  /* offline races return under the pause menu */
+  if (!G.in_menu && !G.paused && !G.hud.pause_disabled) G.hud.pause_pressed++;
+#ifdef WMMT_NATIVE_VK
+  if (!cinder_vk_finish()) fprintf(stderr, "native suspend: GPU completion unconfirmed\n");
+#else
   glFinish(); /* none of the app's GL work left in flight in the background */
+#endif
   if (G.perf) fflush(G.perf);
 }
 
@@ -3301,7 +3758,11 @@ static uint32_t vinyl_tex(int k, int body, int paint, int vinyl, int bonnet, con
   int slot = 0;
   for (int i = 1; i < VINYL_KEEP; ++i)
     if (VIN[i].used < VIN[slot].used) slot = i;
+#ifdef WMMT_NATIVE_VK
+  if (VIN[slot].tex) cinder_vk_texture_destroy(VIN[slot].tex);
+#else
   if (VIN[slot].tex) glDeleteTextures(1, &VIN[slot].tex);
+#endif
   memset(&VIN[slot], 0, sizeof VIN[slot]);
   VIN[slot].pack = k, VIN[slot].body = body, VIN[slot].paint = paint, VIN[slot].vinyl = vinyl, VIN[slot].cb = cb;
   VIN[slot].used = ++vin_clock;
@@ -3373,8 +3834,24 @@ static void vinyl_off(wpk_scene *s, int i, uint32_t old) {
   if (i >= 0) s->textures[i] = old;
 }
 
+/* Paint immediately before each draw: scenes can be reused by cars of different colours.
+ * Borrowed textures follow stock; independently owned aero paints need their own swaps.
+ * Both operations only select loaded texture names, and vinyl must be applied afterwards. */
+static void car_paint_for_draw(wpk_scene *stock, wpk_scene *aero, int paint) {
+  if (stock) wpk_paint(stock, paint);
+  if (aero && aero != stock) {
+    wpk_paint(aero, paint);
+    wpk_share_sync(aero);
+  }
+}
+
 /* the car select's 3D cars, with the arcade's menu camera */
 static void eye_in(const mat4 *m, const float *p, float *out);
+
+static void app_ghost_preview_prepare(const menu_scene *shown);
+static wpk_scene *app_ghost_preview_stock(const menu_car *car);
+static int app_ghost_preview_apply(const menu_car *car,wpk_scene *scene,story_body_view *body,
+                                   app_ghost_paint_scope *scope,app_player_paint_scope *local_scope);
 
 static void menu_draw3d(void *ctx) {
   const menu_scene *s = ctx;
@@ -3387,15 +3864,24 @@ static void menu_draw3d(void *ctx) {
   render_params rp = { .fog_far = 2e6f, .fog_near = 1e6f, .range = { 1e9f, 1e9f, 1e9f } };
   set_car_light(&rp, menu_env_light(s->env), &view);
   /* all the cars at once, not each as it comes in (load_step hurries them meanwhile) */
-  if (!scene_ready(s)) return;
-  glClear(GL_DEPTH_BUFFER_BIT);
-  wpk_scene *scene[MENU_MAX_CARS];
+  if (!s->cars[0].ghost_row && !scene_ready(s)) return;
+  
+#ifdef WMMT_NATIVE_VK
+    render_scene_depth_clear();
+#else
+    glClear(GL_DEPTH_BUFFER_BIT);
+#endif
+  wpk_scene *scene[MENU_MAX_CARS], *stock[MENU_MAX_CARS];
+  int aero[MENU_MAX_CARS];
   for (int i = 0; i < s->n; ++i) {
-    scene[i] = car_pack(s->cars[i].pack);
-    if (scene[i] && s->cars[i].aero) {
-      wpk_paint(scene[i], s->cars[i].paint);
-      scene[i] = menu_aero(s->cars[i].pack, s->cars[i].aero);
-      if (scene[i]) wpk_share_sync(scene[i]);
+    const menu_car *car=&s->cars[i];
+    aero[i] = car->aero;
+    stock[i] = car->ghost_row ? app_ghost_preview_stock(car) : car_pack(car->pack);
+    scene[i] = stock[i];
+    if (scene[i] && aero[i]) {
+      scene[i] = menu_aero(car->pack, aero[i]);
+      /* An unready optional aero must not hide the actual opponent's body. */
+      if (car->ghost_row && !scene[i]) scene[i]=stock[i], aero[i]=0;
     }
   }
   /* clSpriteAnimeCPModel's own scene: the eye at (0, 0, 1000) on the origin, the frustum
@@ -3407,13 +3893,14 @@ static void menu_draw3d(void *ctx) {
     render_blend_pass(pass == WPK_BLEND);
     for (int i = 0; i < s->n; ++i) {
       if (!scene[i]) continue;
-      if (!s->cars[i].aero) wpk_paint(scene[i], s->cars[i].paint);
+      car_paint_for_draw(stock[i], scene[i], s->cars[i].paint);
       mat4 model;
       memcpy(model.m, s->cars[i].model, sizeof model.m);
       const float *e = s->eye;
       mat4 cvp = vp;
       if (s->cars[i].cp) {
-        float h = tanf(0.52359878f) / 64.0f, x = s->cars[i].cp_x, y = s->cars[i].cp_y;
+        float h = tanf(s->cars[i].ghost_row ? s->fov_x*0.5f : 0.52359878f) / 64.0f;
+        float x = s->cars[i].cp_x, y = s->cars[i].cp_y;
         float ew = G.edge / 1.6f; /* (a wide screen's sides) */
         cvp = mat4_mul(mat4_frustum((-x - ew) * h, (640.0f + ew - x) * h, (y - 480.0f) * h, y * h, 5.0f, 20000.0f), cp_view);
         e = cp_eye;
@@ -3424,6 +3911,9 @@ static void menu_draw3d(void *ctx) {
       float d[3] = { e[0] - m[12], e[1] - m[13], e[2] - m[14] };
       float eye[3] = { (d[0] * m[0] + d[1] * m[1] + d[2] * m[2]) / k2, (d[0] * m[4] + d[1] * m[5] + d[2] * m[6]) / k2,
                        (d[0] * m[8] + d[1] * m[9] + d[2] * m[10]) / k2 };
+      story_body_view story_view;
+      int ghost_preview=s->cars[i].ghost_row;
+      if (!ghost_preview && !menu_story_body_scene_view(&G.menu,&s->cars[i],&story_view)) continue;
       rp.mirror = s->cars[i].mirror, rp.wing = s->cars[i].wing, rp.bonnet = s->cars[i].bonnet;
       rp.wheel_custom = wheel_on(s->cars[i].wheel);
       rp.wheel_drop = s->cars[i].lift;
@@ -3433,11 +3923,18 @@ static void menu_draw3d(void *ctx) {
       rp.wheel_rot = still;
       rp.wheels_hub = s->cars[i].turned;
       const char *page1 = "";
-      uint32_t vt = vinyl_tex(s->cars[i].pack, s->cars[i].aero, s->cars[i].paint, s->cars[i].vinyl, s->cars[i].bonnet, &page1), vold = 0;
+      app_player_paint_scope body_scope={0};
+      int custom=s->cars[i].body_color_valid && s->cars[i].body_color.custom_color;
+      if (custom && !app_body_menu_apply(&s->cars[i],scene[i],&body_scope)) continue;
+      app_ghost_paint_scope preview_scope={0};
+      if (ghost_preview && !app_ghost_preview_apply(&s->cars[i],scene[i],&story_view,&preview_scope,&body_scope)) continue;
+      uint32_t vt = (body_scope.cache || preview_scope.cache) ? 0 : vinyl_tex(s->cars[i].pack, aero[i], s->cars[i].paint, s->cars[i].vinyl, s->cars[i].bonnet, &page1), vold = 0;
       int vi = vinyl_on(scene[i], vt, page1, &vold);
-      wpk_draw(scene[i], &cvp, &model, eye, pass, &rp);
+      app_story_body_draw(scene[i],&cvp,&model,eye,pass,&rp,&story_view,s->cars[i].pack);
       vinyl_off(scene[i], vi, vold);
-      draw_wheels(s->cars[i].wheel, s->cars[i].pack, s->cars[i].aero, &cvp, &model, eye, pass, &rp);
+      if (body_scope.cache) app_player_paint_restore(&body_scope);
+      if (preview_scope.cache) app_ghost_paint_restore(&preview_scope);
+      draw_wheels(s->cars[i].wheel, s->cars[i].pack, aero[i], &cvp, &model, eye, pass, &rp);
     }
     rp.wheels = NULL;
     rp.wheels_hub = 0;
@@ -3458,12 +3955,13 @@ static void menu_draw3d(void *ctx) {
     memcpy(model.m, s->cars[i].model, sizeof model.m);
     for (int j = 0; j < 3; ++j) model.m[12 + j] -= 3.1f * model.m[4 + j];
     if (s->cars[i].cp) {
-      float h = tanf(0.52359878f) / 64.0f, x = s->cars[i].cp_x, y = s->cars[i].cp_y;
+      float h = tanf(s->cars[i].ghost_row ? s->fov_x*0.5f : 0.52359878f) / 64.0f;
+      float x = s->cars[i].cp_x, y = s->cars[i].cp_y;
       float ew = G.edge / 1.6f;
       nproj = mat4_frustum((-x - ew) * h, (640.0f + ew - x) * h, (y - 480.0f) * h, y * h, 5.0f, 20000.0f);
       nview = cp_view;
     }
-    lights_draw_neon(&nproj, &nview, model.m, s->cars[i].pack, s->cars[i].aero, s->cars[i].neon, &rp);
+    lights_draw_neon(&nproj, &nview, model.m, s->cars[i].pack, aero[i], s->cars[i].neon, &rp);
   }
   render_blend_pass(0);
 }
@@ -3497,8 +3995,7 @@ static void mini_draw(void *ctx, float fade) {
     G.mini_shown = mc;
   }
   float eye[3], at[3];
-  float k = 1.0f;
-  if (G.mini_move) k = (float)(MINI_MOVE - --G.mini_move) * 0.125f;
+  float k = G.mini_move ? (float)(MINI_MOVE - G.mini_move) * 0.125f : 1.0f;
   for (int i = 0; i < 3; ++i) {
     eye[i] = G.mini_from[0][i] + (mc->eye[i] - G.mini_from[0][i]) * k;
     at[i] = G.mini_from[1][i] + (mc->at[i] - G.mini_from[1][i]) * k;
@@ -3513,7 +4010,12 @@ static void mini_draw(void *ctx, float fade) {
   /* the fade as fog: black by 1 - fade wherever it is */
   render_params rp = { .fog_far = 1e7f * fade, .fog_near = 1e7f * fade - 1e7f, .range = { 1e9f, 1e9f, 1e9f },
                        .object_visible = G.mini_visible, .n_objects = MINI_OBJECTS };
-  glClear(GL_DEPTH_BUFFER_BIT);
+  
+#ifdef WMMT_NATIVE_VK
+    render_scene_depth_clear();
+#else
+    glClear(GL_DEPTH_BUFFER_BIT);
+#endif
   render_begin(&rp);
   memset(G.mini_visible, 0, sizeof G.mini_visible);
   G.mini_visible[MINI_MAP] = G.mini_visible[MINI_COURSE] = G.mini_visible[mc->macula] = 1;
@@ -3521,8 +4023,12 @@ static void mini_draw(void *ctx, float fade) {
     render_blend_pass(pass == WPK_BLEND);
     wpk_draw(&G.mini, &vp, &ident, eye, pass, &rp);
   }
-  int f = G.mini_frame++ % MINI_FRAMES;
+  int f = G.mini_frame % MINI_FRAMES;
+#ifdef WMMT_NATIVE_VK
+  rp.no_depth_test = 1;
+#else
   glDisable(GL_DEPTH_TEST);
+#endif
   render_blend_pass(1);
   memset(G.mini_visible, 0, sizeof G.mini_visible);
   G.mini_visible[mc->gradation] = 1;
@@ -3543,7 +4049,9 @@ static void mini_draw(void *ctx, float fade) {
   eye_in(&bb, eye, eye_bb);
   wpk_draw(&G.mini, &vp, &bb, eye_bb, WPK_BLEND, &rp);
   render_blend_pass(0);
+#ifndef WMMT_NATIVE_VK
   glEnable(GL_DEPTH_TEST);
+#endif
 }
 
 /* frames the race's title page waits for the loading at most (it should never take this
@@ -3558,6 +4066,8 @@ static void mini_draw(void *ctx, float fade) {
 /* a getFade's colour (clFader::draw: 1 atract_p_black, 2 Full_white) as hud_fade's grey */
 static float fade_grey(int fade) { return fade == 2 ? 1.0f : 0.0f; }
 static void story_race_start_failed(void) {
+  app_story_body_clear();
+  app_rotary_stop();
   story_carry_cancel();
   G.story_old_ended = 1;
   G.story_cut_pending = 0;
@@ -3579,7 +4089,7 @@ static int movie_open(int select, int race, const int *rows, int n_rows) {
   memset(cars, 0, sizeof cars);
   for (int k = 0; k < CAR_RIVALS; ++k) {
     G.movie_model[k] = NULL;
-    G.movie_paint[k] = 0;
+    G.movie_paint[k] = 0;G.movie_pack[k]=-1;
     cars[k].type = (unsigned)mv->cars[k];
     cars[k].spokes = 5;
     for (int i = 0; mv->cars[k] && i < n_rows && i < G.n_rival; ++i) {
@@ -3587,7 +4097,7 @@ static int movie_open(int select, int race, const int *rows, int n_rows) {
       used[i] = 1;
       cars[k] = G.race_rv[i];
       G.movie_model[k] = G.rival_model[i];
-      G.movie_paint[k] = G.rival_paint[i];
+      G.movie_paint[k] = G.rival_paint[i];G.movie_pack[k]=G.rival_pack[i];
       break;
     }
   }
@@ -3601,6 +4111,7 @@ static int movie_open(int select, int race, const int *rows, int n_rows) {
       story_carry_cancel();
       return -1;
     }
+    app_rotary_start(); /* missing movie trail: genuine replacement native Init */
     spark_reset(); backfire_reset();
 #ifdef __ANDROID__
     player_tracks_reset();
@@ -3629,6 +4140,7 @@ static void movie_close(void) {
     story_race_start_failed();
     return;
   }
+  app_rotary_start(); /* movie ended: restart only after successful native Init */
   story_carry_finish();
   G.story_old_ended = 0;
   spark_reset(); backfire_reset();
@@ -3641,550 +4153,15 @@ static void movie_close(void) {
   G.top_kmh = 0;
 }
 
-/* ---- the versus (the port's: net.c; over a server, tools/vs_server.py; over Bluetooth or
- * the LAN, a device hosting with vs_host.c): the lobby while the menus show MENU_VS, then the
- * race the host starts (car_set_versus) on the arcade's own link code. Each player's profile
- * describes its car: maker, car, colour, power, handling (VS_PROFILE_CAR, all an older build
- * sends); then its name's five characters (namedb.h's, 255 past its end) for the lobby to
- * draw in the arcade's own glyphs (VS_PROFILE_NAME); then its title (src/title.h, u16) for the
- * race's boxes (VS_PROFILE_DRESS); then its dress-up (vs_dress_t's, a byte each) for the
- * others to draw it as it is. */
-#define VS_PROFILE_CAR 5
-#define VS_PROFILE_NAME 10
-#define VS_PROFILE_DRESS 12
-/* Experimental upstream interoperability: advertise upstream's W/168 profile.
- * This fork retains different gameplay/physics; matching this marker does NOT
- * prove deterministic race compatibility. Cross-build play requires validation
- * and may desynchronize. Update this marker when the agreed build changes. */
-#define VS_PROFILE_BUILD 19
-#define VS_BUILD_NAMESPACE 'W'
-#define VS_BUILD_REVISION 168
-#define VS_PROFILE 21
-enum { VS_GK_OFF, VS_GK_BROWSE, VS_GK_JOIN, VS_GK_HOST };
-#define VS_SILENT 3.0 /* seconds without the server before the screen says so */
-#define VS_GONE 10.0  /* seconds without it in a race on: the host is gone */
-#define VS_CLOSED_NOTICE 180 /* frames of the race's notice of it */
-/* the time attack course whose map and HUD a join ramp's race uses (the ramp's road) */
-static const signed char VS_RAMP_COURSE[MENU_VS_RAMPS] = { 0, 1, 0, 1, 2, 3, 4, 4, 4, 4, 5, 5, 5, 5, 7, 9, 9, 6, 8, 8, 8, 8 };
-
-static void vs_link_send(const unsigned char *p, int len, void *ctx) { (void)ctx; net_race_send(p, len); }
-static void vs_link_receive(void *ctx) { (void)ctx; net_race_receive(); }
-
-static void vs_profile(unsigned char *p) {
-  int power, handling;
-  menu_tune(&G.menu, &power, &handling);
+/* WVS4 APP implementation; Parent supplies smoke teardown after its loader. */
+#ifndef APP_VS4_TEARDOWN_EXTRA
 #ifdef __ANDROID__
-  pre_race_tune_vs_apply(&G.menu.pre_tune, G.menu.maker, G.menu.car, &power, &handling);
-#endif
-  p[0] = (unsigned char)G.menu.maker, p[1] = (unsigned char)G.menu.car, p[2] = (unsigned char)G.menu.color;
-  p[3] = (unsigned char)power, p[4] = (unsigned char)handling;
-  for (int i = 0; i < 5; ++i) p[VS_PROFILE_CAR + i] = G.menu.name[i] >= 0 ? (unsigned char)G.menu.name[i] : 255;
-  int title = menu_title(&G.menu);
-  p[VS_PROFILE_NAME] = (unsigned char)(title & 0xff), p[VS_PROFILE_NAME + 1] = (unsigned char)(title >> 8 & 0xff);
-  int mk = G.menu.maker, c = G.menu.car;
-  unsigned char *d = p + VS_PROFILE_DRESS;
-  d[0] = (unsigned char)G.menu.aero[mk][c], d[1] = (unsigned char)G.menu.mirror[mk][c];
-  d[2] = (unsigned char)G.menu.wing[mk][c], d[3] = (unsigned char)G.menu.bonnet[mk][c];
-  d[4] = G.menu.wheel[mk][c], d[5] = (unsigned char)G.menu.neon[mk][c], d[6] = G.menu.vinyl[mk][c];
-  p[VS_PROFILE_BUILD] = VS_BUILD_NAMESPACE;
-  p[VS_PROFILE_BUILD + 1] = VS_BUILD_REVISION;
-}
-
-#ifdef __ANDROID__
-/* A lobby/GO echo must describe this exact client and confirmed car profile. */
-static int vs_own_profile_matches(const net_player *pl, const unsigned char *profile) {
-  return pl && pl->id == G.vs_id && pl->profile_len >= VS_PROFILE &&
-         memcmp(pl->profile, profile, VS_PROFILE) == 0;
-}
-static int vs_own_lobby_ready(const net_lobby *l, const menu_state *m) {
-  unsigned char profile[VS_PROFILE];
-  if (!l->connected || l->me < 0 || l->me >= l->n || l->me >= NET_PLAYERS) return 0;
-  vs_profile(profile);
-  return l->player[l->me].status == menu_vs_status(m) && vs_own_profile_matches(&l->player[l->me], profile);
-}
-#endif
-
-static int vs_same_build(const net_player *pl) {
-  return pl->profile_len >= VS_PROFILE && pl->profile[VS_PROFILE_BUILD] == VS_BUILD_NAMESPACE &&
-         pl->profile[VS_PROFILE_BUILD + 1] == VS_BUILD_REVISION;
-}
-
-/* a player's dress-up from its profile (an older build's, or none sent: stock) */
-static vs_dress_t vs_dress(const net_player *pl) {
-  vs_dress_t v = { 0 };
-  if (pl->profile_len < VS_PROFILE_BUILD) return v;
-  const unsigned char *d = pl->profile + VS_PROFILE_DRESS;
-  v.aero = d[0] <= 3 ? d[0] : 0;
-  v.mirror = d[1] <= 1 ? d[1] : 0;
-  v.wing = d[2] <= 4 ? d[2] : 0;
-  v.bonnet = d[3] <= 3 ? d[3] : 0;
-  v.wheel = d[4];
-  v.neon = d[5] <= 12 ? d[5] : 0;
-  v.vinyl = d[6] < 100 ? d[6] : 0;
-  return v;
-}
-
-/* clEffCarType::isR35: the GT-R R35 (its box shows the tune's steps) */
-static int vs_r35(int maker, int car) {
-  if (maker < 0 || maker >= CARDB_ALL || car < 0 || car >= CARDB_NCARS[maker]) return 0;
-  for (const char *s = CARDB_CARS[maker][car].label; *s; ++s)
-    if (s[0] == '[' && s[1] == 'R' && s[2] == '3' && s[3] == '5' && s[4] == ']') return 1;
-  return 0;
-}
-
-/* a player's car from its profile (NULL: none this app knows) */
-static const cardb_color *vs_color(const net_player *pl) {
-  const unsigned char *p = pl->profile;
-  if (pl->profile_len < VS_PROFILE_CAR || p[0] >= CARDB_ALL || p[1] >= CARDB_NCARS[p[0]]) return NULL;
-  const cardb_car *c = &CARDB_CARS[p[0]][p[1]];
-  return p[2] < c->ncolors ? &c->colors[p[2]] : NULL;
-}
-
-/* the save's name as the versus sends it: its characters' (ASCII) or, a save from before
- * the names, PLAYER n as its card shows (nothing asked: Allan 10-26) */
-static void vs_name(char *name, int n) {
-  menu_name_ascii(&G.menu, name, n);
-  if (!name[0]) snprintf(name, n, "PLAYER %d", G.menu.save_slot >= 1 && G.menu.save_slot <= MENU_SAVES ? G.menu.save_slot : 1);
-}
-
-/* the screen's font has ASCII only (a car's name has full-width signs) */
-static void vs_ascii(char *out, int n, const char *s) {
-  int k = 0;
-  for (; s && *s && k < n - 1; ++s) {
-    unsigned char c = (unsigned char)*s;
-    if (c < 0x80) out[k++] = (char)c;
-    else if (c == 0xef && (unsigned char)s[1] == 0xbc && (unsigned char)s[2] == 0x8d) out[k++] = '-', s += 2; /* － */
-  }
-  out[k] = 0;
-}
-
-/* save_dir/vs_server: the server's address as last entered */
-static void vs_ip_load(void) {
-  char path[1200];
-  snprintf(path, sizeof path, "%s/vs_server", G.save_dir);
-  FILE *f = fopen(path, "r");
-  if (!f) return;
-  char ip[sizeof G.menu.vs.ip] = { 0 };
-  if (fgets(ip, sizeof ip, f)) {
-    int k = 0;
-    for (int i = 0; ip[i]; ++i)
-      if ((ip[i] >= '0' && ip[i] <= '9') || ip[i] == '.') ip[k++] = ip[i];
-    ip[k] = 0;
-    memcpy(G.menu.vs.ip, ip, sizeof ip);
-  }
-  fclose(f);
-}
-
-static void vs_ip_save(void) {
-  char path[1200];
-  snprintf(path, sizeof path, "%s/vs_server", G.save_dir);
-  FILE *f = fopen(path, "w");
-  if (!f) return;
-  fprintf(f, "%s\n", G.menu.vs.ip);
-  fclose(f);
-}
-
-/* no GameKit here (Android): Bluetooth versus is Apple's only, the LAN plays across */
-#ifdef __ANDROID__
-#define VS_NO_BT "BLUETOOTH: APPLE ONLY. USE LAN"
+#define APP_VS4_TEARDOWN_EXTRA() player_smoke_reset()
 #else
-#define VS_NO_BT "NO BLUETOOTH HERE"
+#define APP_VS4_TEARDOWN_EXTRA() ((void)0)
 #endif
-
-/* everything of the versus off: the client, the host, the LAN's search, Bluetooth */
-static void vs_off(void) {
-  if (net_is_open() || vs_host_is_open()) fprintf(stderr, "versus: off (screen %d, state %d)\n", G.menu.screen, G.menu.vs.state);
-  net_close();
-  vs_host_close();
-  net_scan(0, 0);
-  if (G.vs_gk != VS_GK_OFF) gk_stop();
-  G.vs_gk = VS_GK_OFF;
-  G.menu.vs.hosting = 0;
-  G.menu.vs.n_found = 0;
-}
-
-/* host a game here: the host on UDP (and Bluetooth's peers), this app's client on the loopback */
-static void vs_host_start(const char *name) {
-  vs_off();
-  int bt = G.menu.vs.kind == MENU_VS_BT;
-  if (bt && gk_host(name) != 0) {
-    snprintf(G.menu.vs.note, sizeof G.menu.vs.note, VS_NO_BT);
-    return;
-  }
-  if (bt) G.vs_gk = VS_GK_HOST;
-  if (vs_host_open(bt, G.vs_id) != 0 || net_open("127.0.0.1", NET_PORT, G.vs_id) != 0) {
-    vs_off();
-    snprintf(G.menu.vs.note, sizeof G.menu.vs.note, "COULD NOT HOST (PORT %d IN USE?)", NET_PORT);
-    return;
-  }
-  G.menu.vs.hosting = 1;
-  G.menu.vs.state = MENU_VS_CONNECTING;
-  fprintf(stderr, "versus: hosting a %s game as %08x\n", bt ? "Bluetooth" : "LAN", G.vs_id);
-}
-
-/* the games nearby, while nothing is joined: the LAN's answers, or the Bluetooth hosts seen */
-static void vs_search(double now, const char *name) {
-  menu_state *m = &G.menu;
-  if (m->vs.kind == MENU_VS_LAN) {
-    net_scan(now, 1);
-    net_found f[MENU_VS_FOUND];
-    m->vs.n_found = net_found_list(f, MENU_VS_FOUND);
-    for (int k = 0; k < m->vs.n_found; ++k) {
-      char nm[NET_NAME + 1];
-      vs_ascii(nm, sizeof nm, f[k].name);
-      snprintf(m->vs.found[k], sizeof m->vs.found[k], "%s (%d/%d)", nm, f[k].n, NET_PLAYERS);
-    }
-  } else if (m->vs.kind == MENU_VS_BT) {
-    if (G.vs_gk == VS_GK_OFF) G.vs_gk = gk_browse(name) == 0 ? VS_GK_BROWSE : -1;
-    char f[MENU_VS_FOUND][GK_NAME];
-    m->vs.n_found = G.vs_gk == VS_GK_BROWSE ? gk_found(f, MENU_VS_FOUND) : 0;
-    for (int k = 0; k < m->vs.n_found; ++k) vs_ascii(m->vs.found[k], sizeof m->vs.found[k], f[k]);
-    if (G.vs_gk < 0) snprintf(m->vs.note, sizeof m->vs.note, VS_NO_BT);
-  }
-}
-
-/* A menu frame's part of the versus: hosting, finding and joining (Bluetooth, LAN) or connecting
- * (a server), the lobby as the host has it, the host's START, and the GO that sends this app to
- * the race's loading (its course's map: the race starts once that is in, menu_frame) */
-/* The area vote (MENU_VS_AREA, the arcade's seqJoCourseSelect) over the lobby's statuses
- * (menu_vs_status). Each player's card and vote come from its status; this device opens the
- * vote when the host's does. The host counts it (clNet::getJoinArea): once everyone in it has
- * voted, or VS_AREA_LATE s after its own 20 s (a vote not in: the card it was on, omakase's a
- * random area), the most voted card wins, a tie one of them at random; the result shows for
- * VS_REVEAL s, then the race starts on a random start ramp of the area
- * (clEffAreaType::getRandomRamp, the area table 0x97391a0's ramps). */
-#define VS_AREA_LATE 3.0
-#define VS_REVEAL 1.6
-static const signed char AREA_RAMP[8][2] = { { 0, 4 }, { 4, 2 }, { 6, 4 }, { 10, 4 }, { 17, 1 }, { 14, 1 }, { 15, 2 }, { 18, 4 } };
-
-static void vs_day_open(menu_state *m);
-
-static void vs_area(menu_state *m, const net_lobby *l, double now) {
-  int host = l->me == l->host;
-  if (m->screen == MENU_VS && m->vs.state == MENU_VS_LOBBY && !m->vs.area_go && !host && l->host < m->vs.n) {
-    int st = l->player[l->host].status;
-    if (st >= MENU_VS_CHOOSING && st < MENU_VS_FINAL) m->vs.area_go = 1;
-  }
-  if (m->screen != MENU_VS_AREA) {
-    G.vs_area_at = 0;
-    return;
-  }
-  if (!G.vs_area_at) G.vs_area_at = now;
-  if (!host) {
-    int st = l->host < m->vs.n ? l->player[l->host].status : 0;
-    if (m->vs.area_final < 0 && st >= MENU_VS_FINAL && st < MENU_VS_FINAL + MENU_VS_CARDS) m->vs.area_final = st - MENU_VS_FINAL;
-    /* the host on to the time zone vote: this one with it */
-    if (MENU_VS_IN_DAY(st)) vs_day_open(m);
-    return;
-  }
-  if (m->vs.area_final < 0) {
-    int votes[MENU_VS_CARDS] = { 0 }, all = 1, late = m->vs.timer == 0 && now - G.vs_area_at > 20.0 + VS_AREA_LATE;
-    for (int i = 0; i < m->vs.n; ++i) {
-      int v = i == m->vs.me ? m->vs.voted : m->vs.other_vote[i];
-      int card = i == m->vs.me ? (m->vs.voted ? m->vs.vote : m->vs.item) : m->vs.other[i];
-      if (v < 0) continue; /* not in the vote (back from a race late, say) */
-      if (v == 2) continue; /* omakase: the others' choice */
-      if (!v) {
-        all = 0;
-        if (!late || card <= 0 || card >= MENU_VS_CARDS) continue;
-      }
-      if (card > 0 && card < MENU_VS_CARDS) votes[card]++;
-    }
-    if (!all && !late) return;
-    int best = 0, n_best = 0;
-    for (int k = 1; k < MENU_VS_CARDS; ++k) best = votes[k] > best ? votes[k] : best;
-    int tie[MENU_VS_CARDS];
-    for (int k = 1; k < MENU_VS_CARDS; ++k)
-      if (votes[k] == best && best) tie[n_best++] = k;
-    /* every vote omakase: the arcade's random area */
-    m->vs.area_final = n_best ? tie[rand() % n_best] : menu_vs_random_card();
-    G.vs_final_at = now;
-    fprintf(stderr, "versus: area vote: card %d (%d votes, %d tied)\n", m->vs.area_final, best, n_best);
-    return;
-  }
-  /* the result shown: the start ramp (clEffAreaType::getRandomRamp), the time zone vote */
-  if (now - G.vs_final_at >= VS_REVEAL) {
-    int a = menu_vs_card_area(m->vs.area_final);
-    m->vs.ramp = AREA_RAMP[a < 0 ? 0 : a][0] + rand() % AREA_RAMP[a < 0 ? 0 : a][1];
-    vs_day_open(m);
-  }
-}
-
-/* The time zone vote (MENU_BGM's vs.day, seqJoinDayTimeSelect after seqJoStartRampDecide)
- * over the statuses again: the host counts it (clNet::getJoinDayTime) once everyone in it has
- * voted, or VS_AREA_LATE s after its own 20 s (a vote not in: the card it was on); the most
- * voted zone wins, a tie one at random; the result shows VS_REVEAL s, then the race starts with
- * it (the GO's ramp byte's top bit). The map of the area's city loads under it. */
-static void vs_day_open(menu_state *m) {
-  int a = menu_vs_card_area(m->vs.area_final);
-  if (m->vs.me == m->vs.host) m->course = VS_RAMP_COURSE[m->vs.ramp];
-  else if (a >= 0) m->course = VS_RAMP_COURSE[AREA_RAMP[a][0]];
-  menu_vs_day_open(m);
-}
-
-static void vs_day(menu_state *m, const net_lobby *l, double now) {
-  int host = l->me == l->host;
-  if (m->screen != MENU_BGM || !m->vs.day) {
-    G.vs_day_at = 0;
-    return;
-  }
-  if (!G.vs_day_at) G.vs_day_at = now, G.vs_day_started = 0;
-  if (!host) {
-    int st = l->host < m->vs.n ? l->player[l->host].status : 0;
-    if (m->vs.day_final < 0 && st >= MENU_VS_DAY_FINAL && st < MENU_VS_LOADED) m->vs.day_final = st - MENU_VS_DAY_FINAL;
-    return;
-  }
-  if (m->vs.day_final < 0) {
-    int votes[2] = { 0 }, all = 1, late = m->vs.day_timer == 0 && now - G.vs_day_at > 20.0 + VS_AREA_LATE;
-    for (int i = 0; i < m->vs.n; ++i) {
-      int v = i == m->vs.me ? m->vs.day_voted : m->vs.other_day[i];
-      int zone = i == m->vs.me ? m->zone : m->vs.other_zone[i];
-      if (v < 0) continue;
-      if (v == 2) continue; /* omakase: the others' choice */
-      if (!v) {
-        all = 0;
-        if (!late) continue;
-      }
-      votes[zone & 1]++;
-    }
-    if (!all && !late) return;
-    m->vs.day_final = m->zones < 2 ? 0 : votes[0] == votes[1] ? rand() % 2 : votes[1] > votes[0];
-    /* everyone's race has the host's song (Allan 10-27: one BGM for all), sent with the GO */
-    G.vs_song = m->song;
-    G.vs_day_final_at = now;
-    fprintf(stderr, "versus: time zone vote: %s (%d morning, %d night)\n", m->vs.day_final ? "night" : "morning", votes[0], votes[1]);
-    return;
-  }
-  /* Recheck after voting: a different build may have joined the room. */
-  for (int i = 0; i < l->n; ++i)
-    if (i != l->me && !vs_same_build(&l->player[i])) return;
-  /* START (again each 2 s should it or its GO be lost: the GO moves this screen on) */
-  if (now - G.vs_day_final_at >= VS_REVEAL && now - G.vs_day_started >= 2.0) {
-#ifdef __ANDROID__
-    if (!vs_own_lobby_ready(l, m)) { G.vs_wait_note_until = now + 2.0; return; }
 #endif
-    G.vs_day_started = now;
-    net_start(m->vs.ramp | m->vs.day_final << 7, m->vs.km, G.vs_song + 2);
-  }
-}
-
-static void vs_menu(void) {
-  menu_state *m = &G.menu;
-  double now = now_ms() * 1e-3;
-  char name[NET_NAME + 1];
-  vs_name(name, sizeof name);
-  if (m->screen != MENU_VS && m->screen != MENU_VS_AREA && m->screen != MENU_VS_MATCH && m->screen != MENU_VS_STAR &&
-      !(m->screen == MENU_BGM && m->vs.day)) { /* left the screen */
-    if (net_is_open() || vs_host_is_open() || G.vs_gk != VS_GK_OFF || m->vs.n_found) vs_off();
-    m->vs.state = MENU_VS_OFF, m->vs.n = 0;
-    return;
-  }
-  if (m->vs.connect) {
-    int c = m->vs.connect;
-    m->vs.connect = 0;
-    m->vs.n = 0;
-    m->vs.note[0] = 0;
-    G.vs_asked = now;
-    if (c < 0) {
-      vs_off();
-      m->vs.state = MENU_VS_OFF;
-    } else if (m->vs.kind != MENU_VS_NET) {
-      vs_host_start(name);
-    } else {
-      vs_ip_save();
-      if (net_open(m->vs.ip, NET_PORT, G.vs_id) == 0) {
-        m->vs.state = MENU_VS_CONNECTING;
-        fprintf(stderr, "versus: connecting to %s as %08x\n", m->vs.ip, G.vs_id);
-      } else {
-        snprintf(m->vs.note, sizeof m->vs.note, "NOT AN ADDRESS (LIKE 192.168.1.5)");
-      }
-    }
-  }
-  if (m->vs.join) {
-    int k = m->vs.join - 1;
-    m->vs.join = 0;
-    m->vs.note[0] = 0;
-    G.vs_asked = now;
-    if (m->vs.kind == MENU_VS_LAN) {
-      net_found f[MENU_VS_FOUND];
-      int n = net_found_list(f, MENU_VS_FOUND);
-      if (k >= 0 && k < n && net_open(f[k].ip, NET_PORT, G.vs_id) == 0) {
-        net_scan(now, 0);
-        m->vs.state = MENU_VS_CONNECTING;
-        fprintf(stderr, "versus: joining %s at %s as %08x\n", f[k].name, f[k].ip, G.vs_id);
-      }
-    } else if (m->vs.kind == MENU_VS_BT && G.vs_gk == VS_GK_BROWSE && gk_join(k) == 0) {
-      G.vs_gk = VS_GK_JOIN;
-      m->vs.state = MENU_VS_CONNECTING;
-    }
-  }
-  /* Bluetooth's join: the client once the session has its host, back to the search if not */
-  if (G.vs_gk == VS_GK_JOIN && !net_is_open()) {
-    int j = gk_joined();
-    if (j > 0) {
-      net_open_gk(G.vs_id);
-      G.vs_asked = now;
-    } else if (j < 0 || now - G.vs_asked > 12.0) {
-      gk_stop();
-      G.vs_gk = VS_GK_OFF;
-      m->vs.state = MENU_VS_OFF;
-      snprintf(m->vs.note, sizeof m->vs.note, "COULD NOT JOIN");
-    }
-  }
-  if (G.vs_gk == VS_GK_JOIN && net_is_open() && gk_joined() < 0) {
-    vs_off();
-    m->vs.state = MENU_VS_OFF;
-    snprintf(m->vs.note, sizeof m->vs.note, "THE HOST WENT AWAY");
-  }
-  if (vs_host_is_open()) vs_host_poll(now, name);
-  if (m->vs.state == MENU_VS_OFF) vs_search(now, name);
-  if (!net_is_open()) {
-    if (m->vs.state != MENU_VS_OFF && G.vs_gk != VS_GK_JOIN) m->vs.state = MENU_VS_OFF, m->vs.n = 0;
-    return;
-  }
-  unsigned char profile[VS_PROFILE];
-  vs_profile(profile);
-  net_poll(now, menu_vs_status(m), name, profile, VS_PROFILE);
-  if (net_host_closed()) {
-    vs_off();
-    m->vs.state = MENU_VS_OFF, m->vs.n = 0;
-    snprintf(m->vs.note, sizeof m->vs.note, "HOST LEFT OR CONNECTION LOST");
-    return;
-  }
-  const net_lobby *l = net_lobby_now();
-  if (l->connected) {
-    if (m->vs.state == MENU_VS_CONNECTING) m->vs.state = MENU_VS_LOBBY;
-    m->vs.n = l->n < MENU_VS_PLAYERS ? l->n : MENU_VS_PLAYERS;
-    m->vs.me = l->me;
-    m->vs.host = l->host;
-    for (int i = 0; i < m->vs.n; ++i) {
-      const net_player *pl = &l->player[i];
-      vs_ascii(m->vs.name[i], sizeof m->vs.name[i], pl->name);
-      for (int j = 0, end = pl->profile_len < VS_PROFILE_NAME; j < 5; ++j) {
-        end |= pl->profile[VS_PROFILE_CAR + j] == 255;
-        m->vs.glyph[i][j] = (short)(end ? -1 : pl->profile[VS_PROFILE_CAR + j]);
-      }
-      const cardb_color *col = vs_color(pl);
-      const cardb_car *car = col ? &CARDB_CARS[pl->profile[0]][pl->profile[1]] : NULL;
-      vs_ascii(m->vs.car[i], sizeof m->vs.car[i], car ? car->label : "?");
-      m->vs.mismatch[i] = i != l->me && !vs_same_build(pl);
-      if (m->vs.mismatch[i]) vs_ascii(m->vs.car[i], sizeof m->vs.car[i], "VERSION MISMATCH, UPDATE");
-      m->vs.racing[i] = pl->status == 1 || pl->status == MENU_VS_LOADED;
-      /* the area vote's (menu_vs_status) */
-      int st = pl->status;
-      m->vs.other_vote[i] = st >= MENU_VS_CHOOSING && st < MENU_VS_VOTED ? 0 : st >= MENU_VS_VOTED && st < MENU_VS_OMAKASE ? 1
-                            : st >= MENU_VS_OMAKASE && st < MENU_VS_FINAL ? 2 : st >= MENU_VS_FINAL && st < MENU_VS_DAY ? 1 : -1;
-      m->vs.other[i] = st >= MENU_VS_FINAL ? st - MENU_VS_FINAL : st >= MENU_VS_OMAKASE ? st - MENU_VS_OMAKASE
-                       : st >= MENU_VS_VOTED ? st - MENU_VS_VOTED : st - MENU_VS_CHOOSING;
-      /* and the time zone vote's */
-      m->vs.other_day[i] = st >= MENU_VS_DAY && st < MENU_VS_DAY_VOTED ? 0 : st >= MENU_VS_DAY_VOTED && st < MENU_VS_LOADED ? 1
-                           : st >= MENU_VS_DAY_OMAKASE && st < MENU_VS_DAY_OMAKASE + 2 ? 2 : -1;
-      m->vs.other_zone[i] = (st - MENU_VS_DAY) & 1;
-    }
-    vs_area(m, l, now);
-    vs_day(m, l, now);
-  }
-  double silent = l->connected ? net_silence(now) : now - G.vs_asked;
-  /* a host gone without a word (its app closed, its device asleep): back to the search, where
-   * it shows again once hosting again (Allan 10-27: a way back in) */
-  if (l->connected && !vs_host_is_open() && m->vs.state == MENU_VS_LOBBY && silent > VS_GONE) {
-    fprintf(stderr, "versus: the host went away\n");
-    vs_off();
-    m->vs.state = MENU_VS_OFF, m->vs.n = 0;
-    snprintf(m->vs.note, sizeof m->vs.note, "THE HOST WENT AWAY");
-    return;
-  }
-  const char *quiet = "NO RESPONSE - CHECK NETWORK OR GAME VERSION";
-  if (m->vs.state == MENU_VS_CONNECTING)
-    snprintf(m->vs.note, sizeof m->vs.note, "%s", silent > VS_SILENT ? quiet : "CONNECTING...");
-  else if (silent > VS_SILENT)
-    snprintf(m->vs.note, sizeof m->vs.note, "%s", quiet);
-  else if (now < G.vs_abort_note_until)
-    snprintf(m->vs.note, sizeof m->vs.note, "PLAYER LEFT - BACK IN ROOM");
-  else if (now < G.vs_wait_note_until)
-    snprintf(m->vs.note, sizeof m->vs.note, "WAITING FOR ALL PLAYERS");
-  else
-    m->vs.note[0] = 0;
-  if (m->vs.start) {
-    /* the host's START opens the area vote (the others follow its status) */
-    m->vs.start = 0;
-    if (m->vs.state == MENU_VS_LOBBY && l->me == l->host && m->screen == MENU_VS) {
-      int ready = l->n >= 2;
-      for (int i = 0; i < l->n; ++i) ready &= !m->vs.racing[i] && !m->vs.mismatch[i];
-#ifdef __ANDROID__
-      if (!vs_own_lobby_ready(l, m)) { ready = 0; G.vs_wait_note_until = now + 2.0; }
-#endif
-      if (ready) m->vs.area_go = 1;
-    }
-  }
-  net_go go;
-  if (m->vs.state == MENU_VS_LOBBY && net_take_go(&go)) {
-    /* Do not trust an older or modified host to enforce build compatibility. */
-    for (int i = 0; i < go.n; ++i) {
-      if (!vs_same_build(&go.player[i])) {
-        vs_off();
-        m->vs.state = MENU_VS_OFF; m->vs.n = 0;
-        snprintf(m->vs.note, sizeof m->vs.note, "VERSION MISMATCH - RACE REJECTED");
-        return;
-      }
-    }
-#ifdef __ANDROID__
-    unsigned char expected[VS_PROFILE];
-    vs_profile(expected);
-    if (go.pcb < 0 || go.pcb >= go.n || go.pcb >= NET_PLAYERS ||
-        !vs_own_profile_matches(&go.player[go.pcb], expected)) {
-      vs_off();
-      m->vs.state = MENU_VS_OFF; m->vs.n = 0;
-      menu_vs_closed(m, "PROFILE NOT SYNCED - RECONNECT");
-      return;
-    }
-#endif
-    /* the time zone vote's result rides the ramp's top bit */
-    int zone = go.ramp >> 7 & 1;
-    go.ramp &= 0x7f;
-    m->zone = m->zones > 1 ? zone : 0;
-    /* and the host's song (a host from before it: each its own) */
-    if (go.song) menu_vs_song(m, go.song - 2);
-    G.vs_go = go;
-    G.vs_wait = G.vs_seen_loaded = 0;
-    menu_vs_loading(m);
-    /* the cars flying in once it is loaded (MENU_VS_MATCH): the machines' cars and plates */
-    m->vs.match_n = go.n < MENU_VS_PLAYERS ? go.n : MENU_VS_PLAYERS;
-    m->vs.match_me = go.pcb;
-    for (int k = 0; k < m->vs.match_n; ++k) {
-      const net_player *pl = &go.player[k];
-      const unsigned char *p = pl->profile;
-      int car = vs_color(pl) != NULL;
-      m->vs.match[k].maker = car ? p[0] : -1;
-      m->vs.match[k].car = car ? p[1] : -1;
-      m->vs.match[k].color = car ? p[2] : -1;
-      m->vs.match[k].power = car && p[3] <= CAR_TUNE_MAX ? p[3] : 0;
-      m->vs.match[k].handling = car && p[4] <= CAR_TUNE_MAX ? p[4] : 0;
-      for (int j = 0, end = pl->profile_len < VS_PROFILE_NAME; j < 5; ++j) {
-        end |= p[VS_PROFILE_CAR + j] == 255;
-        m->vs.match[k].glyph[j] = (short)(end ? -1 : p[VS_PROFILE_CAR + j]);
-      }
-      /* no card name sent (PLAYER n): its ASCII name in the glyphs (the plate had none) */
-      if (m->vs.match[k].glyph[0] < 0) {
-        char nm[NET_NAME + 1];
-        vs_ascii(nm, sizeof nm, pl->name);
-        menu_name_glyphs(m->vs.match[k].glyph, nm);
-      }
-      /* (an older build's: none, the box shows the first) */
-      vs_dress_t d = vs_dress(pl);
-      m->vs.match[k].aero = d.aero, m->vs.match[k].mirror = d.mirror, m->vs.match[k].wing = d.wing;
-      m->vs.match[k].bonnet = d.bonnet, m->vs.match[k].wheel = d.wheel, m->vs.match[k].neon = d.neon;
-      m->vs.match[k].vinyl = d.vinyl;
-      m->vs.match[k].title = pl->profile_len >= VS_PROFILE_DRESS ? p[VS_PROFILE_NAME] | p[VS_PROFILE_NAME + 1] << 8 : 0;
-    }
-    m->vs.ramp = go.ramp < MENU_VS_RAMPS ? go.ramp : 0;
-    m->vs.km = go.km;
-    m->course = VS_RAMP_COURSE[m->vs.ramp];
-    G.pre_wait = 0;
-    fprintf(stderr, "versus: race %llu, ramp %d (%s), %s, %d km, %d machines, this one PCB %d\n", (unsigned long long)go.race, go.ramp,
-            menu_vs_ramp_name(m->vs.ramp), m->zone ? "night" : "morning", go.km, go.n, go.pcb);
-  }
-}
+#include "app_vs4.inc"
 
 /* A phone's wide menu (app_wide): the 1024x768 layout's 4:3 middle, its outermost columns
  * drawn out over the sides, darkening toward the screen's edges, for the black bars (and the
@@ -4202,9 +4179,35 @@ static struct {
   int w, h, fmt, off;
 } SIDES;
 
+#ifdef WMMT_NATIVE_VK
+#include "app_native_sides.inc"
+#endif
+
 #ifdef __ANDROID__
 /* the texture (and its framebuffer) for the blit, in sized format fmt (0: RGB8, 1: RGBA8) */
 static void sides_target(int fmt) {
+#ifdef WMMT_NATIVE_VK
+  if (SIDES.fb) cinder_vk_target_destroy(SIDES.fb);
+  if (SIDES.tex) cinder_vk_texture_destroy(SIDES.tex);
+  SIDES.fb = SIDES.tex = 0;
+  SIDES.w = SIDES.h = 0; SIDES.fmt = fmt;
+  const cinder_vk_sampler sampler = { .use_state=1,.min_filter=VK_FILTER_LINEAR,.mag_filter=VK_FILTER_LINEAR,
+    .mipmap_mode=VK_SAMPLER_MIPMAP_MODE_NEAREST,.address_u=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    .address_v=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.anisotropy=1 };
+  const cinder_vk_storage_desc storage = { .width=G.fb_w,.height=G.fb_h,.samples=1,
+    .format=CINDER_VK_STORAGE_RGBA8,.transfer_dst=1,.sampler=sampler };
+  uint32_t texture = cinder_vk_texture_storage(&storage);
+  if (!texture) return;
+  const cinder_vk_target_create_desc desc = { .color={CINDER_VK_IMAGE_TEXTURE,texture} };
+  uint32_t target = cinder_vk_target_create(&desc);
+  if (!target || !cinder_vk_target_ready(target)) {
+    if (target) cinder_vk_target_destroy(target);
+    cinder_vk_texture_destroy(texture);
+    return;
+  }
+  SIDES.tex = texture; SIDES.fb = target;
+  SIDES.w = G.fb_w; SIDES.h = G.fb_h;
+#else
   if (SIDES.fb) glDeleteFramebuffers(1, &SIDES.fb);
   if (SIDES.tex) glDeleteTextures(1, &SIDES.tex);
   glGenTextures(1, &SIDES.tex);
@@ -4217,10 +4220,15 @@ static void sides_target(int fmt) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glGenFramebuffers(1, &SIDES.fb);
   SIDES.w = G.fb_w, SIDES.h = G.fb_h, SIDES.fmt = fmt;
+#endif
 }
 
 /* the two columns into the texture; 0 if the blit was refused */
 static int sides_blit(GLint screen, int xl, int xr) {
+#ifdef WMMT_NATIVE_VK
+  (void)screen;
+  return sides_native_copy(SIDES.fb, G.fb_w, G.fb_h, xl, xr);
+#else
   while (glGetError() != GL_NO_ERROR) {}
   glBindFramebuffer(GL_FRAMEBUFFER, SIDES.fb);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, SIDES.tex, 0);
@@ -4238,6 +4246,7 @@ static int sides_blit(GLint screen, int xl, int xr) {
 #endif
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)screen);
   return glGetError() == GL_NO_ERROR;
+#endif
 }
 #else
 /* the texture: the two columns side by side */
@@ -4265,8 +4274,24 @@ static int sides_blit(GLint screen, int xl, int xr) {
 #endif
 
 static void wide_sides(void) {
+#ifdef WMMT_NATIVE_VK
+  if (SIDES.off || G.fb_w < 8 || G.fb_h <= 0) return;
+  float edge = G.edge * (float)G.fb_h / 768.0f + 0.5f;
+  /* Preserve normal rounding, but reject invalid extents/edges before integer
+   * conversion or doubled-x arithmetic (resize/lifecycle inputs can be empty). */
+  if (!isfinite(edge) || edge < 2 || (double)edge >= (double)G.fb_w) return;
+  int x0 = (int)edge;
+  if (x0 > (G.fb_w - 4) / 2) return;
+#else
   int x0 = (int)(G.edge * (float)G.fb_h / 768.0f + 0.5f); /* the layout's x 0 on the screen */
   if (SIDES.off || x0 < 2 || 2 * x0 + 4 > G.fb_w) return;
+#endif
+#ifdef WMMT_NATIVE_VK
+  if (SIDES.prog && !cinder_vk_program_ready(SIDES.prog)) {
+    cinder_vk_program_destroy(SIDES.prog);
+    SIDES.prog = 0;
+  }
+#endif
   if (!SIDES.prog) {
     static const char *vs =
       "attribute vec2 aPos; attribute vec2 aUV; attribute float aShade; varying vec2 vUV; varying float vShade;\n"
@@ -4281,7 +4306,13 @@ static void wide_sides(void) {
       "  gl_FragColor = vec4(c * vShade, 1.0);\n"
       "}\n";
     const char *attribs[] = { "aPos", "aUV", "aShade" };
-#ifdef __ANDROID__
+#ifdef WMMT_NATIVE_VK
+    SIDES.prog = cinder_vk_program_create(vs, fs, attribs, 3);
+    if (SIDES.prog && !cinder_vk_program_ready(SIDES.prog)) {
+      cinder_vk_program_destroy(SIDES.prog);
+      SIDES.prog = 0;
+    }
+#elif defined(__ANDROID__)
     SIDES.blit = (blit_fn)eglGetProcAddress("glBlitFramebuffer");
     SIDES.prog = SIDES.blit ? gl_compile_program(vs, fs, attribs, 3) : 0;
 #else
@@ -4292,11 +4323,15 @@ static void wide_sides(void) {
       SIDES.off = 1;
       return;
     }
+#ifndef WMMT_NATIVE_VK
     SIDES.u_tex = glGetUniformLocation(SIDES.prog, "uTex");
     SIDES.u_dy = glGetUniformLocation(SIDES.prog, "uDy");
+#endif
   }
   GLint screen = 0;
+#ifndef WMMT_NATIVE_VK
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen);
+#endif
   int xl = x0 + 1, xr = G.fb_w - x0 - 2; /* a pixel in from the 4:3's edges */
   if (SIDES.w != G.fb_w || SIDES.h != G.fb_h) sides_target(SIDES.fmt);
   if (!sides_blit(screen, xl, xr)) {
@@ -4309,6 +4344,7 @@ static void wide_sides(void) {
     }
     fprintf(stderr, "wide menu sides: %s\n", SIDES.fmt ? "RGBA8" : "RGB8");
   }
+#ifndef WMMT_NATIVE_VK
   glViewport(0, 0, G.fb_w, G.fb_h);
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
@@ -4322,6 +4358,7 @@ static void wide_sides(void) {
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glEnableVertexAttribArray(2);
+#endif
   const float out = 0.55f; /* the shade at the screen's edge (1 at the 4:3's) */
 #ifdef __ANDROID__
   float e = 2.0f * (float)x0 / (float)G.fb_w, ul = ((float)xl + 0.5f) / (float)G.fb_w,
@@ -4339,65 +4376,67 @@ static void wide_sides(void) {
     { 1 - e, -1, ur, v0, 1, 1, -1, ur, v0, out, 1 - e, 1, ur, v1, 1, 1, 1, ur, v1, out },
   };
   for (int s = 0; s < 2; ++s) {
+#ifdef WMMT_NATIVE_VK
+    if (!sides_native_draw(SIDES.prog, SIDES.tex, G.fb_w, G.fb_h, v[s])) return;
+#else
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, v[s]);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, v[s] + 2);
     glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 20, v[s] + 4);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
   }
+#ifndef WMMT_NATIVE_VK
   glDisableVertexAttribArray(2);
+#endif
 }
 
-/* Whether the race's other machines have loaded it too: each says so in its lobby status
- * (MENU_VS_LOADED, then 1 again in the race), a machine not in the lobby (gone) not waited for */
-#define VS_WAIT_MAX (60 * 60)
-#define VS_LOADING_MIN 30 /* frames of the loading page at least, after the cars' flying in */
-static int vs_others_loaded(void) {
-  const net_lobby *l = net_lobby_now();
-  if (!net_is_open() || !l->connected) return 1;
-  int all = 1;
-  for (int k = 0; k < G.vs_go.n && k < NET_PLAYERS; ++k) {
-    if (k == G.vs_go.pcb || (G.vs_seen_loaded >> k & 1)) continue;
-    for (int i = 0; i < l->n; ++i) {
-      if (l->player[i].id != G.vs_go.player[k].id) continue;
-      if (l->player[i].status == MENU_VS_LOADED) G.vs_seen_loaded |= 1 << k;
-      else all = 0;
-    }
-  }
-  return all;
-}
 
-/* the race's notice that the host closed the game */
-static void vs_closed_draw(void) {
-  static const char S[] = "THE HOST CLOSED THE GAME";
-  float w = G.hud.screen_w, h = G.hud.screen_h, px = 4.0f, tw = hud_ui_text_width(S, px);
-  float a = G.vs_closed < 10 ? (float)G.vs_closed / 10.0f : 1.0f;
-  hud_ui_begin(w, h);
-  hud_ui_rect(0, 0.5f * h - 60.0f, w, 120.0f, 0, 0, 0, 0.7f * a);
-  hud_ui_text(S, 0.5f * (w - tw), 0.5f * h - 3.5f * px, px, 1.0f, 0.55f, 0.1f, a);
-  hud_ui_end();
-}
+#include "app_ghost.inc"
+#include "app_ta_rank.inc"
+#include "app_body_color.inc"
 
 static void menu_frame(float dt, double frame_start) {
+  AGR.token=0;
+  app_story_body_clear(); /* returned menu/load/cancel cannot reuse a previous race stamp */
+  app_rotary_stop(); /* menu entry closes the previous native audio lifetime once */
+#ifdef __ANDROID__
+  player_smoke_reset();
+#endif
+  if (BPC.race_frozen) {
+    (void)player_body_paint_clear(&BPC.race,0);
+    BPC.race_frozen=BPC.draw_fault=0;
+  }
+  if (G.mini_move > 0) --G.mini_move;
+  ++G.mini_frame;
   /* The token may cross only the automatic, quiet next-period transition. */
   if (G.story_carry_token &&
       (G.menu.game != MENU_GAME_STORY || G.menu.screen != MENU_PRE || !G.menu.pre_quiet ||
        !G.story_cut_pending || G.menu.story_pick != G.story_carry_select ||
        G.story_race != G.story_carry_period)) story_carry_cancel();
-  glViewport(0, 0, G.fb_w, G.fb_h);
-  glClearColor(0, 0, 0, 1);
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   G.vs_race = 0;
   G.vs_closed = 0;
-  vs_menu();
+  app_ghost_menu();
+  app_ghost_card_menu();
+  if (!app_ghost_mode()) vs_menu();
   /* a versus on its way: the race's course loads under the versus screen's NOW LOADING */
-  int vs_load = (G.menu.screen == MENU_VS || G.menu.screen == MENU_VS_MATCH) && G.menu.vs.state == MENU_VS_LOADING;
+  int vs_load = net_is_open() && G.menu.game == MENU_GAME_VS &&
+    net_state()->phase == VS4_LOAD &&
+    (G.menu.screen == MENU_VS || G.menu.screen == MENU_VS_MATCH) && G.menu.vs.state == MENU_VS_LOADING;
   /* the time zone select's card, once it stays at rest a moment (or is chosen), picks the map
    * to load; the other's goes a step a frame */
   int rest = G.menu.screen != MENU_BGM || G.menu.deciding || G.menu.card_t >= ZONE_REST;
   /* and the city: the chosen course's (car_course_city), a story race's its series' start
    * (STORYCITY, once its title page names the rival) */
   int city = G.track_city;
-  if (G.menu.screen == MENU_VS || G.menu.screen == MENU_VS_MATCH) {
+  if (app_ghost_mode() && (menu_ghost_preparing(&G.menu) || menu_ghost_choosing_options(&G.menu))) {
+    city = car_course_city(AG.course); /* render resource only, native field remains immutable */
+    if (G.menu.screen==MENU_BGM) {
+      char night_path[1200];
+      city_path(night_path,sizeof night_path,"",city,1,"wpk");
+      G.menu.zones=access(night_path,R_OK)==0 ? 2 : 1;
+      if (G.menu.zone>=G.menu.zones) G.menu.zone=0;
+    }
+  } else if (G.menu.screen == MENU_VS || G.menu.screen == MENU_VS_MATCH) {
     if (vs_load) city = car_course_city(G.menu.course);
   } else if (G.menu.screen == MENU_BGM && G.menu.vs.day) { /* the area's city, once known */
     if (G.menu.vs.area_final >= 0 || G.menu.vs.me == G.menu.vs.host) city = car_course_city(G.menu.course);
@@ -4417,6 +4456,13 @@ static void menu_frame(float dt, double frame_start) {
     city = car_course_city(G.menu.course);
   if ((G.menu.zone != G.track_zone || city != G.track_city || G.hd_reload) && !G.menu.slide && rest &&
       track_open(city, G.menu.zone) != 0) {
+    if (app_ghost_mode()) {
+      app_ghost_fail("GHOST MAP RESOURCE UNAVAILABLE");
+      menu_present(frame_start); return; /* never start a different native/render course */
+    }
+    if (net_is_open() && net_state()->phase == VS4_LOAD && G.menu.game == MENU_GAME_VS) {
+      app_vs4_cancel("EXACT VS MAP RESOURCE UNAVAILABLE");menu_present(frame_start);return;
+    }
     fprintf(stderr, "no map of city %d zone %d, back to Tokyo's morning\n", city, G.menu.zone);
     G.menu.zone = 0;
     G.menu.zones = 1;
@@ -4427,12 +4473,14 @@ static void menu_frame(float dt, double frame_start) {
    * cost the race a frame and more on the iPad): the course, its sky and arrow boards, the
    * traffic (warm_step), the chosen car with its paint, and the HUD with the car's meters
    * (hud_warm: the race's first frame took some 100 ms first-drawing them) */
-  G.rival = story_rival();
+  G.rival = app_ghost_mode() ? -1 : story_rival();
   G.menu.story_sel = G.rival >= 0 && G.menu.game == MENU_GAME_STORY ? RIVALDB[G.rival].select : -1;
   const cardb_color *chosen = chosen_color();
   int start_in = G.seen.track == 2 || (G.seen.track == 1 && G.seen.start == G.menu.course + 1);
   if (vs_load) start_in = G.seen.track == 2 && city == G.track_city; /* the race starts off the course's start */
-  int pre = G.menu.screen == MENU_PRE || vs_load;
+  if (app_ghost_mode() && menu_ghost_preparing(&G.menu)) start_in = G.seen.track == 2 && city == G.track_city;
+  int pre = G.menu.screen == MENU_PRE || vs_load || menu_ghost_preparing(&G.menu);
+  int body_in = !pre || app_body_start_ready();
   int hud_in = 1;
   if (pre) {
     hud_set_meter(menu_card_meter(&G.menu));
@@ -4448,14 +4496,29 @@ static void menu_frame(float dt, double frame_start) {
   /* a versus': the machines' cars, for their flying in (MENU_VS_MATCH) */
   int match_in = 1;
   for (int k = 0; vs_load && k < G.menu.vs.match_n; ++k) {
-    const cardb_color *oc = vs_color(&G.vs_go.player[k]);
-    match_in = match_in && (!oc || (car_pack(oc->pack) && paint_ready(oc->pack, oc->paint)));
+    const net_player *member = &G.vs_go.player[k];
+    const cardb_color *oc = vs_color(member);
+    match_in = match_in && oc && car_pack(oc->pack) && paint_ready(oc->pack, oc->paint);
   }
   all_in = all_in && match_in;
+  int ghost_paint = 0, ghost_pack = app_ghost_rival_pack(&ghost_paint);
+  if (ghost_pack >= 0) all_in = all_in && ghost_pack < NPACKS && G.seen.pack[ghost_pack] == 1 &&
+                                    car_pack(ghost_pack) && paint_ready(ghost_pack, ghost_paint);
+  /* Unlike legacy menus, a real Ghost opponent must never be drawn as the FD3S
+   * missing-model substitute. Its exact approved model remains a start gate. */
+  if(app_ghost_mode() && AG.arcade && AG.prepared) all_in=all_in && app_arcade_appearance_ready();
   G.pre_wait = pre && !all_in ? G.pre_wait + 1 : 0;
   if (G.menu.screen == MENU_PRE) G.pre_frames++;
   if (G.pre_wait == PRE_WAIT_MAX) fprintf(stderr, "race title: loading still not done (track %d), starting\n", G.seen.track);
-  G.menu.ready = all_in || G.pre_wait >= PRE_WAIT_MAX;
+  G.menu.ready = (app_ghost_mode() ? pre && all_in && AG.prepared : all_in || G.pre_wait >= PRE_WAIT_MAX) && body_in; /* timeout cannot bypass exact player paint */
+  if (vs_load) {
+    G.menu.ready=all_in && body_in;
+    if(G.pre_wait>=PRE_WAIT_MAX){app_vs4_cancel("EXACT VS RESOURCES TIMED OUT - ROUND CANCELED");menu_present(frame_start);return;}
+  }
+  if (app_ghost_mode() && pre && G.pre_wait >= PRE_WAIT_MAX) {
+    app_ghost_fail("GHOST LOADING TIMED OUT - NOT STARTED");
+    menu_present(frame_start); return;
+  }
   /* Detect deleted cards around menu_update without changing the menu subsystem. */
   menu_own old_own[MENU_OWN_MAX];
   int old_count = G.menu.n_own, old_slot = G.menu.save_slot;
@@ -4463,6 +4526,7 @@ static void menu_frame(float dt, double frame_start) {
   memcpy(old_own, G.menu.own, (size_t)old_count * sizeof old_own[0]);
   int story_was_selecting = G.menu.story_day_select && !G.menu.deciding;
   int go = menu_update(&G.menu, dt);
+  app_ta_rank_menu();
   if (story_was_selecting && G.menu.story_day_select && G.menu.deciding) {
     char path[1200];
     snprintf(path, sizeof path, "%s/story_timezone", G.save_dir);
@@ -4503,27 +4567,12 @@ static void menu_frame(float dt, double frame_start) {
       }
     }
   }
-  int vs = G.menu.screen == MENU_VS && G.menu.vs.state == MENU_VS_LOADING;
-  /* the cars fly in first (MENU_VS_MATCH), once theirs are in, the course loading on under it
-   * (Allan 10-27); then the loading page */
-  int match_first = vs && G.menu.vs.match_n >= 2 && !G.menu.vs.match_played;
-  if (match_first && (match_in || G.menu.ready)) menu_vs_match(&G.menu);
-  if (menu_vs_match_done(&G.menu)) menu_vs_match_back(&G.menu);
-  if (match_first) vs = 0;
-  /* loaded: it says so (menu_vs_status) and waits for the race's other machines' (one gone from
-   * the lobby does not hold it, nor longer than VS_WAIT_MAX); then the race (the loading page
-   * shown a moment at least) */
-  if (vs && G.menu.ready && !G.menu.vs.loaded) {
-    G.menu.vs.loaded = 1;
-    fprintf(stderr, "versus: race loaded (%d frames)\n", G.menu.t);
-  }
-  int vs_waiting = vs && G.menu.vs.loaded && !vs_others_loaded();
-  if (G.menu.vs.wait_others && !vs_waiting) fprintf(stderr, "versus: the others loaded after %.1f s\n", (float)G.vs_wait / 60.0f);
-  G.vs_wait = vs_waiting ? G.vs_wait + 1 : 0;
-  if (G.vs_wait == VS_WAIT_MAX) fprintf(stderr, "versus: the others still loading after %d s, starting\n", VS_WAIT_MAX / 60);
-  G.menu.vs.wait_others = vs_waiting && G.vs_wait < VS_WAIT_MAX;
-  int vs_ready = vs && G.menu.ready && !G.menu.vs.wait_others && G.menu.t >= VS_LOADING_MIN;
-  if (vs_ready) go = 1;
+  app_vs4_match_ready(match_in && G.menu.ready);
+  /* Native Init occurs once DURING LOAD after local rendering resources, not
+   * after peer native packets. LOAD_READY follows returned Init + exact paint. */
+  int vs = net_is_open() && net_state()->phase == VS4_LOAD && G.menu.screen == MENU_VS &&
+    G.menu.vs.state == MENU_VS_LOADING && G.menu.vs.match_played && !AV4.native_initialized && G.vs_go.round;
+  if (vs && G.menu.ready && G.menu.t >= VS_LOADING_MIN) go = 1;
   if (G.menu.save_erase) {
     save_erase(G.menu.save_erase);
     G.menu.save_erase = 0;
@@ -4573,8 +4622,21 @@ static void menu_frame(float dt, double frame_start) {
   } else if (G.menu.options_dirty && options_save()) {
     G.menu.options_dirty = 0;
   }
+  if (go && app_ghost_mode() && !app_ghost_go_valid()) {
+    app_ghost_fail("GHOST START REJECTED - NO PREPARED SESSION");
+    go = 0;
+  }
   if (go) {
+    int ghost = app_ghost_mode();
+    if (!ghost) car_ghost_clear();
     const cardb_color *col = chosen_color();
+    app_story_body_clear();
+    if (!menu_story_body_get(&G.menu,&ASB.own)) {
+      if (vs) app_vs4_cancel("EXACT EARNED CAR ASSEMBLY UNAVAILABLE");
+      else story_race_start_failed();
+      return;
+    }
+    ASB.active=1;
     int power, handling;
     /* a story race runs on the story's tune (the card's), the time attack on the setting's */
     if (G.menu.game == MENU_GAME_STORY && !vs) menu_story_tune(&G.menu, &power, &handling);
@@ -4582,9 +4644,18 @@ static void menu_frame(float dt, double frame_start) {
 #ifdef __ANDROID__
     /* Consume the confirmed single-race adjustment before constructing any
      * physics, HUD, or audio configuration; never change stored garage data. */
-    if (vs) pre_race_tune_vs_apply(&G.menu.pre_tune, G.menu.maker, G.menu.car, &power, &handling);
-    else pre_race_tune_take(&G.menu.pre_tune, G.menu.game, G.menu.maker, G.menu.car,
-                            power, handling, &power, &handling);
+    if (vs) {
+      if (!vs_slot_matches() || (G.menu.pre_tune.state &&
+          !pre_race_tune_slot_matches(&G.menu.pre_tune,G.menu.save_slot,G.menu.save_skip)) ||
+          !app_vs4_snapshot_matches(net_state())) { app_vs4_cancel("TUNE OR CARD CHANGED BEFORE INIT"); return; }
+      const net_player *own=&G.vs_go.player[G.vs_go.pcb];
+      power=own->profile[3];handling=own->profile[4];
+    } else {
+      if (G.menu.pre_tune.state && !pre_race_tune_slot_matches(&G.menu.pre_tune,G.menu.save_slot,G.menu.save_skip))
+        pre_race_tune_clear(&G.menu.pre_tune);
+      else pre_race_tune_take(&G.menu.pre_tune, G.menu.game, G.menu.maker, G.menu.car,
+                             power, handling, &power, &handling);
+    }
 #endif
     car_spec spec = { (unsigned)col->type, col->gears, { 0 }, (int)CARDB_TYRES[col->pack][6], power, handling };
     for (int i = 0; i < 6; ++i) spec.tyres[i] = CARDB_TYRES[col->pack][i];
@@ -4593,7 +4664,7 @@ static void menu_frame(float dt, double frame_start) {
     while (G.track_old.n_batch || G.track_old.n_tex) wpk_free_step(&G.track_old, 1u << 30);
     if (!G.track_ready) track_set(wpk_upload(&G.track, (size_t)-1));
     pack_load_now(col->pack, col->paint != 0);
-    car_rival rv[CAR_RIVALS];
+    car_rival rv[CAR_RIVALS] = {{0}};
     int story_slots_valid = 1;
     G.n_rival = 0;
     memset(G.rival_dress, 0, sizeof G.rival_dress);
@@ -4634,15 +4705,15 @@ static void menu_frame(float dt, double frame_start) {
         if (k == G.vs_go.pcb) continue;
         const net_player *pl = &G.vs_go.player[k];
         const cardb_color *oc = vs_color(pl);
-        if (!oc) oc = col;
+        if (!oc || !app_story_body_peer(pl,&ASB.rival[G.n_rival])) {app_vs4_cancel("FROZEN RIVAL PROFILE LOST");return;}
         car_link_car *o = &others[G.n_rival];
         memset(o, 0, sizeof *o);
         o->pcb = k;
         o->type = (unsigned)oc->type;
         for (int j = 0; j < 6; ++j) o->tyres[j] = CARDB_TYRES[oc->pack][j];
         o->spokes = (int)CARDB_TYRES[oc->pack][6];
-        o->power = pl->profile_len >= VS_PROFILE_CAR && pl->profile[3] <= CAR_TUNE_MAX ? pl->profile[3] : 0;
-        o->handling = pl->profile_len >= VS_PROFILE_CAR && pl->profile[4] <= CAR_TUNE_MAX ? pl->profile[4] : 0;
+        o->power = pl->profile[3];
+        o->handling = pl->profile[4];
         G.rival_pack[G.n_rival] = oc->pack;
         G.rival_paint[G.n_rival] = oc->paint;
         pack_load_now(oc->pack, oc->paint != 0);
@@ -4678,16 +4749,34 @@ static void menu_frame(float dt, double frame_start) {
       rv[k].spokes = (int)CARDB_TYRES[base][6];
       G.n_rival++;
     }
+    if (ghost && (AG.config.kind == CAR_GHOST_CHALLENGE || AG.config.kind == CAR_GHOST_DEFAULT)) {
+      G.n_rival = 1; G.rival_pack[0] = AG.rival_pack; G.rival_paint[0] = AG.rival_paint;
+      app_ghost_arcade_apply_dress(&G.rival_dress[0]);
+      if (G.rival_dress[0].aero) menu_aero_want(AG.rival_pack,G.rival_dress[0].aero);
+      if (G.rival_dress[0].wheel) wheel_model(G.rival_dress[0].wheel);
+      pack_load_now(AG.rival_pack, AG.rival_paint != 0);
+      if (AG.arcade || AG.config.kind==CAR_GHOST_DEFAULT) {
+        int raw=AG.arcade ? (int)AG.arcade_style.car_ : (int)AG.default_binding.record.raw_model_id;
+        const car_spec *earned=AG.arcade ? &AG.arcade_binding.rival : &AG.default_binding.record.car.rival;
+        if (!story_body_view_capture_model(&ASB.rival[0],AG.rival_pack,raw,(int)earned->type,earned->power,earned->handling,0)) {
+          app_story_body_clear();app_ghost_fail("EXACT SOURCE GHOST ASSEMBLY UNAVAILABLE");return;
+        }
+      }
+    }
     load_sync(NULL);
-    car_set_rivals(rv, ten || vs ? 0 : G.n_rival);
-    if (ten || vs || !story_slots_valid) story_carry_cancel();
+    if (!ghost) car_set_rivals(rv, ten || vs ? 0 : G.n_rival);
+    if (ghost || ten || vs || !story_slots_valid) story_carry_cancel();
     else story_carry_arm(rv, G.n_rival);
+    if (!ghost) app_ta_replay_arm();
     if (car_start(&G.car, course, G.menu.manual, &spec) != 0) {
       fprintf(stderr, "course %d failed to start\n", G.menu.course);
       story_carry_cancel();
-      if (vs) menu_vs_loading(&G.menu), G.menu.vs.state = MENU_VS_LOBBY;
-      else story_race_start_failed();
+      if (ghost) { app_ghost_fail("NATIVE GHOST START FAILED"); return; }
+      if (vs) {
+        app_vs4_cancel("RETURNED NATIVE INIT FAILURE - ROUND CANCELED"); return;
+      } else story_race_start_failed();
     } else {
+      if (ghost && !app_ghost_started(&spec)) { app_ghost_fail("GHOST TARGET OR RECORDER NOT READY"); return; }
       G.story_old_ended = 0;
       G.story_carry_attempted = 0;
       spark_reset(); backfire_reset();
@@ -4695,6 +4784,7 @@ static void menu_frame(float dt, double frame_start) {
     player_tracks_reset();
 #endif
       G.vs_race = vs ? G.n_rival : 0;
+      G.hud.pause_disabled = vs;
       if (vs) G.menu.vs.state = MENU_VS_RACE;
       fprintf(stderr, "race: course %d (%s), %s colour %d, power %d handling %d, %s\n", G.menu.course,
               G.menu.official ? "official machine" : "personal best", CARDB_CARS[G.menu.maker][G.menu.car].label,
@@ -4727,22 +4817,44 @@ static void menu_frame(float dt, double frame_start) {
       if (getenv("WMMT_AERO")) set = atoi(getenv("WMMT_AERO")); /* test: this aero set */
 #endif
       aero_model(col->pack, set);
+      if (!app_body_race_prepare()) {
+        app_rotary_stop(); app_ta_rank_invalidate(); app_body_drop(0);
+        story_carry_cancel(); snd_quiet(); G.in_menu=1; G.paused=0;
+        if (ghost) { app_ghost_fail("PLAYER APPEARANCE PREPARATION FAILED - RUN CANCELLED"); return; }
+        if (vs) { app_vs4_cancel("EXACT PLAYER APPEARANCE START FAILED"); return; }
+        story_race_start_failed();
+        return;
+      }
       wheel_model(G.menu.wheel[G.menu.maker][G.menu.car]);
       for (int i = 0; i < CAR_RIVALS; ++i) {
         G.rival_model[i] = i < G.n_rival ? car_pack(G.rival_pack[i]) : NULL;
-        if (G.rival_model[i] && !ten && !vs)
+        if (G.rival_model[i] && !ten && !vs && !ghost)
           fprintf(stderr, "rival %d: %s (%s), select %d race %d\n", i + 1, RIVALDB[rows[i]].name,
                   pack_name(G.rival_pack[i]), RIVALDB[rows[i]].select, RIVALDB[rows[i]].race);
       }
       /* the car's own engine sound, meters (morning or night) and gear pattern */
       snd_set_car((unsigned)col->type, power);
+      app_rotary_start(); /* successful native race sequence, not menu car selection */
       hud_set_tune(car_tune_hp(CARDB_CARS[G.menu.maker][G.menu.car].hp, power), car_tune_grade(power, handling));
       hud_set_class(G.menu.class_car[G.menu.maker][G.menu.car]);
       hud_set_card(menu_title(&G.menu), G.menu.name);
       hud_set_meter(menu_card_meter(&G.menu));
       hud_set_car(col->pack, z == 1);
       hud_set_course(course);
-      hud_set_story(G.menu.story_sel >= 0 || vs); /* a versus: the story's console (no records) */
+      hud_set_story(G.menu.story_sel >= 0 || vs || ghost); /* a versus: the story's console (no records) */
+      if (ghost && AG.arcade) {
+        const car_ghost_arcade_binding *rival = &AG.arcade_binding;
+        const cardb_car *model = &CARDB_CARS[rival->maker][rival->car];
+        int p = rival->rival.power, h = rival->rival.handling;
+        hud_vs_box card = {
+          .title = (int)AG.arcade_style.title_, .plate = model->plate,
+          .hp = car_tune_hp(model->hp, p), .grade = car_tune_grade(p, h),
+          .power = p, .handling = h,
+          .steps = vs_r35(G.menu.maker, G.menu.car) || vs_r35(rival->maker, rival->car),
+        };
+        memcpy(card.name, AG.rival_name, sizeof card.name);
+        hud_set_ghost_card(&card, AG.crown_challenge ? AG.arcade_area : -1);
+      }
       {
         int chara[CAR_RIVALS] = { 0 };
         unsigned char shown[CAR_RIVALS] = { 0 };
@@ -4801,7 +4913,7 @@ static void menu_frame(float dt, double frame_start) {
         }
         hud_set_vs(box, n);
       }
-      records_show(course);
+      if (!ghost) records_show(course);
       G.race_pack = col->pack;
       if (G.story_race == 0) { /* (a select's second race: the card as the first started) */
         title_card_now(&G.title_pre);
@@ -4815,9 +4927,10 @@ static void menu_frame(float dt, double frame_start) {
       G.ten_white = G.n_ten ? 1 : 0;
       G.race_spec = spec;
       memcpy(G.race_rv, rv, sizeof rv);
-      G.race_nrv = ten || vs ? 0 : G.n_rival;
-      G.story_race_slots_valid = !ten && !vs && story_slots_valid;
+      G.race_nrv = ghost || ten || vs ? 0 : G.n_rival;
+      G.story_race_slots_valid = !ghost && !ten && !vs && story_slots_valid;
       G.race_course = course;
+      if (!vs) app_ta_rank_start(); /* VS is never a time-attack recorder. */
 #if defined(__ANDROID__) && defined(WMMT_DEBUG_LOG)
       debug_race_init();
 #endif
@@ -4832,6 +4945,7 @@ static void menu_frame(float dt, double frame_start) {
       /* No movie or a missing trail: this successful Init is the real race.
        * A running movie keeps the same token until movie_close's final Init. */
       if (G.movie_len <= 0) story_carry_finish();
+      if (vs && !app_vs4_initialized()) return;
       perf_open();
       return;
     }
@@ -4846,13 +4960,31 @@ static void menu_frame(float dt, double frame_start) {
   if (G.low_memory) car_packs_trim(1, &want);
   car_paints_trim(&want, 0);
   load_sync(&want);
+  int body_ready=app_body_menu_prepare(has3d?&scene:NULL);
+  app_ghost_preview_prepare(has3d?&scene:NULL);
   /* NOW LOADING: the car select's cars on show, or the race title's course */
-  int waiting = (has3d && !scene_ready(&scene)) || (G.menu.screen == MENU_PRE && !G.menu.ready);
+  int waiting = (has3d && (!scene_ready(&scene) || !body_ready)) || (G.menu.screen == MENU_PRE && !G.menu.ready);
   G.menu.loading = waiting ? G.menu.loading + 1 : 0;
   G.load_hurry = waiting || pre || menu_booting(&G.menu);
   G.load_wait = has3d && waiting;
   if (G.menu.screen != MENU_COURSE && G.menu.screen != MENU_TEN_COURSE && G.menu.screen != MENU_VS_AREA) G.mini_shown = NULL;
+  if (!app_tick_only) menu_present(frame_start);
+}
+
+/* Presentation does not poll network, advance menu clocks, retry saves, publish
+ * LOADED, or start physics. Loading uploads stay in the fixed menu pass. */
+static void menu_present(double frame_start) {
+#ifdef WMMT_NATIVE_VK
+  render_display_clear(0, 0, 0, 1);
+#else
+  glViewport(0, 0, G.fb_w, G.fb_h);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+#endif
+  menu_scene scene;
+  int has3d = menu_scene3d(&G.menu, &scene);
   menu_draw(&G.menu, G.hud.screen_w, G.hud.screen_h, has3d ? menu_draw3d : NULL, &scene, mini_draw);
+  app_body_notice();
   if (G.edge > 0 && !menu_photo_bg() && !anm_wide_drawn()) wide_sides();
   if (!G.loader) load_step(frame_start);
 }
@@ -4885,11 +5017,10 @@ static void draw_race_cars(const car_state *c, const mat4 *vp, const float *eye_
   if (own) {
     float range = rp->range[WPK_GROUND];
     rp->range[WPK_GROUND] = 1e9f;
-    wpk_paint(G.race_model, chosen_color()->paint); /* a rival may share the model */
+    car_paint_for_draw(G.race_model, G.aero_set ? &G.aero : NULL, chosen_color()->paint);
     rp->wheels = (const float (*)[16])c->tyre;
     rp->wheel_rot = c->tyre_rot;
     rp->braking = c->brake;
-    if (G.aero_set) wpk_share_sync(&G.aero);
     rp->mirror = G.menu.mirror[G.menu.maker][G.menu.car];
     rp->wing = G.menu.wing[G.menu.maker][G.menu.car];
     rp->bonnet = G.menu.bonnet[G.menu.maker][G.menu.car];
@@ -4899,11 +5030,17 @@ static void draw_race_cars(const car_state *c, const mat4 *vp, const float *eye_
     {
       const char *page1 = "";
       wpk_scene *cs = G.aero_set ? &G.aero : G.race_model;
-      uint32_t vt = vinyl_tex(G.race_pack, G.aero_set, chosen_color()->paint, G.menu.vinyl[G.menu.maker][G.menu.car],
+      app_player_paint_scope body_scope={0};
+      int appearance=app_body_race_apply(cs,&body_scope);
+      int custom=BPC.race_frozen && BPC.race_view.custom_color;
+      uint32_t vt = custom ? 0 : vinyl_tex(G.race_pack, G.aero_set, chosen_color()->paint, G.menu.vinyl[G.menu.maker][G.menu.car],
                               rp->bonnet, &page1), vold = 0;
-      int vi = vinyl_on(cs, vt, page1, &vold);
-      wpk_draw(cs, vp, &car_m, eye_car, pass, rp);
-      vinyl_off(cs, vi, vold);
+      if (appearance) {
+        int vi = vinyl_on(cs, vt, page1, &vold);
+        if (ASB.active) app_story_body_draw(cs,vp,&car_m,eye_car,pass,rp,&ASB.own.view,G.race_pack);
+        vinyl_off(cs, vi, vold);
+        if (custom) app_player_paint_restore(&body_scope);
+      }
     }
     draw_wheels(wheel, G.race_pack, G.aero_set, vp, &car_m, eye_car, pass, rp);
     rp->over = 0;
@@ -4919,28 +5056,40 @@ static void draw_race_cars(const car_state *c, const mat4 *vp, const float *eye_
     memcpy(m.m, c->rival_body[i], sizeof m.m);
     float eye[3];
     eye_in(&m, eye_pos, eye);
-    wpk_paint(model, movie ? G.movie_paint[i] : G.rival_paint[i]);
     rp->wheels = (const float (*)[16])c->rival_tyre[i];
     rp->wheel_rot = c->rival_tyre_rot[i];
     rp->braking = c->rival_brake[i];
-    if (!movie && G.vs_race) {
-      /* a versus' other car: dressed up as its player's */
+    if (!movie && (G.vs_race || app_ghost_arcade_dressed())) {
+      /* Actual opponent appearance: VS peer or pinned original Ghost profile. */
       const vs_dress_t *d = &G.rival_dress[i];
       int pack = G.rival_pack[i];
       wpk_scene *aero = d->aero ? menu_aero(pack, d->aero) : NULL;
-      if (aero) wpk_share_sync(aero), model = aero;
+      car_paint_for_draw(model, aero, G.rival_paint[i]);
+      if (aero) model = aero;
       int body = aero ? d->aero : 0;
       rp->mirror = d->mirror, rp->wing = d->wing, rp->bonnet = d->bonnet;
       rp->wheel_custom = wheel_on(d->wheel);
-      const char *page1 = "";
-      uint32_t vt = vinyl_tex(pack, body, G.rival_paint[i], d->vinyl, d->bonnet, &page1), vold = 0;
-      int vi = vinyl_on(model, vt, page1, &vold);
-      wpk_draw(model, vp, &m, eye, pass, rp);
-      vinyl_off(model, vi, vold);
+      if(i==0 && AG.arcade && AG.active && AG.arcade_binding.custom_color) {
+        app_ghost_paint_scope scope={0};
+        app_player_paint_scope local_scope={0};
+        if(!app_arcade_paint_apply(model,&scope,&local_scope)) {
+          rp->mirror=rp->wing=rp->bonnet=rp->wheel_custom=0;rp->wheels=NULL;continue;
+        }
+        app_story_body_draw(model,vp,&m,eye,pass,rp,movie?NULL:&ASB.rival[i],movie?G.movie_pack[i]:G.rival_pack[i]);
+        if(local_scope.cache)app_player_paint_restore(&local_scope);
+        if(scope.cache)app_ghost_paint_restore(&scope); /* same WPK may be the player's model */
+      } else {
+        const char *page1 = "";
+        uint32_t vt = vinyl_tex(pack, body, G.rival_paint[i], d->vinyl, d->bonnet, &page1), vold = 0;
+        int vi = vinyl_on(model, vt, page1, &vold);
+        app_story_body_draw(model,vp,&m,eye,pass,rp,movie?NULL:&ASB.rival[i],movie?G.movie_pack[i]:G.rival_pack[i]);
+        vinyl_off(model, vi, vold);
+      }
       draw_wheels(d->wheel, pack, body, vp, &m, eye, pass, rp);
       rp->mirror = rp->wing = rp->bonnet = rp->wheel_custom = 0;
     } else {
-      wpk_draw(model, vp, &m, eye, pass, rp);
+      car_paint_for_draw(model, NULL, movie ? G.movie_paint[i] : G.rival_paint[i]);
+      app_story_body_draw(model,vp,&m,eye,pass,rp,movie?NULL:&ASB.rival[i],movie?G.movie_pack[i]:G.rival_pack[i]);
     }
     rp->wheels = NULL;
   }
@@ -4952,6 +5101,21 @@ static void draw_race_cars(const car_state *c, const mat4 *vp, const float *eye_
     float eye[3];
     eye_in(&m, eye_pos, eye);
     if (G.traffic[t->model].n_batch) wpk_draw(&G.traffic[t->model], vp, &m, eye, pass, rp);
+  }
+}
+
+static void draw_race_front_halos(const car_state *car, const mat4 *proj, const mat4 *view,
+                                  const float *eye, int own, int mirror, render_params *rp) {
+  if (!G.vs_race || G.vs_closed) return;
+  if (own && car->spot && G.race_model && G.race_pack >= 0 && G.race_pack < CARDB_NPACKS)
+    lights_draw_front_halo(proj, view, eye, car->body, CARDB_PACKS[G.race_pack], G.aero_set, mirror, rp);
+  for (int i = 0; i < CAR_RIVALS; ++i) {
+    int pack = G.rival_pack[i];
+    if (!car->rival_shown[i] || !car->rival_spot[i] || !G.rival_model[i] ||
+        pack < 0 || pack >= CARDB_NPACKS) continue;
+    int aero = G.rival_dress[i].aero;
+    if (aero && !menu_aero(pack, aero)) aero = 0;
+    lights_draw_front_halo(proj, view, eye, car->rival_body[i], CARDB_PACKS[pack], aero, mirror, rp);
   }
 }
 
@@ -4984,7 +5148,8 @@ static void draw_backmirror(const car_state *c, int movie) {
   float fovy = 2.0f * atanf(tanf(c->mirror_fov * 0.5f) / aspect);
   mat4 view;
   memcpy(view.m, c->mirror_view, sizeof view.m);
-  mat4 vp = mat4_mul(mat4_perspective(fovy, aspect, c->mirror_near, BM_FAR), view);
+  mat4 proj = mat4_perspective(fovy, aspect, c->mirror_near, BM_FAR);
+  mat4 vp = mat4_mul(proj, view);
   float eye[3];
   const float *V = c->mirror_view;
   for (int j = 0; j < 3; j++) eye[j] = -(V[12] * V[4 * j] + V[13] * V[4 * j + 1] + V[14] * V[4 * j + 2]);
@@ -5013,7 +5178,12 @@ static void draw_backmirror(const car_state *c, int movie) {
       wpk_draw(sky, &sky_vp, &sky_m, sky_eye, pass, &sky_rp);
     }
     render_blend_pass(0);
+    
+#ifdef WMMT_NATIVE_VK
+    render_scene_depth_clear();
+#else
     glClear(GL_DEPTH_BUFFER_BIT);
+#endif
     rp.draws += sky_rp.draws;
     rp.triangles += sky_rp.triangles;
   }
@@ -5027,6 +5197,7 @@ static void draw_backmirror(const car_state *c, int movie) {
      * mirror camera (a HIACE, an aero kit: Allan, 10-26) */
     draw_race_cars(c, &vp, eye, pass, 0, 0, BM_FAR, &rp);
   }
+  draw_race_front_halos(c, &proj, &view, eye, 0, 1, &rp);
   render_blend_pass(0);
   render_backmirror_end();
   G.bm_shown = 1;
@@ -5036,11 +5207,10 @@ static void draw_backmirror(const car_state *c, int movie) {
 }
 
 /* the player's car's and the traffic's shadows, onto what the opaque passes drew */
-static void draw_shadows(const mat4 *vp, const mat4 *car_m) {
+static void draw_shadows(const car_state *c, const mat4 *vp, const mat4 *car_m) {
   const wpk_scene *s[1 + CAR_RIVALS + CAR_TRAFFIC];
   mat4 mvp[1 + CAR_RIVALS + CAR_TRAFFIC];
   int n = 0;
-  const car_state *c = &G.car;
   if (G.camera == 0 && G.race_model) {
     s[n] = G.aero_set ? &G.aero : G.race_model;
     shadow_of(vp, car_m->m, &mvp[n++]);
@@ -5076,7 +5246,7 @@ void app_frame(float dt) {
 #if defined(__ANDROID__) && defined(WMMT_DEBUG_LOG)
   debug_frame(debug_raw_dt, dt);
 #endif
-  if (dt > 0) G.fps += (1.0f / dt - G.fps) * 0.05f;
+  if (!app_tick_only && dt > 0) G.fps += (1.0f / dt - G.fps) * 0.05f;
   wpk_ao(G.ao_test >= 0 ? G.ao_test : G.menu.ao_on);
 #ifdef WMMT_EGL
   /* test: the versus stars screen for "stars change [wins]" once the car or game mode select is up */
@@ -5100,42 +5270,37 @@ void app_frame(float dt) {
     return;
   }
 
-  /* a versus: the server hears from this app all through the race (and its end) */
-  if (G.vs_race && net_is_open()) {
-    char name[NET_NAME + 1];
-    unsigned char profile[VS_PROFILE];
-    vs_name(name, sizeof name);
-    vs_profile(profile);
-    /* (a host relays the others' packets all through it too) */
-    if (vs_host_is_open()) vs_host_poll(now_ms() * 1e-3, name);
-    net_poll(now_ms() * 1e-3, 1, name, profile, VS_PROFILE);
-    /* the host closed its game (or went quiet once the race is on: its app gone): the notice,
-     * then back to the versus screen (Allan 10-27: the other one drove on alone) */
-    if (!G.vs_closed &&
-        (net_host_closed() ||
-         (!vs_host_is_open() && G.car.race.state == CAR_RACE_RUN && G.car.race.countdown <= 0.0f &&
-           net_silence(now_ms() * 1e-3) > VS_GONE))) {
-      G.vs_closed = 1;
-      car_clear_junction(&G.car.race);
-#ifdef __ANDROID__
-      junction_ui_reset(&race_junction_ui);
-      junction_barrier_reset(&race_junction_barrier);
-#endif
-      fprintf(stderr, "versus: the host %s\n", net_host_closed() ? "closed or timed out" : "went quiet");
+  /* Lost player presentation never silently becomes a different factory colour.
+   * Abort at the next safe frame boundary, without committing a Ghost/TA result. */
+  if (!ASB.active || !menu_story_body_owner_same(&G.menu,&ASB.own)) BPC.draw_fault=1;
+  if (BPC.draw_fault) {
+    int ghost=app_ghost_mode(), versus=G.vs_race;
+    app_ta_rank_invalidate(); app_rotary_stop(); app_body_drop(0);
+    snd_quiet(); car_clear_junction(&G.car.race);
+    G.in_menu=1; G.paused=0;
+    if (ghost) {
+      app_ghost_fail("PLAYER APPEARANCE LOST - RUN CANCELLED");
+      menu_frame(0,frame_start); return; /* retain the actionable Ghost invalid page */
     }
-  }
-  if (G.vs_closed && ++G.vs_closed > VS_CLOSED_NOTICE) {
-    vs_off();
-    G.vs_closed = 0;
-    G.paused = 0;
-    snd_quiet();
-    hud_init(&G.hud, G.hud.screen_w, G.hud.screen_h);
-    menu_vs_closed(&G.menu, "HOST LEFT OR CONNECTION LOST");
-    G.in_menu = 1;
-    if (G.perf) fflush(G.perf);
-    menu_frame(0, frame_start);
+    if (versus) {
+      app_vs4_cancel("PLAYER APPEARANCE LOST - ROUND CANCELED");
+      menu_frame(0,frame_start); return;
+    }
+    story_race_start_failed();
+    menu_frame(0,frame_start);
     return;
   }
+  /* A lost exact opponent appearance invalidates at this safe frame boundary,
+   * BEFORE any further native physics/RNG/input tick. Never draw a base fallback. */
+  if(app_ghost_mode() && ACP.draw_fault) {
+    app_ghost_fail("EXACT GHOST APPEARANCE LOST - RACE INVALIDATED");
+    snd_quiet();hud_init(&G.hud,G.hud.screen_w,G.hud.screen_h);
+    car_clear_junction(&G.car.race);menu_frame(0,frame_start);return;
+  }
+  /* Ghost is never governed by room state. Polling continues independently of
+   * user pause and soft transport pause, and cancellation wins before any tick. */
+  if (app_ghost_mode()) G.vs_race = G.vs_closed = G.vs_wait = G.n_ten = 0;
+  if (G.vs_race && app_vs4_native_gate() < 0) { menu_frame(0,frame_start); return; }
   int movie = G.movie_len > 0;
   /* Handle a goal already observed before this display frame as well as one
    * reached inside the fixed-step loop below. */
@@ -5145,15 +5310,22 @@ void app_frame(float dt) {
     hud_story_cutin_step(&G.car.race, 0);
     G.story_end_started = 1;
     G.story_end_freeze = hud_story_cutin_goal_hold(&G.car.race);
+#ifdef __ANDROID__
+      if (G.story_end_freeze > 0) android_story_bgm_pause();
+#endif
   }
   car_input in = {0};
+  G.hud.passing_available = !movie && G.vs_race && !G.vs_wait && !G.vs_closed &&
+      !G.paused && !G.menu.finish && !G.car.race.over && G.car.race.play_state == 2;
+  if (!G.hud.passing_available) G.hud.passing_pressed = 0;
   int steps = 0;
   double t0 = now_ms();
   /* Once closure is known, keep polling and drawing the notice, but do not
    * consume race input, simulate, mutate race state or commit results. */
   if (!G.vs_closed) {
   /* the pause menu: the race stands still under it (not once the race has stopped running) */
-  if (!movie && G.hud.pause_pressed && !G.paused && !G.menu.finish && G.car.race.state == CAR_RACE_RUN) {
+  if (!movie && !G.hud.pause_disabled && G.hud.pause_pressed && !G.paused &&
+      !G.menu.finish && G.car.race.state == CAR_RACE_RUN) {
     G.paused = 1;
     hud_init(&G.hud, G.hud.screen_w, G.hud.screen_h); /* let go of the pedals and the wheel */
     menu_pause_open(&G.menu);
@@ -5171,20 +5343,11 @@ void app_frame(float dt) {
       /* the screen is white: on to the menus, which come out of it (a story select starts
        * over from its first race) */
       G.paused = 0;
+      if (app_ghost_mode()) app_ghost_fail("RUN CANCELLED - PREVIOUS RECORD KEPT");
       G.story_race = 0;
       G.story_cut_pending = 0;
       story_carry_cancel();
-      if (G.vs_race) {
-        /* Leaving an active match is a BYE, not a completed race. */
-        vs_off();
-        G.vs_race = 0;
-        car_clear_junction(&G.car.race);
-#ifdef __ANDROID__
-        junction_ui_reset(&race_junction_ui);
-        junction_barrier_reset(&race_junction_barrier);
-#endif
-        menu_vs_closed(&G.menu, "YOU LEFT THE GAME");
-      }
+      if (G.vs_race) { app_vs4_cancel("YOU CANCELED THE ROUND - BACK IN ROOM");menu_frame(0,frame_start);return; }
       hud_init(&G.hud, G.hud.screen_w, G.hud.screen_h);
       G.in_menu = 1;
       if (G.perf) fflush(G.perf);
@@ -5195,19 +5358,15 @@ void app_frame(float dt) {
   }
   /* the race's end, FINISH or TIME UP over the race running on, then white: the menus */
   if (G.menu.finish && menu_finish_update(&G.menu, dt) == MENU_LEAVE) {
+    if (app_ghost_mode()) {
+      app_ghost_clear();
+      G.n_rival = 0;
+      memset(G.rival_model, 0, sizeof G.rival_model);
+    }
     snd_quiet();
     hud_init(&G.hud, G.hud.screen_w, G.hud.screen_h);
     G.in_menu = 1;
-    if (G.vs_race && net_is_open()) {
-      /* DONE means the result screen is over and this client can accept GO. */
-      G.vs_race = 0;
-      car_clear_junction(&G.car.race);
-#ifdef __ANDROID__
-      junction_ui_reset(&race_junction_ui);
-      junction_barrier_reset(&race_junction_barrier);
-#endif
-      /* WV1 returns to the lobby by advertising status 0; no DONE packet. */
-    }
+    if (G.vs_race) app_vs4_result_ui_left(); /* DONE only after stars reach MENU_VS. */
     if (G.perf) fflush(G.perf);
     menu_frame(0, frame_start);
     return;
@@ -5217,7 +5376,7 @@ void app_frame(float dt) {
   hud_options();
   hud_input_dt(&G.hud, &in, dt);
   if (G.story_end_freeze > 0 || G.story_old_ended)
-    G.hud.camera_pressed = G.hud.reset_pressed = G.hud.trans_pressed = 0;
+    G.hud.camera_pressed = G.hud.reset_pressed = 0;
   if (G.hud.camera_pressed) {
     G.camera ^= 1;
     car_view(G.camera ? CAR_VIEW_ROOF : CAR_VIEW_BEHIND);
@@ -5225,21 +5384,21 @@ void app_frame(float dt) {
   }
   /* the reset key: the car back on the road once it is in the player's hands (not over the
    * rolling start's pilot, a beaten rival's still frames or the finish) */
+  if (G.vs_race) G.hud.reset_pressed=0;
   if (G.hud.reset_pressed) {
     const car_race *r = &G.car.race;
-    if (r->state == CAR_RACE_RUN && r->countdown <= 0.0f && r->play_state == 2) car_reset(&G.car);
+    if (r->state == CAR_RACE_RUN && r->countdown <= 0.0f && r->play_state == 2) {
+      app_ta_rank_invalidate();
+      AGR.token=0;
+#ifdef __ANDROID__
+      player_smoke_reset(); /* explicit warp fence, including the early tick2 alias */
+#endif
+      car_reset(&G.car);
+    }
     G.hud.reset_pressed = 0;
   }
-  if (G.hud.trans_pressed) {
-    /* the arcade fixes the gearbox for a race; here it switches on the move */
-    G.menu.manual ^= 1;
-    car_set_manual(&G.car, G.menu.manual);
-    garage_save();
-    G.hud.trans_pressed = 0;
-  }
-  /* One arcade frame per display frame: dt comes from vsync-aligned timestamps, so
-   * rounding it counts the vsyncs that went by. (An accumulator drifting around 1/60 s now
-   * and then ran no step one frame and two the next, a visible hitch.) */
+  /* app_present supplies one exact 60 Hz logic interval, never display cadence.
+   * Legacy platforms retain their existing vsync-rounded behavior below. */
   t0 = now_ms();
 #ifdef __ANDROID__
   /* The first two frames include race setup and initial GPU warm-up, not driving time. */
@@ -5249,6 +5408,7 @@ void app_frame(float dt) {
   if (steps < 1 || G.race_frames < 2) steps = 1;
 #endif
   if (G.paused && !G.vs_race) steps = 0; /* a versus runs on with the others under it */
+  if (G.vs_race && (!net_native_allowed() || AV4.local_finished)) steps=0;
   if (G.period_in > 0) G.period_in -= steps;
   if (movie) { /* clRaceThread::race: the movie's frames, then the race */
     for (int i = 0; i < steps && G.movie_len > 0; ++i) {
@@ -5284,6 +5444,7 @@ void app_frame(float dt) {
   if (!steps && !movie && !frozen && !G.story_old_ended && !(G.paused && !G.vs_race) && !android_was_paused) {
     G.hud.shift_up += in.shift_up;
     G.hud.shift_down += in.shift_down;
+    G.hud.passing_pressed |= in.passing;
   }
 #endif
   int story_was_old_ended = G.story_old_ended;
@@ -5291,6 +5452,11 @@ void app_frame(float dt) {
   int story_tail_ticks = story_was_old_ended ? steps : 0;
   int physics_steps = story_was_old_ended ? 0 : steps;
   for (int i = 0; i < physics_steps; ++i) {
+    if (G.vs_race) {
+      int gate=app_vs4_native_gate();
+      if(gate<0){menu_frame(0,frame_start);return;}
+      if(!gate)break;
+    }
     if (G.ten_white && ++G.ten_white > 1 + TEN_WHITE_HOLD + TEN_WHITE_FADE) G.ten_white = 0;
 #if defined(__ANDROID__) && defined(WMMT_DEBUG_LOG)
     ++debug_sim_seq;
@@ -5299,23 +5465,21 @@ void app_frame(float dt) {
     if (debug_on) debug_before = debug_capture();
 #endif
     car_update(&G.car, &in);
-    /* car_update can itself receive a CLOSED or ABORT packet. Do not run
-     * another tick, commit a result, or draw this stale race afterwards. */
-    if (G.vs_race && net_host_closed()) {
-      G.vs_closed = 1;
-      car_clear_junction(&G.car.race);
-#ifdef __ANDROID__
-      junction_ui_reset(&race_junction_ui);
-      junction_barrier_reset(&race_junction_barrier);
-#endif
-      break;
-    }
+    if (!G.vs_race) app_ta_rank_tick();
+    /* link_receive can latch cancellation inside the native call. Its current
+     * call cannot be interrupted, but no subsequent tick/result is permitted. */
+    if (G.vs_race && app_vs4_native_gate()<0) {menu_frame(0,frame_start);return;}
 #ifdef __ANDROID__
     /* Sampling once per simulated tick avoids dropping effects at high refresh;
      * the arcade invokes this from its display manager, so cadence may differ. */
-    if (!movie) player_tracks_tick(&G.car);
+    if (!movie) {
+      player_tracks_tick(&G.car);
+      player_smoke_tick(&G.car);
+    }
+    race_tail_tick(movie);
 #endif
     ++executed_physics_ticks;
+    if (app_ghost_mode() && G.car.race.over) break; /* next ordinary 60Hz tick may finish step3 sampling */
 #ifdef __ANDROID__
     if (G.car.race.jct_select_valid) {
       junction_ui_tick(&race_junction_ui, G.car.race.jct_state, G.car.race.jct_left_area,
@@ -5344,7 +5508,7 @@ void app_frame(float dt) {
     }
 #endif
     backfire_tick();
-    in.shift_up = in.shift_down = 0;
+    in.shift_up = in.shift_down = in.passing = 0;
     /* clCarEffectManager::update's sparks, each car's */
     spark_step(0, G.car.body, &G.car.effect);
     for (int k = 0; k < CAR_RIVALS; ++k)
@@ -5365,6 +5529,9 @@ void app_frame(float dt) {
         G.car.race.state == CAR_RACE_GOAL) {
       G.story_end_started = 1;
       G.story_end_freeze = hud_story_cutin_goal_hold(&G.car.race);
+#ifdef __ANDROID__
+      if (G.story_end_freeze > 0) android_story_bgm_pause();
+#endif
       break; /* no additional physics steps after the goal in a multi-step frame */
     }
     /* clRaceThread::race on a 10-in-a-row rival beaten (play state 9, one arcade frame): the
@@ -5380,12 +5547,22 @@ void app_frame(float dt) {
       break;
     }
     if (G.car.race.play_state != 9) G.ten_beaten_on = 0;
+    if (G.vs_race && G.car.race.over && !G.menu.finish) break; /* FINISH outside loop, no extra native goal ticks. */
   }
   /* A stopped old sequence has no physics, but dialogue still uses UI time. */
   for (int i = 0; i < story_tail_ticks; ++i) hud_story_cutin_step(&G.car.race, 0);
-  if (!G.vs_closed && !G.paused && !frozen && !movie) snd_update(&G.car, &in, dt);
+  if (!G.vs_closed && !G.vs_wait && !G.paused && !frozen && !movie) snd_update(&G.car, &in, dt);
+  if (G.vs_closed || G.vs_wait || G.paused || frozen || movie || G.story_old_ended || G.story_end_freeze > 0 || G.ten_freeze > 0)
+    snd_rev_quiet(); /* A stopped physics loop must not leave the rev buzzer sounding. */
   /* the time attack console's sounds: TIME EXTEND at a checkpoint, the last seconds' ticks */
   car_race *race = &G.car.race;
+  if (!movie) app_ta_replay_finish();
+  if (app_ghost_finish()) {
+    snd_quiet(); hud_init(&G.hud, G.hud.screen_w, G.hud.screen_h);
+    car_clear_junction(&G.car.race);
+    if (G.perf) fflush(G.perf);
+    menu_frame(0, frame_start); return;
+  }
   /* the 10-in-a-row's rival of the round */
   if (G.n_ten && race->ten_rival >= 0 && race->ten_rival < G.n_ten && G.ten_pack[race->ten_rival] >= 0) {
     G.rival_model[0] = car_pack(G.ten_pack[race->ten_rival]);
@@ -5396,9 +5573,10 @@ void app_frame(float dt) {
     G.ten_rival_on = race->ten_rival;
     snd_menu(race->ten_rival == G.n_ten - 1 ? SND_APPROACH3 : SND_APPROACH2);
   }
-  if (race->extended > 0) {
+  int ta_checkpoint = G.menu.game == MENU_GAME_TA && hud_ta_checkpoint(race);
+  if (race->extended > 0 || ta_checkpoint) {
     snd_menu(SND_TIME_EXTEND);
-    hud_time_extend(race->total);
+    if (!ta_checkpoint) hud_time_extend(race->total);
   }
   race->extended = 0;
   int left = (int)race->time_left;
@@ -5425,7 +5603,7 @@ void app_frame(float dt) {
   if (race->state == CAR_RACE_RUN && race->countdown <= 0.0f) {
     G.top_kmh = fmaxf(G.top_kmh, car_kmh(&G.car));
     /* the card's mileage */
-    if (!(G.menu.game == MENU_GAME_STORY && G.menu.story_test) && G.menu.own_sel >= 0 && G.menu.own_sel < G.menu.n_own) G.menu.own[G.menu.own_sel].odo += car_kmh(&G.car) / 3.6 * executed_physics_ticks / 60.0;
+    if (!app_ghost_mode() && !(G.menu.game == MENU_GAME_STORY && G.menu.story_test) && G.menu.own_sel >= 0 && G.menu.own_sel < G.menu.n_own) G.menu.own[G.menu.own_sel].odo += car_kmh(&G.car) / 3.6 * executed_physics_ticks / 60.0;
   }
 #ifdef WMMT_EGL
   if (getenv("WMMT_ST_END") && (G.rival >= 0 || G.vs_race) && !movie && G.race_frames > atoi(getenv("WMMT_ST_END")))
@@ -5436,8 +5614,16 @@ void app_frame(float dt) {
       race->state == CAR_RACE_GOAL) {
     G.story_end_started = 1;
     G.story_end_freeze = hud_story_cutin_goal_hold(&G.car.race); /* bounded result-dialogue hold */
+#ifdef __ANDROID__
+    if (G.story_end_freeze > 0) android_story_bgm_pause();
+#endif
   }
-  if (race->over && !G.menu.finish && !G.vs_closed && !movie && G.story_end_freeze <= 0) {
+  int vs_finish_ready = 1;
+  if (G.vs_race && race->over && !G.menu.finish) {
+    vs_finish_ready=app_vs4_finish_ready();
+    if(vs_finish_ready<0){menu_frame(0,frame_start);return;}
+  }
+  if (!app_ghost_mode() && race->over && !G.menu.finish && !G.vs_closed && !movie && G.story_end_freeze <= 0 && vs_finish_ready) {
     int goal = race->state == CAR_RACE_GOAL;
     garage_save(); /* the mileage */
     menu_result res;
@@ -5513,6 +5699,7 @@ void app_frame(float dt) {
       menu_finish_ten(&G.menu, beaten, race->ten_now, medal);
       menu_dress_win(&G.menu, getenv("WMMT_DRESS_WIN") ? atoi(getenv("WMMT_DRESS_WIN")) : beaten);
     } else {
+      if (goal) app_ta_rank_finish(race);
       if (goal) records_goal(G.menu.course, race, &res, !G.race_traffic);
       menu_finish_open(&G.menu, goal, goal ? &res : NULL);
       title_race_over(TITLE_TA, goal, race, G.menu.course, goal && !G.race_traffic && res.rank == 1);
@@ -5521,7 +5708,29 @@ void app_frame(float dt) {
   }
   } /* !G.vs_closed: only the renderer and closure notice continue below */
   double t1 = now_ms();
+  app_display_input = in;
+  if (G.car.race.state == CAR_RACE_RUN) {
+    float aspect = (float)G.fb_w / (float)G.fb_h;
+    float fovy = 2.0f * atanf(tanf(G.car.cam_fov * 0.5f) / (4.0f / 3.0f));
+    mat4 proj = mat4_perspective(fovy, aspect, G.car.cam_near, 20000.0f);
+    hud_rival_view(G.car.cam_view, proj.m);
+    if (AG.active && AG.arcade) {
+      car_ghost_observation opponent;
+      int valid = car_ghost_status(&opponent) && opponent.session_token == AG.token &&
+                  opponent.kind == AG.config.kind && opponent.status == CAR_GHOST_RUNNING &&
+                  (opponent.native_target_valid || opponent.native_default_ai_valid);
+      hud_set_ghost_gap(valid ? opponent.live_gap_mm : NAN);
+    }
+    hud_visual_tick(&G.car);
+  }
+  if (!app_tick_only) app_draw_frame(dt, &in, steps, t1 - t0, &G.car);
+}
 
+static void app_draw_frame(float dt, const car_input *input, int steps, double physics_ms, const car_state *c) {
+  car_input in = *input;
+  int movie = G.movie_len > 0;
+  double t1 = now_ms();
+  wpk_ao(G.ao_test >= 0 ? G.ao_test : G.menu.ao_on);
   /* the overhead map for the player's car first, before anything goes to the frame's own
    * target (a tile renderer would store the frame and load it again to come back to it) */
   {
@@ -5530,9 +5739,9 @@ void app_frame(float dt) {
     if (G.no_over || !G.menu.over_on || !(G.camera == 0 || movie)) {
       G.over_drawn = 0;
     } else if (!(G.race_frames & 1) || !G.over_drawn) {
-      /* every other frame: a reflection 1/30 s old does not show, half its GPU time does */
+      /* Every other presentation: a GPU-cost cadence, not a gameplay clock. */
       mat4 body;
-      memcpy(body.m, G.car.body, sizeof body.m);
+      memcpy(body.m, c->body, sizeof body.m);
       const wpk_scene *over[2] = { &G.track, &G.arrows[G.track_zone] };
       int t0 = G.rp.triangles;
       G.over_draws = render_overhead(over, 2, &body, &G.rp);
@@ -5542,24 +5751,29 @@ void app_frame(float dt) {
     G.over_ms = now_ms() - o0;
   }
 
-  draw_backmirror(&G.car, movie);
+  draw_backmirror(c, movie);
 
   /* render: into the radial blur's texture while the camera asks for it (or the sharpening) */
   int sharp = G.menu.sharp_on && !G.no_sharp;
   if (sharp && dt > 1.5f / 60.0f && G.race_frames > 2) G.sharp_rest = SHARP_REST;
-  else if (G.sharp_rest > 0) G.sharp_rest--;
+  else if (G.sharp_rest > 0) G.sharp_rest = G.sharp_rest > steps ? G.sharp_rest - steps : 0;
   if (sharp && G.sharp_rest > 0) G.sharp_rested++;
   render_sharpen(sharp && !G.sharp_rest ? SHARP_AMOUNT : 0.0f, sharp);
-  int blurred = render_blur_begin(G.phone ? 0.0f : G.car.cam_blur, G.fb_w, G.fb_h);
+  int blurred = render_blur_begin(G.phone ? 0.0f : c->cam_blur, G.fb_w, G.fb_h);
+#ifndef WMMT_NATIVE_VK
   int scene_w = G.fb_w, scene_h = G.fb_h;
   if (blurred) render_blur_size(&scene_w, &scene_h);
   glViewport(0, 0, scene_w, scene_h);
+#endif
+#ifdef WMMT_NATIVE_VK
+  render_scene_clear(G.rp.fog_color[0], G.rp.fog_color[1], G.rp.fog_color[2], 1);
+#else
   glClearColor(G.rp.fog_color[0], G.rp.fog_color[1], G.rp.fog_color[2], 1);
   glDepthMask(GL_TRUE);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+#endif
 
   /* the arcade's own camera: fixed to the car, with its sway */
-  const car_state *c = &G.car;
   float aspect = (float)G.fb_w / (float)G.fb_h;
   /* the arcade's view across 4:3; a wider screen sees more at the sides */
   float fovy = 2.0f * atanf(tanf(c->cam_fov * 0.5f) / (4.0f / 3.0f));
@@ -5634,7 +5848,12 @@ void app_frame(float dt) {
       wpk_draw(sky, &sky_vp, &sky_m, sky_eye, pass, &sky_rp);
     }
     render_blend_pass(0);
+    
+#ifdef WMMT_NATIVE_VK
+    render_scene_depth_clear();
+#else
     glClear(GL_DEPTH_BUFFER_BIT);
+#endif
   }
   SEG_END(SEG_SKY);
   set_car_light(&G.rp, &CAR_LIGHT[G.track_city][G.track_zone], &view);
@@ -5644,7 +5863,7 @@ void app_frame(float dt) {
     wpk_draw(&G.track, &vp, &ident, c->cam_pos, pass, &G.rp);
     wpk_draw(&G.arrows[G.track_zone], &vp, &ident, c->cam_pos, pass, &G.rp);
     draw_race_cars(c, &vp, c->cam_pos, pass, movie, G.camera == 0 || movie, G.phone ? PHONE_TRAFFIC_FAR : 0.0f, &G.rp);
-    if (pass == WPK_CUTOUT) draw_shadows(&vp, &car_m);
+    if (pass == WPK_CUTOUT) draw_shadows(c, &vp, &car_m);
     SEG_END(SEG_OPAQUE + pass);
   }
 #ifdef __ANDROID__
@@ -5658,7 +5877,11 @@ void app_frame(float dt) {
   }
 #endif
 #ifdef __ANDROID__
-  if (!movie && !G.vs_closed) player_tracks_draw(&vp, &G.rp);
+  if (!movie && !G.vs_closed) {
+    player_tracks_draw(&vp, &G.rp);
+    /* Original drawLow/drawHigh use view0's track -> RollUp pass. No mirrors. */
+    player_smoke_draw(&proj, &view, &G.rp);
+  }
 #endif
   /* the headlights' pools on the road (clCarSpotLight), then the street lights' and building
    * lights' glows, and the rows of lights at the goal and the next checkpoint */
@@ -5671,6 +5894,7 @@ void app_frame(float dt) {
       if (c->rival_shown[i] && c->rival_spot[i] && (movie ? G.movie_model[i] : G.rival_model[i])) spot[n++] = c->rival_body[i];
     if (!getenv("WMMT_NO_SPOT")) lights_draw_spots(&proj, &view, spot, n, G.track_zone == 1, &G.rp);
   }
+  if (!movie) draw_race_front_halos(c, &proj, &view, c->cam_pos, G.camera == 0, 0, &G.rp);
   /* the car's under neon (clCarDisp::update: clNeon::setPosture with the car's frame at its
    * hubs' mean height) */
   if ((G.camera == 0 || movie) && G.menu.neon[G.menu.maker][G.menu.car]) {
@@ -5680,7 +5904,7 @@ void app_frame(float dt) {
     lights_draw_neon(&proj, &view, f.m, G.race_pack, G.menu.aero[G.menu.maker][G.menu.car], G.menu.neon[G.menu.maker][G.menu.car], &G.rp);
   }
   /* a versus' other cars' */
-  for (int i = 0; !movie && G.vs_race && i < CAR_RIVALS; ++i) {
+  for (int i = 0; !movie && (G.vs_race || app_ghost_arcade_dressed()) && i < CAR_RIVALS; ++i) {
     const vs_dress_t *d = &G.rival_dress[i];
     if (!d->neon || !c->rival_shown[i] || !G.rival_model[i]) continue;
     mat4 f;
@@ -5692,7 +5916,10 @@ void app_frame(float dt) {
   lights_draw(&proj, &view, G.track_zone == 1, G.rp.time, &G.rp);
   lights_draw_goal(&proj, &view, &c->race, G.rp.time, &G.rp);
   lights_draw_ten_line(&proj, &view, &c->race, &G.rp);
-  backfire_draw(&vp, c->cam_pos, movie);
+  backfire_draw(&vp, c->cam_pos, movie, c);
+#ifdef __ANDROID__
+  race_tail_draw(&proj, &G.rp, movie, G.camera == 0);
+#endif
   if (!movie && !getenv("WMMT_NO_SPARK")) spark_draw(&proj, &view, &G.rp);
   render_blend_pass(0);
   SEG_END(SEG_LIGHTS);
@@ -5730,11 +5957,13 @@ void app_frame(float dt) {
     float left = G.movie_len - G.movie_frame;
     if (G.movie_fade && left < MOVIE_FADE) hud_fade(&G.hud, fade_grey(G.movie_fade), 1.0f - left / MOVIE_FADE);
   } else if (c->race.state == CAR_RACE_RUN) hud_draw(&G.hud, c, &in, G.fps);
-  else if (!G.vs_closed) menu_finish_warm(G.n_ten ? 3 : G.vs_race || (G.rival >= 0 && G.menu.game == MENU_GAME_STORY) ? 2 : c->race.state == CAR_RACE_GOAL);
+  else if (!G.vs_closed) menu_finish_warm(G.n_ten ? 3 : app_ghost_mode() || G.vs_race || (G.rival >= 0 && G.menu.game == MENU_GAME_STORY) ? 2 : c->race.state == CAR_RACE_GOAL);
 #ifdef __ANDROID__
   if (!movie && !G.vs_closed && !G.menu.finish && !G.story_end_freeze &&
       c->race.state == CAR_RACE_RUN && c->race.jct_select_valid) {
+#ifndef WMMT_NATIVE_VK
     glBlendEquation(GL_FUNC_ADD); /* anm's first ordinary layer needs additive equation */
+#endif
     junction_ui_draw(&race_junction_ui);
   }
 #endif
@@ -5744,7 +5973,8 @@ void app_frame(float dt) {
   if (!movie && G.movie_in > 0) hud_fade(&G.hud, fade_grey(G.movie_fade), (float)G.movie_in / MOVIE_FADE);
   if (G.period_in > 0) hud_fade(&G.hud, fade_grey(G.period_fade), (float)G.period_in / MOVIE_FADE);
   hud_white(&G.hud, ten_white_alpha());
-  if (G.vs_closed) vs_closed_draw();
+
+  app_vs4_notice();
   SEG_END(SEG_HUD);
 #undef SEG_END
   /* now and then, in a frame that is slow anyway (its render, or the frame before it, which
@@ -5754,20 +5984,90 @@ void app_frame(float dt) {
   if (G.perf && (now_ms() - t1 > 10.0 || dt > 1.5f / 60.0f) && G.race_frames - gpu_sampled >= 300) {
     gpu_sampled = G.race_frames;
     double g0 = now_ms();
+#ifdef WMMT_NATIVE_VK
+    int completed = cinder_vk_finish();
+    if (completed)
+      fprintf(G.perf, "%7.2fs native submit/wait host sample: render %.2f ms, wait %.2f ms; draws %d tris %d kmh %.0f blur %.2f"
+              " over %d sharp %d\n", G.race_time, g0 - t1, now_ms() - g0, G.rp.draws, G.rp.triangles, car_kmh(c),
+              c->cam_blur, G.over_draws, G.menu.sharp_on && !G.sharp_rest);
+    else fprintf(G.perf, "%7.2fs native submit/wait sample unavailable (completion unconfirmed)\n", G.race_time);
+#else
     glFinish();
     fprintf(G.perf, "%7.2fs gpu sample: render %.2f ms, then the GPU %.2f ms more; draws %d tris %d kmh %.0f blur %.2f"
             " over %d sharp %d\n", G.race_time, g0 - t1, now_ms() - g0, G.rp.draws, G.rp.triangles, car_kmh(c),
             c->cam_blur, G.over_draws, G.menu.sharp_on && !G.sharp_rest);
+#endif
   }
   if (G.paused && !G.vs_closed) {
     menu_pause_draw(&G.menu);
     return;
   }
-  perf_frame(dt, steps, t1 - t0, now_ms() - t1, warmed, &G.rp);
+  perf_frame(dt, steps, physics_ms, now_ms() - t1, warmed, &G.rp);
   static int frame;
   if (frame < 10 || frame % 150 == 0)
+#ifdef WMMT_NATIVE_VK
+    fprintf(stderr, "frame %d dt %.3f draws %d tris %d car %.1f %.1f %.1f cam %.1f %.1f %.1f traffic %d kmh %.0f blur %.3f native epoch %llu pending %d\n",
+            frame, dt, G.rp.draws, G.rp.triangles, c->pos[0], c->pos[1], c->pos[2], c->cam_pos[0], c->cam_pos[1],
+            c->cam_pos[2], c->n_traffic, car_kmh(c), c->cam_blur, (unsigned long long)cinder_vk_error_epoch(), cinder_vk_error_pending());
+#else
     fprintf(stderr, "frame %d dt %.3f draws %d tris %d car %.1f %.1f %.1f cam %.1f %.1f %.1f traffic %d kmh %.0f blur %.3f err 0x%x\n",
             frame, dt, G.rp.draws, G.rp.triangles, c->pos[0], c->pos[1], c->pos[2], c->cam_pos[0], c->cam_pos[1],
             c->cam_pos[2], c->n_traffic, car_kmh(c), c->cam_blur, glGetError());
+#endif
   frame++;
+}
+
+
+void app_timing_reset(void) {
+  timing60_sim_reset(&app_clock);
+  app_history_valid = 0;
+  memset(&app_display_input, 0, sizeof app_display_input);
+}
+
+/* Keep original RC/net/sound inputs and physics ownership in app_frame. At most
+ * six fixed ticks follow a stall (100 ms admitted time); longer blocked/loading
+ * intervals are deliberately discarded, never a spiral of replayed packets. */
+void app_present(float dt) {
+  double frame_start = now_ms();
+  G.frame_start = frame_start;
+#ifdef WMMT_NATIVE_VK
+  render_display_begin(G.fb_w, G.fb_h);
+#endif
+  if (!isfinite(dt) || dt < 0) dt = 0;
+  app_display_dt = dt > 0.1f ? 0.1f : dt;
+  if (dt > 0) G.fps += (1.0f / dt - G.fps) * 0.05f;
+  if (dt > 0.1f) app_history_valid = 0;
+  if (net_is_open()) app_vs4_poll_transport();
+  int ticks = timing60_sim_steps(&app_clock, dt);
+  double physics_ms = 0;
+  app_tick_only = 1;
+  for (int i = 0; i < ticks; ++i) {
+    /* Abort is checked again before each display catch-up slice. Soft wait still
+     * runs APP logic/network polling, but the inner gate permits no native tick. */
+    if (G.vs_race && app_vs4_native_gate()<0) {app_history_valid=0;break;}
+    int menu = G.in_menu, camera = G.camera, movie = G.movie_len > 0;
+    int reset = G.hud.reset_pressed;
+    int warm = !menu && G.race_frames < 2;
+    app_previous = G.car;
+    double t0 = now_ms();
+    app_frame(1.0f / 60.0f);
+    physics_ms += now_ms() - t0;
+    app_history_valid = !menu && !G.in_menu && camera == G.camera && movie == (G.movie_len > 0) &&
+      !G.paused && !G.vs_closed && !G.ten_freeze && !G.story_end_freeze && !G.story_old_ended &&
+      !warm && !reset && app_previous.race.state == G.car.race.state;
+    if (menu != G.in_menu || movie != (G.movie_len > 0)) {
+      /* Slow Init/End/movie setup belongs to neither the new race nor menu time. */
+      timing60_sim_reset(&app_clock);
+      app_history_valid = 0;
+      break;
+    }
+  }
+  app_tick_only = 0;
+  G.frame_start = frame_start;
+  if (G.in_menu) { menu_present(frame_start); return; }
+  presentation60_car(&app_display_car, &app_previous, &G.car,
+                      (float)app_clock.fraction, app_history_valid);
+  app_draw_frame(app_display_dt, &app_display_input, ticks, physics_ms, &app_display_car);
+  /* GPU warming is not elapsed driving time, regardless of display rate. */
+  if (G.race_frames <= 2) timing60_sim_reset(&app_clock);
 }

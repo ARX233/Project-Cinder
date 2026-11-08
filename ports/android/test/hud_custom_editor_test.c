@@ -18,6 +18,9 @@ static int hit_key, hit_race, last_dead, last_separate;
 void hud_layout_set(int g,float k,float x,float y) {(void)g;(void)k;(void)x;(void)y;}
 void hud_set_stick_deadzone_percent(int n) {last_dead=n;}
 void hud_shift_layout_set(int s,float k,float x,float y) {last_separate=s;(void)k;(void)x;(void)y;}
+static int last_opacity;
+void hud_set_button_opacity_percent(int n) {last_opacity=n;}
+void hud_button_layout_set(int g,int s,float k,float x,float y) {(void)g;(void)s;(void)k;(void)x;(void)y;}
 void hud_race_layout_set(int g,float k,float x,float y) {(void)g;(void)k;(void)x;(void)y;}
 void hud_layout_clamp_mode(int g,int m,float k,float *x,float *y) {(void)g;(void)m;(void)k;(void)x;(void)y;}
 static int force_identity_clamp, clamp_calls;
@@ -45,6 +48,25 @@ int main(void) {
   assert(m.custom_layout.shift_separate && m.custom_layout.shift.k==130 && m.custom_layout.shift.dx==27 && m.custom_layout.shift.dy==-13 && last_separate);
   press(&m,LAY_RESET); assert(!m.custom_layout.shift_separate && m.custom_layout.shift.k==120);
   hit_key=HUD_EDIT_SHIFT; layout_touch(&m,(void*)1,TOUCH_BEGAN,40,600); layout_touch(&m,(void*)1,TOUCH_MOVED,80,600); assert(m.custom_layout.shift_separate); layout_touch(&m,(void*)1,TOUCH_CANCELLED,80,600); assert(!m.custom_layout.shift_separate);
+  m.lay_sel=HUD_EDIT_SHIFT_UP;
+  press(&m,LAY_SMALLER);
+  assert(m.custom_layout.separate_buttons==1 && m.custom_layout.button[0].k==110 &&
+         m.custom_layout.button[0].dx==27 && !m.custom_layout.shift_separate);
+  m.lay_sel=HUD_EDIT_SHIFT_DOWN;
+  press(&m,LAY_BIGGER);
+  assert(m.custom_layout.separate_buttons==3 && m.custom_layout.button[1].k==130 &&
+         m.custom_layout.button[0].k==110);
+  hit_key=HUD_EDIT_PAUSE; layout_touch(&m,(void*)1,TOUCH_BEGAN,100,20);
+  layout_touch(&m,(void*)1,TOUCH_ENDED,125,30);
+  assert(m.custom_layout.separate_buttons==7 && m.custom_layout.button[2].dx==25);
+  m.lay_sel=HUD_EDIT_CAMERA; press(&m,LAY_BIGGER);
+  assert(m.custom_layout.separate_buttons==15 && m.custom_layout.button[3].k==110);
+  press(&m,LAY_RESET);
+  assert(m.custom_layout.separate_buttons==7 && m.custom_layout.button[3].k==100);
+  press(&m,LAY_OPACITY_MINUS);
+  assert(m.custom_layout.button_opacity_percent==90 && last_opacity==90);
+  press(&m,LAY_RESET_ALL);
+  assert(m.custom_layout.button_opacity_percent==100 && last_opacity==100 && !m.custom_layout.separate_buttons);
   press(&m,LAY_PAGE); assert(m.lay_page && m.lay_sel==HUD_RACE_MAP);
   hit_race=HUD_RACE_METER; layout_touch(&m,(void*)1,TOUCH_BEGAN,40,600); layout_touch(&m,(void*)2,TOUCH_MOVED,140,600); assert(m.custom_layout.meter.dx==0); layout_touch(&m,(void*)1,TOUCH_ENDED,90,600); assert(m.custom_layout.meter.dx==50);
   press(&m,LAY_BIGGER); assert(m.custom_layout.meter.k==110);

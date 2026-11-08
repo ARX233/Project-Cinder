@@ -4,8 +4,19 @@
 #include "../src/menu.c"
 static int missing, volume = 2, fail_save, meter, source; static const char *missing_name;
 static int drawn[300000], part_ids[32], nparts; static float part_rect[32][4];
+static int story_cells, story_portraits[20], defense_rows;
 void anm_draw(int a, int f, float v) { (void)a; (void)f; (void)v; }
-void anm_draw_ex(int a, int f, float v, float x, float y, const anm_swap *s, int n) { (void)a;(void)f;(void)v;(void)x;(void)y;(void)s;(void)n; }
+void anm_draw_ex(int a, int f, float v, float x, float y, const anm_swap *s, int n) {
+  (void)v; (void)n;
+  if (a == 2) {
+    assert(story_cells < 20 && x == 105 + 108 * (story_cells % 5) && y == 170 + 60 * (story_cells / 5));
+    story_portraits[story_cells++] = s[f].to;
+  }
+  if (a == 3) {
+    assert(defense_rows < 8 && x == 319 && y == 189 + 24 * defense_rows);
+    defense_rows++;
+  }
+}
 void anm_draw_xy(int a, int f, float v, float x, float y, float sx, float sy, const anm_swap *s, int n) { (void)a;(void)f;(void)v;(void)x;(void)y;(void)sx;(void)sy;(void)s;(void)n; }
 void anm_draw_sprite(int s, float x, float y, float a) { (void)x;(void)y;(void)a; if (s >= 0 && s < 300000) drawn[s]++; }
 float anm_sprite_width(int s) { (void)s; return 50; }
@@ -14,7 +25,12 @@ int anm_sprites(int a, int *out, int max) { (void)a;(void)out;(void)max; return 
 int anm_sprite_id(int s) { return s; }
 int anm_sprite_rect(int a, int f, int s, float r[4]) { (void)a;(void)f;(void)s;(void)r; return 0; }
 void anm_draw_part(int s, const float src[4], const float dst[4], float alpha) { (void)src;(void)alpha; if(nparts<32) { part_ids[nparts]=s; memcpy(part_rect[nparts],dst,4*sizeof(float)); nparts++; } }
-int anm_find(const char *n) { return (missing || (missing_name && !strcmp(n, missing_name))) ? -1 : 1; }
+int anm_find(const char *n) {
+  if (missing || (missing_name && !strcmp(n, missing_name))) return -1;
+  if (!strcmp(n, "menu_g_cardcheck_2_chara")) return 2;
+  if (!strcmp(n, "menu_g_cardcheck_14_data")) return 3;
+  return 1;
+}
 int anm_frames(int a) { (void)a; return 1; }
 int anm_sprite(int id) { return id; }
 void snd_menu(int x) { (void)x; }
@@ -24,6 +40,7 @@ int hud_meter_preview(int pack, int style, float x, float y, float w, float h, f
 }
 int app_get_bgm_volume(void) { return volume; }
 int app_model_ta_best_ms(int pack, int course) { (void)pack; return course == 0 ? 123456 : 0; }
+int title_model(int maker, int car, int color) { (void)maker; (void)car; (void)color; return 0; }
 int app_set_bgm_volume(int v) { if (fail_save) return 0; volume = v; return 1; }
 int menu_card_meter(const menu_state *m) { (void)m; return meter; }
 int menu_card_bgm_source(const menu_state *m) { (void)m; return source; }
@@ -68,7 +85,19 @@ int main(void) {
  /* Verified state fields, not the embedded template's example numbers. */
  memset(&m, 0, sizeof m); m.screen = MENU_CARD; m.card_page = 2; m.st_div = 1; m.st_bits = 3;
  memset(drawn, 0, sizeof drawn); draw_card(&m, 0, 1, 0);
- assert(!drawn[SAVE_TEXT + S_STORY] && drawn[SAVE_GLYPH + 2] == 2);
+ assert(story_cells == 20 && story_portraits[0] == 0x1536 && story_portraits[1] == 0x1537);
+ assert(story_portraits[2] == 0x85d && story_portraits[3] == 0x1a51);
+ assert(!drawn[0xabd]); /* the historical total is unknown for this saved division */
+ m.card_page = 3; m.maker = 0; m.car = 0; m.dress_lv[0][0] = 12;
+ m.card_ghost_stats.races = 5; m.card_ghost_stats.wins = 3; m.card_ghost_stats.coins = 4;
+ memset(drawn, 0, sizeof drawn); draw_card(&m, 0, 1, 0);
+ assert(!drawn[SAVE_TEXT + S_NO_DATA] && drawn[0x488+5] && drawn[0x488+3] && drawn[0x488+4]);
+ m.card_page = 4; memset(drawn, 0, sizeof drawn); draw_card(&m, 0, 1, 0);
+ assert(drawn[SAVE_TEXT + S_NO_DATA] && defense_rows == 0);
+ m.card_ghost_stats.defense_races = 8; m.card_ghost_stats.defense_wins = 2;
+ m.card_ghost_stats.defense_recent_count = 8;
+ memset(drawn, 0, sizeof drawn); draw_card(&m, 0, 1, 0);
+ assert(!drawn[SAVE_TEXT + S_NO_DATA] && drawn[0x493+8] && drawn[0x493+2] && defense_rows == 8);
  m.card_page = 5; m.ten_result[0][0] = 3; m.ten_result[1][1] = 3; m.ten_result[1][2] = 2;
  memset(drawn, 0, sizeof drawn); draw_card(&m, 0, 1, 0);
  assert(drawn[SAVE_TEXT + S_MEDALS] && drawn[SAVE_GLYPH + 2] == 1);

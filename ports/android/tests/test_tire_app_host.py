@@ -53,6 +53,10 @@ typedef struct {float pos[3],uv[2]; uint8_t rgba[4];} render_vertex;
 typedef struct {int unused;} render_params;
 typedef struct {int fd,n_tex; uint32_t *textures,*loaded;} wpk_scene;
 static TireTrack player_tracks; static wpk_scene track_scene; static uint32_t track_texture;
+/* This fixture owns only tire geometry. The shared race-reset dependency is
+ * captured here; actual tail clearing is checked in test_tail_trail_scene.py. */
+static int race_tail_resets;
+static void race_tail_reset(void){race_tail_resets++;}
 static uint32_t textures[1],loaded[1]; static int loads,frees,detached,mode,pending; static uint64_t epoch;
 int vkgl_error_pending(void){return pending;} uint64_t vkgl_error_epoch(void){return epoch;}
 static int wpk_load(wpk_scene *s,const char *path) {
@@ -92,6 +96,7 @@ int main(int argc,char **argv) {
  player_tracks_reset();for(int i=0;i<4;i++)car.track_alpha[i]=0;player_tracks_tick(&car);player_tracks_tick(&car);player_tracks_draw(&vp,&rp);CHECK(draws==1);
  player_tracks_reset();for(int i=0;i<4;i++)car.track_alpha[i]=1;player_tracks_tick(&car);car.track_matrix[0][0]=NAN;player_tracks_tick(&car);car.track_matrix[0][0]=1;player_tracks_tick(&car);CHECK(tire_track_pair(&player_tracks,0,1)->strip_start);player_tracks_draw(&vp,&rp);CHECK(draws==2&&quad_count==6);
  player_tracks_reset();for(int j=0;j<20;j++){car.track_matrix[0][12]=(float)j;player_tracks_tick(&car);}CHECK(player_tracks.wheel[0].count==15&&tire_track_pair(&player_tracks,0,0)->vertex[0].x==4);player_tracks_reset();CHECK(player_tracks.enabled&&player_tracks.wheel[0].count==0);
+ CHECK(race_tail_resets>0);
  puts("tire app host contract: PASS");return 0;
 }
 """
@@ -103,7 +108,7 @@ class TireAppHostTest(unittest.TestCase):
         source = (ROOT/'src/app.c').read_text()
         self.assertRegex(source, r'if\s*\(!movie\)\s*player_tracks_tick\(&G\.car\)')
         self.assertRegex(source, r'if\s*\(!movie\s*&&\s*!G\.vs_closed\)\s*player_tracks_draw\(&vp,\s*&G\.rp\)')
-        work = Path(tempfile.mkdtemp(prefix='tire-app-host-'))
+        work = Path(tempfile.mkdtemp(prefix='tire-app-host-', dir='/Volumes/CodexWork'))
         env = os.environ.copy()
         for key in ('HOME','TMPDIR','TMP','TEMP','XDG_CACHE_HOME'): env[key]=str(work)
         good=work/'good'; bad=work/'bad'; good.mkdir(); bad.mkdir()

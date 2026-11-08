@@ -81,4 +81,22 @@ int bfx_car_id(const char *key, const char *body) {
   return id;
 }
 int bfx_variant_b(int id) { static const unsigned char b[]={0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x32,0x34,0x5f,0x60,0x61,0x71,0x75,0x76}; for(size_t i=0;i<sizeof b;i++) if(id==b[i]) return 1; return 0; }
-void bfx_step(bfx_playback *p,const bfx_asset *a,int car,const char *id,int pulse,int type) { if(!p||!a||!id||car<0||car>=BFX_MAX_CARS) return; for(unsigned i=0;i<a->nnozzle && i<BFX_MAX_NOZZLE;i++) { int f=p->frame[car][i]; if(bfx_car_id(a->nozzle[i].car,id)<0 || strcmp(a->nozzle[i].muffler,"MUFFLER1")) f=-1; if(f>=0 && ++f>=BFX_FRAMES) f=-1; if(f<0 && pulse && (type==0||type==1) && bfx_car_id(a->nozzle[i].car,id)>=0 && !strcmp(a->nozzle[i].muffler,"MUFFLER1")) { f=0; p->type[car][i]=(int8_t)type; } p->frame[car][i]=(int8_t)f; } }
+void bfx_step(bfx_playback *p, const bfx_asset *a, int car, const char *id,
+              int tuned_muffler, int pulse, int type) {
+  if (!p || !a || !id || car < 0 || car >= BFX_MAX_CARS) return;
+  const char *muffler = tuned_muffler ? "MUFFLER2" : "MUFFLER1";
+  for (unsigned i = 0; i < a->nnozzle && i < BFX_MAX_NOZZLE; ++i) {
+    const bfx_nozzle *nozzle = &a->nozzle[i];
+    if (bfx_car_id(nozzle->car, id) < 0 || strcmp(nozzle->muffler, muffler)) {
+      p->frame[car][i] = -1;
+      continue;
+    }
+    int frame = p->frame[car][i];
+    if (frame >= 0 && ++frame >= BFX_FRAMES) frame = -1;
+    if (frame < 0 && pulse && (type == 0 || type == 1)) {
+      frame = 0;
+      p->type[car][i] = (int8_t)type;
+    }
+    p->frame[car][i] = (int8_t)frame;
+  }
+}

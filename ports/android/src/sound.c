@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__ANDROID__) || defined(WMMT_AUDIO_DIAGNOSTICS) || defined(WMMT_LOOP_ATOMICS_TEST)
+#if defined(__ANDROID__) || defined(WMMT_AUDIO_DIAGNOSTICS) || defined(WMMT_LOOP_ATOMICS_TEST) || defined(__LP64__)
 #include <stdatomic.h>
 #endif
 #if defined(__ANDROID__) || defined(WMMT_AUDIO_DIAGNOSTICS)
@@ -114,8 +114,24 @@ static const char *EFFECT_FILES[S_COUNT - S_SLIP] = { "slip", "wall", "crash1", 
 static sample SAMPLES[S_COUNT];
 
 /* Loop voices map 1:1 to the first ten samples; one-shots get their own pool. */
-#define N_LOOP (S_WALL + 1)
+#define L_REV (S_WALL + 1) /* separate loop: preserve all existing sample IDs */
+#define N_LOOP (L_REV + 1)
 #define N_SHOT 4
+static sample REV_SAMPLE;
+static unsigned rev_car_type, rev_seen_sequence;
+/* REV's start/stop epoch is published as one word; audio owns its phase. Bit 0
+ * is playing, higher bits fence a new native Mc_Start/Mc_Stop lifetime. */
+#if defined(__ANDROID__) || defined(WMMT_LOOP_ATOMICS_TEST)
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "rev control must always be lock-free");
+static _Atomic unsigned rev_control;
+#define REV_CONTROL_LOAD() atomic_load_explicit(&rev_control, memory_order_acquire)
+#define REV_CONTROL_STORE(value) atomic_store_explicit(&rev_control, (value), memory_order_release)
+#else
+static volatile unsigned rev_control;
+#define REV_CONTROL_LOAD() (rev_control)
+#define REV_CONTROL_STORE(value) (rev_control = (value))
+#endif
+static unsigned rev_audio_control; /* callback only */
 
 typedef struct {
   const sample *s;
@@ -156,7 +172,27 @@ typedef struct {
 static loop_voice LOOPS[N_LOOP];
 static voice SHOTS[N_SHOT];
 static voice BAR; /* the story result's points gauge counting (SE 0x43, looped till stopped) */
+static voice ROAD; /* callback-owned, monophonic like native one-shot 3 */
+static unsigned long long road_seen; /* callback only */
+#if defined(__ANDROID__) || defined(WMMT_LOOP_ATOMICS_TEST) || defined(__LP64__)
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "road shot commands must be lock-free");
+static _Atomic unsigned long long road_command;
+#define ROAD_LOAD() atomic_load_explicit(&road_command, memory_order_relaxed)
+#define ROAD_STORE(value) atomic_store_explicit(&road_command, (value), memory_order_relaxed)
+#else
+static volatile unsigned long long road_command;
+#define ROAD_LOAD() (road_command)
+#define ROAD_STORE(value) (road_command = (value))
+#endif
 static int shot_next;
+
+static void road_shot(uint16_t hz, float gain) {
+  /* Publish the generation, native frequency and exact gain in one command. */
+  uint32_t bits;
+  memcpy(&bits, &gain, sizeof bits);
+  unsigned long long generation = (ROAD_LOAD() >> 48) + 1u;
+  ROAD_STORE(generation << 48 | (unsigned long long)hz << 32 | bits);
+}
 
 /* Minimal RIFF reader: PCM u8 or s16, mono. */
 static int load_wav(sample *s, const char *path) {
@@ -208,11 +244,15 @@ int snd_init(const char *data_dir) {
       snprintf(path, sizeof path, "%s/sound/engine/%s.wav", data_dir, name);
       if (load_wav(&ENGINE_SAMPLES[k][i], path) != 0) missing++;
     }
+  /* Original rotary warning shared by the RX-7 and RX-8. Old prepared data can omit it. */
+  snprintf(path, sizeof path, "%s/sound/rx7_rev1.wav", data_dir);
+  if (load_wav(&REV_SAMPLE, path) != 0 || REV_SAMPLE.n < 2 || REV_SAMPLE.rate <= 0)
+    fprintf(stderr, "rotary warning sound unavailable: sound/rx7_rev1.wav\n");
   for (int i = 0; i < N_LOOP; ++i) {
-    LOOP_STORE(LOOPS[i].s, &SAMPLES[i]);
-    LOOP_STORE(LOOPS[i].pitch, 1.0f);
+    LOOP_STORE(LOOPS[i].s, i == L_REV ? &REV_SAMPLE : &SAMPLES[i]);
+    LOOP_STORE(LOOPS[i].pitch, i == L_REV && REV_SAMPLE.rate > 0 ? 22000.0f / REV_SAMPLE.rate : 1.0f);
   }
-  snd_set_car(5, 24); /* the FD3S, tuned */
+  snd_set_car(5, 24); /* the FD3S, tuned; not a race/Mc_Start */
   return missing ? -1 : 0;
 }
 
@@ -224,6 +264,8 @@ static const unsigned char VALB_BY_TYPE[48] = {
 static int valb_sample = S_VALVE;
 
 void snd_set_car(unsigned type, int power) {
+  snd_rev_quiet();
+  rev_car_type = type;
   int v = type < 48 ? VALB_BY_TYPE[type] : 0;
   valb_sample = v == 0 ? S_VALVE : v == 1 ? S_VALB2 : S_VALB3;
   const unsigned char *by_type = power >= 8 ? SOUNDDB_BY_TYPE : SOUNDDB_BY_TYPE_STOCK;
@@ -304,16 +346,41 @@ void snd_update(car_state *car, const car_input *in, float dt) {
   }
   E.shot_cooldown -= dt;
   E.valb_left -= dt;
+  /* Independent tuning, not original arcade gain values. Bound abnormal
+   * requests before multiplication so the existing soft limiter stays safe. */
+  const float valve_boost = 1.7f, backfire_boost = 1.7f;
   if (car->se.valb && E.valb_left <= 0 && isfinite(car->se.valb_vol) && car->se.valb_vol >= 0) {
-    play_shot(valb_sample, 0.73f * 0.73f * car->se.valb_vol, 1.0f);
+    play_shot(valb_sample, valve_boost * 0.73f * 0.73f * fminf(car->se.valb_vol, 2.0f), 1.0f);
     E.valb_left = SAMPLES[valb_sample].rate > 0 ? (float)SAMPLES[valb_sample].n / SAMPLES[valb_sample].rate : 0.5f;
   }
   if (car->se.backfire && isfinite(car->se.backfire_vol) && car->se.backfire_vol >= 0 && isfinite(car->se.backfire_hz)) {
     int id = (E.backfire_k++ & 1u) ? S_BACKFIRE1 : S_BACKFIRE2;
     float hz = car->se.backfire_hz;
-    play_shot(id, 0.73f * car->se.backfire_vol, hz > 0 ? hz / 22050.0f : 1.0f);
+    play_shot(id, backfire_boost * 0.73f * fminf(car->se.backfire_vol, 2.0f), hz > 0 ? hz / 22050.0f : 1.0f);
   }
   car->se.valb = car->se.backfire = 0;
+  if (car->se.road_hz > 0 && car->se.road_hz <= UINT16_MAX &&
+      isfinite(car->se.road_vol) && car->se.road_vol > 0.0f) {
+    /* Mc_Req's 0.73 gain times wave descriptor 3's 1.8 multiplier. */
+    road_shot((uint16_t)car->se.road_hz, 0.73f * 1.8f * fminf(car->se.road_vol, 1.0f));
+  }
+  car->se.road_hz = 0;
+  /* The enable bit identifies an equipped car; the physics envelope already
+   * includes the high-rev state machine. Do not invent another RPM threshold. */
+  if (!car->se.rev_sequence) snd_rev_quiet();
+  else if (car->se.rev_sequence != rev_seen_sequence) {
+    rev_seen_sequence = car->se.rev_sequence;
+    float rev = car->se.rev_vol;
+    /* Original CSetting::GetSettingPt 0x89bfcff..0x89bfd25 enables
+     * ECarType 4..6: RX-8 SE3P, RX-7 FD and RX-7 FC. */
+    if (!(REV_CONTROL_LOAD() & 1u) ||
+        (rev_car_type < 4 || rev_car_type > 6) || !car->se.rev_enabled ||
+        !isfinite(car->rpm) || car->rpm < 0.0f || !isfinite(rev) || rev <= 0.0f || !REV_SAMPLE.data || REV_SAMPLE.n < 2 || REV_SAMPLE.rate <= 0)
+      rev = 0.0f;
+    else
+      rev = 0.73f * fminf(rev, 1.0f);
+    LOOP_STORE(LOOPS[L_REV].vol, rev);
+  }
 
   /* Prevent NaN/Inf or absurd inputs from poisoning the smoothed state. */
   float input_rpm = car->rpm;
@@ -377,8 +444,26 @@ void snd_update(car_state *car, const car_input *in, float dt) {
   car->impact = 0;
 }
 
+/* These are presentation-only lifetime notifications, not engine calls. The
+ * caller fences the latest observed sequence at a successful native race start;
+ * only a subsequent physics observation may unmute it. Selection alone is not a
+ * start. A mute/pause does not restart the continuously playing source. */
+void snd_rev_start(unsigned observed_sequence) {
+  snd_rev_quiet();
+  rev_seen_sequence = observed_sequence;
+  REV_CONTROL_STORE((REV_CONTROL_LOAD() + 2u) | 1u);
+}
+
+void snd_rev_stop(void) {
+  snd_rev_quiet();
+  REV_CONTROL_STORE((REV_CONTROL_LOAD() + 2u) & ~1u);
+}
+
+void snd_rev_quiet(void) { LOOP_STORE(LOOPS[L_REV].vol, 0.0f); }
+
 void snd_quiet(void) {
   for (int i = 0; i < N_LOOP; ++i) LOOP_STORE(LOOPS[i].vol, 0.0f);
+  if ((ROAD_LOAD() >> 32) & 0xffffu) road_shot(0, 0);
 }
 
 /* ---- audio thread ---- */
@@ -432,12 +517,48 @@ static void mix_loop(loop_voice *v, float *acc, int frames) {
   v->cur_vol = target;
 }
 
+/* Original REV is voice 5 / loop wave 9: Mc_Start plays it at zero gain,
+ * Mc_Req changes gain/frequency, Mc_Mute leaves it playing, Mc_Stop stops it.
+ * All n original PCM frames belong to this loop (no WAV smpl subset). Keep this
+ * separate from legacy engine/muffler interpolation and mute semantics. This
+ * is the port's linear interpolator/block gain ramp, not a claim of bit-exact
+ * proprietary OpenAL resampling or cabinet output. */
+static void mix_rev(float *acc, int frames) {
+  loop_voice *v = &LOOPS[L_REV];
+  unsigned control = REV_CONTROL_LOAD();
+  if (control != rev_audio_control) {
+    rev_audio_control = control;
+    v->pos = 0.0;
+    v->cur_vol = 0.0f;
+  }
+  if (!(control & 1u)) { v->cur_vol = 0.0f; return; }
+  const sample *s = LOOP_LOAD(v->s);
+  if (!s || !s->data || s->n < 2 || s->rate <= 0) return;
+  float target = LOOP_LOAD(v->vol);
+  if (!isfinite(target) || target < 0.0f) target = 0.0f;
+  float g = v->cur_vol, dg = (target - g) / (float)frames;
+  /* Do not round a float 22000/22050 ratio then multiply the carrier rate. */
+  const double step = 22000.0 / (double)SND_RATE;
+  double pos = v->pos;
+  for (int i = 0; i < frames; ++i) {
+    if (pos >= s->n) pos = fmod(pos, (double)s->n);
+    int p = (int)pos, next = p + 1 == s->n ? 0 : p + 1;
+    float t = (float)(pos - p);
+    acc[i] += g * (s->data[p] + (s->data[next] - s->data[p]) * t);
+    g += dg;
+    pos += step; /* zero gain still advances the original continuous loop */
+  }
+  v->pos = pos;
+  v->cur_vol = target;
+}
+
 void snd_mix(short *out, int frames) {
   static float acc[4096];
   while (frames > 0) {
     int n = frames > 4096 ? 4096 : frames;
     memset(acc, 0, sizeof(float) * (size_t)n);
-    for (int i = 0; i < N_LOOP; ++i) mix_loop(&LOOPS[i], acc, n);
+    for (int i = 0; i < L_REV; ++i) mix_loop(&LOOPS[i], acc, n);
+    mix_rev(acc, n);
     if (BAR.played_seq != BAR.seq) { BAR.played_seq = BAR.seq; BAR.pos = 0; BAR.cur_vol = BAR.vol; }
     mix_voice(&BAR, acc, n, 1);
     for (int i = 0; i < N_SHOT; ++i) {
@@ -445,6 +566,17 @@ void snd_mix(short *out, int frames) {
       if (v->played_seq != v->seq) { v->played_seq = v->seq; v->pos = 0; v->cur_vol = v->vol; }
       if (v->s) mix_voice(v, acc, n, 0);
     }
+    unsigned long long road = ROAD_LOAD();
+    if (road != road_seen) {
+      road_seen = road;
+      unsigned hz = (unsigned)(road >> 32) & 0xffffu;
+      uint32_t bits = (uint32_t)road;
+      float gain;
+      memcpy(&gain, &bits, sizeof gain);
+      ROAD = (voice){.s = hz ? &SAMPLES[S_GYAP] : NULL, .vol = gain, .cur_vol = gain,
+                     .pitch = hz / 22050.0f};
+    }
+    if (ROAD.s) mix_voice(&ROAD, acc, n, 0);
     for (int i = 0; i < n; ++i) {
       out[2 * i] = out[2 * i + 1] = (short)(32767.0f * tanhf(acc[i] * (1.0f / 32767.0f))); /* soft clip */
     }

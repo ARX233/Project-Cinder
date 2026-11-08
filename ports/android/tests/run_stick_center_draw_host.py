@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory() as d:
 static struct { int bg; } ID;
 static char texts[100][128]; static int ntexts, buttons[LAY_BUTTONS];
 static void draw_back(int a,int b,int c) {(void)a;(void)b;(void)c;}
-static void anm_fill(float a,float b,float c,float d) {(void)a;(void)b;(void)c;(void)d;}
+void anm_fill(float a,float b,float c,float d) {(void)a;(void)b;(void)c;(void)d;}
 void hud_draw_race_layout(float a,float b,int c){(void)a;(void)b;(void)c;}
 void hud_draw_layout_mode(float a,float b,int c,int d){(void)a;(void)b;(void)c;(void)d;}
 void hud_ui_begin(float a,float b){(void)a;(void)b;} void hud_ui_end(void){}
@@ -23,12 +23,13 @@ float hud_ui_text(const char *s,float x,float y,float px,float r,float g,float b
 static int has(const char *s){for(int i=0;i<ntexts;i++)if(!strcmp(texts[i],s))return 1;return 0;}
 static void reset(void){ntexts=0;memset(buttons,0,sizeof buttons);}
 int main(void){menu_state m;memset(&m,0,sizeof m);hud_custom_default(&m.custom_layout);for(int i=0;i<3;i++)m.key_k[i]=100; m.gyro=HUD_STEER_STICK;m.lay_sel=HUD_KEYS_LEFT;
- draw_layout(&m,0,1024,768);assert(has("FLOAT - TAP FOR STATIC") && has("DEADZONE 8 PCT") && buttons[LAY_CENTER] && buttons[LAY_DEAD_MINUS] && buttons[LAY_DEAD_PLUS]);
+ draw_layout(&m,0,1024,768);assert(has("BUTTON OPACITY 100 PCT") && buttons[LAY_OPACITY_MINUS] && buttons[LAY_OPACITY_PLUS]);
+ assert(has("FLOAT - TAP FOR STATIC") && has("DEADZONE 8 PCT") && buttons[LAY_CENTER] && buttons[LAY_DEAD_MINUS] && buttons[LAY_DEAD_PLUS]);
  assert(LAY_BUTTON[LAY_CENTER][1]>=LAY_BUTTON[LAY_DONE][1]+LAY_BUTTON[LAY_DONE][3]);
  reset();m.stick_center_mode=HUD_STICK_FIXED;draw_layout(&m,0,1024,768);assert(has("STATIC - TAP FOR FLOAT") && buttons[LAY_CENTER]);
  reset();m.lay_sel=HUD_KEYS_RIGHT;draw_layout(&m,0,1024,768);assert(!buttons[LAY_CENTER] && !buttons[LAY_DEAD_MINUS] && !buttons[LAY_DEAD_PLUS]);
  reset();m.lay_sel=HUD_KEYS_LEFT;m.gyro=HUD_STEER_WHEEL;draw_layout(&m,0,1024,768);assert(!buttons[LAY_CENTER] && !buttons[LAY_DEAD_MINUS]);
- reset();m.gyro=HUD_STEER_STICK;m.lay_page=1;draw_layout(&m,0,1024,768);assert(!buttons[LAY_CENTER] && !buttons[LAY_DEAD_MINUS]);puts("stick center rendered labels and controls passed");}
+ reset();m.gyro=HUD_STEER_STICK;m.lay_page=1;draw_layout(&m,0,1024,768);assert(!buttons[LAY_CENTER] && !buttons[LAY_DEAD_MINUS] && !buttons[LAY_OPACITY_MINUS]);puts("stick center rendered labels and controls passed");}
 """
  (p/'test.c').write_text(wrapper)
  subprocess.run(['cc','-std=gnu11','-I',str(p),'-I',str(root/'test'),'-I',str(root/'src'),str(p/'test.c'),'-lm','-o',str(p/'test')],check=True)

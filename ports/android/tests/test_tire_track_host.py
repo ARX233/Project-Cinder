@@ -1,6 +1,6 @@
 """Pure CPU contract test; run python3 -B test_tire_track_host.py.
 
-All generated files and tool environment are isolated under the system temporary directory.
+All generated files and tool environment are isolated under /Volumes/CodexWork.
 No device, network, Android build, or build script is involved.
 """
 import os
@@ -59,7 +59,7 @@ int main(void) {
 
 class TireTrackHostTest(unittest.TestCase):
     def test_geometry(self):
-        root = tempfile.mkdtemp(prefix="tire-track-host-")
+        root = tempfile.mkdtemp(prefix="tire-track-host-", dir="/Volumes/CodexWork")
         env = os.environ.copy()
         for key in ("HOME", "TMP", "TMPDIR", "TEMP", "XDG_CACHE_HOME"):
             env[key] = root

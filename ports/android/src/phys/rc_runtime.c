@@ -1,4 +1,5 @@
 #include "rc_runtime.h"
+#include "../ghost_runtime.h"
 #ifdef WMMT_DEBUG_LOG
 #include "../debug_log.h"
 #endif
@@ -85,6 +86,46 @@ uint32_t rc_fopen(uint32_t path) {
 }
 
 static FILE *rc_file(uint32_t f) { return f >= 1 && f <= 4 ? rc_files[f - 1] : NULL; }
+
+static int ghost_span(uint32_t address, size_t length) {
+  return rc_mem && address >= RC_MEM_BASE && length <= RC_MEM_SIZE &&
+         address - RC_MEM_BASE <= RC_MEM_SIZE - length;
+}
+static int ghost_literal(uint32_t address, const char *literal) {
+  size_t length = strlen(literal) + 1u;
+  return ghost_span(address, length) && !memcmp(VA(address), literal, length);
+}
+uint32_t rc_ghost_fopen(uint32_t path, uint32_t mode) {
+  if (ghost_literal(path, GHOST_INPUT_TOKEN)) {
+    if (!ghost_literal(mode, "rb") && !ghost_literal(mode, "r")) return 0;
+    return ghost_runtime_open(0);
+  }
+  if (ghost_literal(path, GHOST_OUTPUT_TOKEN)) {
+    if (!ghost_literal(mode, "wb") && !ghost_literal(mode, "w")) return 0;
+    return ghost_runtime_open(1);
+  }
+  /* Not a Ghost capability: preserve the exact original read-only bridge. */
+  return rc_fopen(path);
+}
+uint32_t rc_ghost_fread(uint32_t buf, uint32_t size, uint32_t n, uint32_t f) {
+  if (!ghost_runtime_is_handle(f)) return rc_fread(buf, size, n, f);
+  if (!size || !n || (uint64_t)size * n > RC_MEM_SIZE ||
+      !ghost_span(buf, (size_t)size * n)) return 0;
+  return (uint32_t)ghost_runtime_read(f, VA(buf), size, n);
+}
+uint32_t rc_ghost_fwrite(uint32_t buf, uint32_t size, uint32_t n, uint32_t f) {
+  /* No ordinary FILE handle can ever be written through this bridge. */
+  if (f != GHOST_OUTPUT_HANDLE || !size || !n || (uint64_t)size * n > RC_MEM_SIZE ||
+      !ghost_span(buf, (size_t)size * n)) return 0;
+  return (uint32_t)ghost_runtime_write(f, VA(buf), size, n);
+}
+void rc_ghost_fclose(uint32_t f) {
+  if (ghost_runtime_is_handle(f)) ghost_runtime_close(f); else rc_fclose(f);
+}
+uint32_t rc_ghost_feof(uint32_t f) {
+  return ghost_runtime_is_handle(f) ? (uint32_t)ghost_runtime_eof(f) : rc_feof(f);
+}
+int rc_ghost_recording_enabled(void) { return ghost_runtime_recording(); }
 
 uint32_t rc_fread(uint32_t buf, uint32_t size, uint32_t n, uint32_t f) {
   FILE *fp = rc_file(f);
@@ -284,8 +325,21 @@ int rc_load_image(const char *path) {
   uint32_t n = RC_IMG_END - RC_IMG_BASE;
   FILE *f = fopen(path, "rb");
   if (!f) return -1;
-  if (!rc_mem) rc_mem = calloc(1, RC_MEM_SIZE);
-  size_t got = fread(rc_mem + (RC_IMG_BASE - RC_MEM_BASE), 1, n, f);
+  /* Stage the 6,588,744-byte image before touching the published memory. */
+  uint8_t *image = malloc(n);
+  if (!image) { fclose(f); return -1; }
+  size_t got = fread(image, 1, n, f);
+  int failed = got != n || ferror(f);
   fclose(f);
-  return got == n ? 0 : -1;
+  if (failed) { free(image); return -1; }
+  if (!rc_mem) {
+    uint8_t *mem = calloc(1, RC_MEM_SIZE);
+    if (!mem) { free(image); return -1; }
+    memcpy(mem + (RC_IMG_BASE - RC_MEM_BASE), image, n);
+    rc_mem = mem;
+  } else {
+    memcpy(rc_mem + (RC_IMG_BASE - RC_MEM_BASE), image, n);
+  }
+  free(image);
+  return 0;
 }

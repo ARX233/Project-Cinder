@@ -1,0 +1,4 @@
+OC_MEDIA_1 {
+  global: oc_media_convert_fd; oc_media_build_info;
+  local: *;
+};

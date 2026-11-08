@@ -10,6 +10,7 @@
 
 #include "gl.h"
 #include "time_texture.h"
+#include "ui_vs_mode.inc"
 
 typedef struct {
   uint16_t sprite, blend; /* 0 alpha, 1 added, 2 subtracted (clDrawBuffer::draw's modes 1, 3) */
@@ -32,8 +33,8 @@ static struct {
   uint32_t *zsize;   /* their zlib-packed size, 0 = raw */
   uint32_t *used;    /* clock of the last draw */
   uint32_t clock;
-  FILE *file, *extra_file, *card_file; /* base menu and optional independently installed sprites */
-  uint32_t base_sprites, story_end;
+  FILE *file, *extra_file, *card_file, *ghost_file; /* independently verified optional resources */
+  uint32_t base_sprites, story_end, ghost_begin;
   float (*size)[2];
   int *ids; /* the arcade's sprite id of each packed sprite */
   uint16_t (*cols)[2]; /* on a wide screen: its first and past-last columns with any opacity, once up */
@@ -43,15 +44,22 @@ static struct {
   GLint u_mul, u_add, u_tex, u_view;
   float edge; /* anm_view */
   uint32_t wide_clock; /* the clock when a frame last drew out to the screen's sides */
+  GLuint builtin_tex[1];
+  uint32_t builtin_used[1];
 } A;
 
 static const float SCALE = 1024.0f / 640.0f;
 
+#ifdef WMMT_NATIVE_VK
+#include "ui_native_vk_resources.inc"
+#include "anm_native_vk.inc"
+#else
 /* the program, with the 1024-wide layout in the middle of a screen anm_view widens */
 static void use_prog(void) {
   glUseProgram(A.prog);
   glUniform2f(A.u_view, 1.0f / (512.0f + A.edge), A.edge / (512.0f + A.edge) - 1.0f);
 }
+#endif
 
 void anm_view(float edge) { A.edge = edge; }
 float anm_edge(void) { return A.edge; }
@@ -65,28 +73,13 @@ static void load_extra(const char *data_dir) {
   char path[1024];
   FILE *f = NULL;
 #if defined(__ANDROID__)
-  /* Both installer layouts are inside getExternalFilesDir(null). */
-  char root[1024];
-  if (snprintf(root, sizeof root, "%s", data_dir) >= (int)sizeof root) return;
-  char *last = strrchr(root, '/');
-  int known_root = 0;
-  if (last && !strcmp(last + 1, "wmmt")) { *last = 0; known_root = 1; }
-  else if (last) {
-    *last = 0;
-    last = strrchr(root, '/');
-    if (last && !strcmp(last + 1, "re3dxplus-data")) { *last = 0; known_root = 1; }
-  }
-  if (known_root) {
-    if (snprintf(path, sizeof path, "%s/wmmt-sidecars/story-cutin.bin", root) >= (int)sizeof path) return;
-    f = fopen(path, "rb");
-    /* An inaccessible independent pack is not equivalent to a missing one. */
-    if (!f && errno != ENOENT) return;
-  }
+  extern int android_optional_resource_path(const char *, char *, size_t);
+  if (!android_optional_resource_path("story-cutin.bin", path, sizeof path)) return;
+  f = fopen(path, "rb");
+#else
+  if (snprintf(path, sizeof path, "%s/story-cutin.bin", data_dir) >= (int)sizeof path) return;
+  f = fopen(path, "rb");
 #endif
-  if (!f) {
-    if (snprintf(path, sizeof path, "%s/story-cutin.bin", data_dir) >= (int)sizeof path) return;
-    f = fopen(path, "rb");
-  }
   if (!f) return;
   uint32_t n, nanims; char magic[4];
   int *ids = NULL; float (*size)[2] = NULL; long *offset = NULL; uint32_t *zs = NULL;
@@ -152,19 +145,13 @@ static void load_extra(const char *data_dir) {
 static void load_card_pages(const char *data_dir) {
   char path[1024]; FILE *f = NULL;
 #if defined(__ANDROID__)
-  char root[1024];
-  if (snprintf(root, sizeof root, "%s", data_dir) >= (int)sizeof root) return;
-  char *last = strrchr(root, '/'); int known = 0;
-  if (last && !strcmp(last + 1, "wmmt")) { *last = 0; known = 1; }
-  else if (last) { *last = 0; last = strrchr(root, '/');
-    if (last && !strcmp(last + 1, "re3dxplus-data")) { *last = 0; known = 1; } }
-  if (known) {
-    if (snprintf(path, sizeof path, "%s/wmmt-sidecars/card-pages.bin", root) >= (int)sizeof path) return;
-    f = fopen(path, "rb"); if (!f && errno != ENOENT) return;
-  }
+  extern int android_optional_resource_path(const char *, char *, size_t);
+  if (!android_optional_resource_path("card-pages.bin", path, sizeof path)) return;
+  f = fopen(path, "rb");
+#else
+  if (snprintf(path, sizeof path, "%s/card-pages.bin", data_dir) >= (int)sizeof path) return;
+  f = fopen(path, "rb");
 #endif
-  if (!f) { if (snprintf(path, sizeof path, "%s/card-pages.bin", data_dir) >= (int)sizeof path) return;
-    f = fopen(path, "rb"); }
   if (!f) return;
   char magic[4]; uint32_t version, n = 0, na = 0, total; long length;
   int *ids = NULL; float (*sizes)[2] = NULL; long *offs = NULL; uint32_t *zs = NULL;
@@ -240,6 +227,8 @@ bad_card:
   free(anims); free(ids); free(sizes); free(offs); free(zs); free(tex); free(alloff); free(allzs); free(used); free(allsize); free(allids); free(cols); free(allanims); fclose(f);
 }
 
+#include "ghost_ui_loader.inc"
+
 int anm_load(const char *data_dir) {
   static const char *vs =
     "attribute vec2 aPos; attribute vec2 aUV; varying vec2 vUV;\n"
@@ -249,12 +238,18 @@ int anm_load(const char *data_dir) {
     "precision mediump float; uniform sampler2D uTex; uniform vec4 uMul, uAdd; varying vec2 vUV;\n"
     "void main() { gl_FragColor = clamp(texture2D(uTex, vUV) * uMul + uAdd, 0.0, 1.0); }\n";
   const char *attribs[] = { "aPos", "aUV" };
+#ifdef WMMT_NATIVE_VK
+  A.prog = cinder_vk_program_create(vs, fs, attribs, 2);
+#else
   A.prog = gl_compile_program(vs, fs, attribs, 2);
+#endif
   if (!A.prog) return -1;
+#ifndef WMMT_NATIVE_VK
   A.u_mul = glGetUniformLocation(A.prog, "uMul");
   A.u_add = glGetUniformLocation(A.prog, "uAdd");
   A.u_tex = glGetUniformLocation(A.prog, "uTex");
   A.u_view = glGetUniformLocation(A.prog, "uView");
+#endif
 
   char path[1024];
   snprintf(path, sizeof path, "%s/menu.bin", data_dir);
@@ -297,6 +292,7 @@ int anm_load(const char *data_dir) {
   load_extra(data_dir);
   A.story_end = A.nsprites;
   load_card_pages(data_dir);
+  load_ghost_ui(data_dir);
   return 0;
 fail:
   fprintf(stderr, "menu.bin is damaged\n");
@@ -305,19 +301,69 @@ fail:
   return -1;
 }
 
-/* the sprite's texture, uploaded from menu.bin on first use (0 if it cannot be read) */
+static int read_sprite_pixels(int i, unsigned char *px, size_t n) {
+  unsigned char *z = A.zsize[i] ? malloc(A.zsize[i]) : NULL;
+  uLongf got = (uLongf)n;
+  FILE *f = (uint32_t)i < A.base_sprites ? A.file :
+            (A.ghost_file && (uint32_t)i >= A.ghost_begin ? A.ghost_file :
+             (!A.card_file || (uint32_t)i < A.story_end ? A.extra_file : A.card_file));
+  int ok = f && fseek(f, A.offset[i], SEEK_SET) == 0 &&
+           (A.zsize[i] ? z && read_all(f, z, A.zsize[i]) && uncompress(px, &got, z, A.zsize[i]) == Z_OK && got == n
+                       : read_all(f, px, n));
+  free(z);
+  return ok;
+}
+
+/* Restore the classic VS overlays with old and new imported packs. The arcade's
+ * disc, ring, preview and caption band still come from the installed resources. */
+static int vs_select_pixels(int i, unsigned char *px) {
+  int id = A.ids[i];
+  if (id >= 107011 && id <= 107012 && A.size[i][0] == 256 && A.size[i][1] == 256) {
+    const unsigned pixels = 256 * 256;
+    const vs_art *art = &VS_SELECT_ICONS[id - 107011];
+    uLongf got = pixels * 2;
+    if (uncompress(px, &got, art->data, art->size) != Z_OK || got != pixels * 2) return 0;
+    /* Expand grey/alpha in place, starting at the end to preserve unread bytes. */
+    for (unsigned p = pixels; p-- > 0;) {
+      unsigned char grey = px[p * 2], alpha = px[p * 2 + 1];
+      px[p * 4] = px[p * 4 + 1] = px[p * 4 + 2] = grey;
+      px[p * 4 + 3] = alpha;
+    }
+    return 1;
+  }
+  enum { BAND_W = 512, BAND_H = 64 };
+  if (id < 107021 || id > 107022 || A.size[i][0] != BAND_W || A.size[i][1] != BAND_H) return 0;
+  int band = anm_sprite(2317); /* menu_p_mode_txt_tg */
+  if (band < 0 || A.size[band][0] != BAND_W || A.size[band][1] != BAND_H ||
+      !read_sprite_pixels(band, px, BAND_W * BAND_H * 4)) return 0;
+
+  /* As in tools/vsdiscs.py, combine the band alpha above and left of its
+   * original lettering, then composite a white port-authored caption. */
+  unsigned char rows[BAND_H], cols[BAND_W];
+  for (int y = 0; y < BAND_H; ++y) rows[y] = px[(y * BAND_W + 100) * 4 + 3];
+  for (int x = 0; x < BAND_W; ++x) cols[x] = px[(2 * BAND_W + x) * 4 + 3];
+  const vs_art *art = &VS_SELECT_CAPTIONS[id - 107021];
+  uLongf got = BAND_W * BAND_H;
+  if (uncompress(px, &got, art->data, art->size) != Z_OK || got != BAND_W * BAND_H) return 0;
+  for (int p = BAND_W * BAND_H; p-- > 0;) {
+    int band_alpha = rows[p / BAND_W] * cols[p % BAND_W];
+    band_alpha = (band_alpha + 32) / 64;
+    if (band_alpha > 255) band_alpha = 255;
+    int text = px[p], alpha = text * 255 + band_alpha * (255 - text);
+    unsigned char grey = alpha ? (text * 255 * 255 + alpha / 2) / alpha : 0;
+    px[p * 4] = px[p * 4 + 1] = px[p * 4 + 2] = grey;
+    px[p * 4 + 3] = (alpha + 127) / 255;
+  }
+  return 1;
+}
+
+/* Upload the sprite's texture on first use (0 if its pixels cannot be read). */
 static GLuint texture(int i) {
   A.used[i] = A.clock;
   if (A.tex[i]) return A.tex[i];
   size_t n = (size_t)A.size[i][0] * (size_t)A.size[i][1] * 4;
-  unsigned char *px = malloc(n), *z = A.zsize[i] ? malloc(A.zsize[i]) : NULL;
-  uLongf got = (uLongf)n;
-  FILE *f = (uint32_t)i < A.base_sprites ? A.file : (!A.card_file || (uint32_t)i < A.story_end ? A.extra_file : A.card_file);
-  int ok = px && f && fseek(f, A.offset[i], SEEK_SET) == 0 &&
-           (A.zsize[i] ? z && read_all(f, z, A.zsize[i]) && uncompress(px, &got, z, A.zsize[i]) == Z_OK && got == n
-                       : read_all(f, px, n));
-  free(z);
-  if (!ok) {
+  unsigned char *px = malloc(n);
+  if (!px || (!vs_select_pixels(i, px) && !read_sprite_pixels(i, px, n))) {
     free(px);
     return 0;
   }
@@ -334,6 +380,9 @@ static GLuint texture(int i) {
         }
     A.cols[i][0] = (uint16_t)(c0 < c1 ? c0 : 0), A.cols[i][1] = (uint16_t)(c0 < c1 ? c1 : w);
   }
+#ifdef WMMT_NATIVE_VK
+  A.tex[i] = ui_native_texture_rgba8((unsigned)A.size[i][0], (unsigned)A.size[i][1], px);
+#else
   glGenTextures(1, &A.tex[i]);
   glBindTexture(GL_TEXTURE_2D, A.tex[i]);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -342,13 +391,17 @@ static GLuint texture(int i) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)A.size[i][0], (GLsizei)A.size[i][1], 0, GL_RGBA,
                GL_UNSIGNED_BYTE, px);
+#endif
   free(px);
   return A.tex[i];
 }
 
 unsigned int anm_sprite_texture(int sprite) {
   if (sprite < 0 || (uint32_t)sprite >= A.nsprites || !A.tex || !A.used ||
-      !A.size || !A.offset || !A.zsize || !A.ids || !A.cols || !glGetString(GL_VERSION)) return 0;
+      !A.size || !A.offset || !A.zsize || !A.ids || !A.cols) return 0;
+#ifndef WMMT_NATIVE_VK
+  if (!glGetString(GL_VERSION)) return 0;
+#endif
   return texture(sprite);
 }
 
@@ -357,9 +410,21 @@ void anm_trim(void) {
   if (A.clock % 60) return;
   for (uint32_t i = 0; i < A.nsprites; ++i)
     if (A.tex[i] && A.clock - A.used[i] > 180) {
+#ifdef WMMT_NATIVE_VK
+      cinder_vk_texture_destroy(A.tex[i]);
+#else
       glDeleteTextures(1, &A.tex[i]);
+#endif
       A.tex[i] = 0;
     }
+  if (A.builtin_tex[0] && A.clock - A.builtin_used[0] > 180) {
+#ifdef WMMT_NATIVE_VK
+    cinder_vk_texture_destroy(A.builtin_tex[0]);
+#else
+    glDeleteTextures(1, &A.builtin_tex[0]);
+#endif
+    A.builtin_tex[0] = 0;
+  }
 }
 
 /* the patched iOS SDK has no plain strcmp for armv7 */
@@ -382,6 +447,11 @@ int anm_warm_sprite(int sprite, int upload) {
     return 0;
   }
   if (!upload) return 0;
+#ifdef WMMT_NATIVE_VK
+  static const float v[16] = { 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1 };
+  const float mul[4] = { 1, 1, 1, 0 }, add[4] = { 0, 0, 0, 0 };
+  anm_native_quad(v, texture(sprite), mul, add, 0, VK_TRUE);
+#else
   use_prog();
   glUniform1i(A.u_tex, 0);
   glActiveTexture(GL_TEXTURE0);
@@ -400,6 +470,7 @@ int anm_warm_sprite(int sprite, int upload) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, v);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
   return 1;
 }
 
@@ -540,12 +611,13 @@ void anm_draw_xf(int anim, int frame, float alpha, float dx, float dy, float zoo
   anm_draw_xy(anim, frame, alpha, dx, dy, zoom, zoom, swap, nswap);
 }
 
-void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx, float sy, const anm_swap *swap,
-                 int nswap) {
+static void draw_xy_layout(int anim, int frame, float alpha, float dx, float dy, float sx, float sy,
+                           const anm_swap *swap, int nswap, const anm_layout_move *moves, int nmoves) {
   if (anim < 0 || (uint32_t)anim >= A.nanims) return;
   const anm_anim *an = &A.anims[anim];
   if (frame < 0) frame = 0;
   if ((uint32_t)frame >= an->nframes) frame = (int)an->nframes - 1;
+#ifndef WMMT_NATIVE_VK
   use_prog();
   glUniform1i(A.u_tex, 0);
   glActiveTexture(GL_TEXTURE0);
@@ -558,10 +630,21 @@ void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx,
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
+  int blend = 0;
+#endif
   const anm_rec *r = an->recs + an->frames[frame][0];
-  int blend = 0, plain = dx == 0.0f && dy == 0.0f && sx == 1.0f && sy == 1.0f;
+  int plain = dx == 0.0f && dy == 0.0f && sx == 1.0f && sy == 1.0f;
   for (uint32_t k = 0; k < an->frames[frame][1]; ++k, ++r) {
     int sprite = r->sprite;
+    float mx = 0.0f, my = 0.0f;
+    if (moves) for (int i = 0; i < nmoves; ++i) {
+      if (same_sprite(moves[i].sprite, r->sprite)) {
+        if (isfinite(moves[i].dx) && isfinite(moves[i].dy)) {
+          mx = moves[i].dx; my = moves[i].dy;
+        }
+        break; /* a group belongs to the authored template, not its replacement */
+      }
+    }
     for (int i = 0; i < nswap; ++i)
       if (same_sprite(swap[i].from, sprite)) {
         sprite = swap[i].to; /* once: a template may be another's digit (TOTAL TIME's) */
@@ -573,7 +656,14 @@ void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx,
     float w = A.size[sprite][0];
     GLuint tx = texture(sprite); /* (first: its columns for wide_pieces) */
     wide_piece pc[WIDE_PIECES];
-    int npc = wide_pieces(r, sprite, plain, pc);
+    int npc;
+    if (mx != 0.0f || my != 0.0f) {
+      /* Explicit composition placement supersedes automatic edge extrusion for
+       * this record only. In particular, do not widen a moved song panel twice. */
+      pc[0] = (wide_piece){ 0, w, 0, w, 1 };
+      npc = 1;
+    } else npc = wide_pieces(r, sprite, plain, pc);
+#ifndef WMMT_NATIVE_VK
     if (r->blend != blend) {
       /* the arcade's ONE, ONE: its fades scale the colour; here the alpha does */
       blend = r->blend;
@@ -583,12 +673,15 @@ void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx,
     glUniform4f(A.u_mul, r->mul[0] / 256.0f, r->mul[1] / 256.0f, r->mul[2] / 256.0f, a);
     glUniform4f(A.u_add, r->add[0] / 255.0f, r->add[1] / 255.0f, r->add[2] / 255.0f, r->add[3] / 255.0f * alpha);
     glBindTexture(GL_TEXTURE_2D, tx);
+#endif
     for (int p = 0; p < npc; ++p) {
+#ifndef WMMT_NATIVE_VK
       if (p && pc[p].f != pc[p - 1].f) {
         glUniform4f(A.u_mul, r->mul[0] / 256.0f, r->mul[1] / 256.0f, r->mul[2] / 256.0f, a * pc[p].f);
         glUniform4f(A.u_add, r->add[0] / 255.0f, r->add[1] / 255.0f, r->add[2] / 255.0f,
                     r->add[3] / 255.0f * alpha * pc[p].f);
       }
+#endif
       float h = A.size[sprite][1], v[16];
       static const float corner[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
       for (int i = 0; i < 4; ++i) {
@@ -596,18 +689,39 @@ void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx,
         float q = pc[p].d0 + corner[i][0] * (pc[p].d1 - pc[p].d0);
         v[i * 4 + 0] = (dx + sx * (r->x + r->a * q + r->c * t)) * SCALE;
         v[i * 4 + 1] = (dy + sy * (r->y + r->b * q + r->d * t)) * SCALE;
+        if (mx != 0.0f) v[i * 4 + 0] += mx * SCALE;
+        if (my != 0.0f) v[i * 4 + 1] += my * SCALE;
         v[i * 4 + 2] = u / w;
         v[i * 4 + 3] = corner[i][1];
       }
+#ifdef WMMT_NATIVE_VK
+      const float mul[4] = { r->mul[0] / 256.0f, r->mul[1] / 256.0f, r->mul[2] / 256.0f, a * pc[p].f };
+      const float add[4] = { r->add[0] / 255.0f, r->add[1] / 255.0f, r->add[2] / 255.0f,
+                             r->add[3] / 255.0f * alpha * pc[p].f };
+      anm_native_quad(v, tx, mul, add, r->blend, VK_FALSE);
+#else
       glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, v);
       glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
       glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
     }
   }
+#ifndef WMMT_NATIVE_VK
   if (blend) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glBlendEquation(GL_FUNC_ADD);
   }
+#endif
+}
+
+void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx, float sy, const anm_swap *swap,
+                 int nswap) {
+  draw_xy_layout(anim, frame, alpha, dx, dy, sx, sy, swap, nswap, NULL, 0);
+}
+
+void anm_draw_layout(int anim, int frame, float alpha, float dx, float dy,
+                     const anm_swap *swap, int nswap, const anm_layout_move *moves, int nmoves) {
+  draw_xy_layout(anim, frame, alpha, dx, dy, 1.0f, 1.0f, swap, nswap, moves, nmoves);
 }
 
 int anm_sprite_rect(int anim, int frame, int sprite, float r[4]) {
@@ -674,6 +788,7 @@ float anm_sprite_height(int sprite) {
 
 void anm_draw_sprite(int sprite, float x, float y, float alpha) {
   if (sprite < 0 || (uint32_t)sprite >= A.nsprites || alpha <= 0.0f) return;
+#ifndef WMMT_NATIVE_VK
   use_prog();
   glUniform1i(A.u_tex, 0);
   glActiveTexture(GL_TEXTURE0);
@@ -685,15 +800,89 @@ void anm_draw_sprite(int sprite, float x, float y, float alpha) {
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
+#endif
   float x1 = x + A.size[sprite][0], y1 = y + A.size[sprite][1];
   const float v[16] = { x * SCALE, y * SCALE, 0, 0, x1 * SCALE, y * SCALE, 1, 0,
                         x * SCALE, y1 * SCALE, 0, 1, x1 * SCALE, y1 * SCALE, 1, 1 };
+#ifdef WMMT_NATIVE_VK
+  const float mul[4] = { 1, 1, 1, alpha }, add[4] = { 0, 0, 0, 0 };
+  anm_native_quad(v, texture(sprite), mul, add, 0, VK_FALSE);
+#else
   glUniform4f(A.u_mul, 1, 1, 1, alpha);
   glUniform4f(A.u_add, 0, 0, 0, 0);
   glBindTexture(GL_TEXTURE_2D, texture(sprite));
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, v);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
+}
+
+/* Only a compiled program asset can reach this upload path. Imported game
+ * bytes continue to go through the existing bounded menu/sidecar readers. */
+static GLuint builtin_texture(int image) {
+  if (image != ANM_BUILTIN_VS_MODE || !A.prog) return 0;
+  A.builtin_used[0] = A.clock;
+  if (A.builtin_tex[0]) return A.builtin_tex[0];
+#ifndef WMMT_NATIVE_VK
+  if (!glGetString(GL_VERSION)) return 0;
+#endif
+  const size_t bytes = 256u * 256u * 4u;
+  unsigned char *px = malloc(bytes);
+  uLongf got = (uLongf)bytes;
+  if (!px) return 0;
+  if (uncompress(px, &got, ANM_VS_MODE_Z, sizeof ANM_VS_MODE_Z) != Z_OK || got != bytes) {
+    free(px);
+    return 0;
+  }
+#ifdef WMMT_NATIVE_VK
+  A.builtin_tex[0] = ui_native_texture_rgba8(256, 256, px);
+#else
+  glGenTextures(1, &A.builtin_tex[0]);
+  glBindTexture(GL_TEXTURE_2D, A.builtin_tex[0]);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+#endif
+  free(px);
+  return A.builtin_tex[0];
+}
+
+void anm_draw_builtin(int image, float x, float y, float w, float h, float alpha) {
+  if (image != ANM_BUILTIN_VS_MODE || !isfinite(x) || !isfinite(y) ||
+      !isfinite(w) || !isfinite(h) || !isfinite(alpha) || w <= 0.0f || h <= 0.0f || alpha <= 0.0f ||
+      !isfinite(x + w) || !isfinite(y + h) || !isfinite(x*SCALE) || !isfinite(y*SCALE) ||
+      !isfinite((x+w)*SCALE) || !isfinite((y+h)*SCALE)) return;
+  GLuint tex = builtin_texture(image);
+  if (!tex) return;
+  if (alpha > 1.0f) alpha = 1.0f;
+  static const float add[4] = {0, 0, 0, 0};
+  const float mul[4] = {1, 1, 1, alpha};
+  const float v[16] = {x*SCALE, y*SCALE, 0, 0, (x+w)*SCALE, y*SCALE, 1, 0,
+                       x*SCALE, (y+h)*SCALE, 0, 1, (x+w)*SCALE, (y+h)*SCALE, 1, 1};
+#ifdef WMMT_NATIVE_VK
+  anm_native_quad(v, tex, mul, add, 0, VK_FALSE);
+#else
+  use_prog();
+  glUniform1i(A.u_tex, 0);
+  glActiveTexture(GL_TEXTURE0);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_CULL_FACE);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glEnableVertexAttribArray(0);
+  glEnableVertexAttribArray(1);
+  glDisableVertexAttribArray(2);
+  glUniform4f(A.u_mul, mul[0], mul[1], mul[2], mul[3]);
+  glUniform4f(A.u_add, add[0], add[1], add[2], add[3]);
+  glBlendEquation(GL_FUNC_ADD);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, v);
+  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
 }
 
 void anm_draw_part(int sprite, const float src[4], const float dst[4], float alpha) {
@@ -704,6 +893,7 @@ void anm_draw_part(int sprite, const float src[4], const float dst[4], float alp
 
 void anm_draw_part_col(int sprite, const float src[4], const float dst[4], const float mul[4], const float add[4]) {
   if (sprite < 0 || (uint32_t)sprite >= A.nsprites || (mul[3] <= 0.0f && add[3] <= 0.0f)) return;
+#ifndef WMMT_NATIVE_VK
   use_prog();
   glUniform1i(A.u_tex, 0);
   glActiveTexture(GL_TEXTURE0);
@@ -715,22 +905,28 @@ void anm_draw_part_col(int sprite, const float src[4], const float dst[4], const
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
+#endif
   float u0 = src[0] / A.size[sprite][0], v0 = src[1] / A.size[sprite][1];
   float u1 = src[2] / A.size[sprite][0], v1 = src[3] / A.size[sprite][1];
   float x0 = dst[0] * SCALE, y0 = dst[1] * SCALE, x1 = dst[2] * SCALE, y1 = dst[3] * SCALE;
   const float v[16] = { x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1, x1, y1, u1, v1 };
+#ifdef WMMT_NATIVE_VK
+  anm_native_quad(v, texture(sprite), mul, add, 0, VK_FALSE);
+#else
   glUniform4f(A.u_mul, mul[0], mul[1], mul[2], mul[3]);
   glUniform4f(A.u_add, add[0], add[1], add[2], add[3]);
   glBindTexture(GL_TEXTURE_2D, texture(sprite));
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, v);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
 }
 
 void anm_fill(float r, float g, float b, float a) {
   static int white = -2;
   if (white == -2) white = anm_sprite(841); /* atract_p_white */
   if (white < 0 || a <= 0.0f) return;
+#ifndef WMMT_NATIVE_VK
   use_prog();
   glUniform1i(A.u_tex, 0);
   glActiveTexture(GL_TEXTURE0);
@@ -742,13 +938,19 @@ void anm_fill(float r, float g, float b, float a) {
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
+#endif
   /* sample the middle of the white sprite so its edges don't show */
   const float x0 = -A.edge, x1 = 1024.0f + A.edge;
   const float v[16] = { x0, 0, 0.5f, 0.5f, x1, 0, 0.5f, 0.5f, x0, 768, 0.5f, 0.5f, x1, 768, 0.5f, 0.5f };
+#ifdef WMMT_NATIVE_VK
+  const float mul[4] = { r, g, b, a }, add[4] = { 0, 0, 0, 0 };
+  anm_native_quad(v, texture(white), mul, add, 0, VK_FALSE);
+#else
   glUniform4f(A.u_mul, r, g, b, a);
   glUniform4f(A.u_add, 0, 0, 0, 0);
   glBindTexture(GL_TEXTURE_2D, texture(white));
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, v);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#endif
 }

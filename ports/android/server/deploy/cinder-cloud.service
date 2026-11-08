@@ -1,0 +1,29 @@
+[Unit]
+Description=Project Cinder Ghost and Time Attack sync
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+[Service]
+User=cinder-cloud
+Group=cinder-cloud
+WorkingDirectory=/opt/cinder-cloud
+StateDirectory=cinder-cloud
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 -B -m server.cloud_service --state-dir /var/lib/cinder-cloud --credentials /etc/cinder-cloud/accounts.json --port 8791 --ghost-retention-days 90 --ghost-max-records 1000 --ghost-max-per-account 128
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+MemoryMax=192M
+TasksMax=32
+LimitNOFILE=512
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

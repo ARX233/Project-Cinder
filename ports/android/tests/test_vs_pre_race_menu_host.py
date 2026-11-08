@@ -4,7 +4,7 @@ import os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 root = Path(__file__).resolve().parents[3]
 android = root / "ports/android"
-generated = Path(os.environ["HUD_GENERATED"]) if os.environ.get("HUD_GENERATED") else android / "src"
+generated = Path(os.environ.get("WMMT_GENERATED_ROOT", root.parent / "control-layout-v12")) / "android/project/src"
 if sys.platform != "darwin" or not shutil.which("clang") or not (generated / "cardb.h").is_file():
     print("SKIP: macOS clang or generated headers unavailable")
     sys.exit(0)

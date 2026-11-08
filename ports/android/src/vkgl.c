@@ -15,7 +15,9 @@
 #include <GLES2/gl2ext.h>
 
 #include "vkgl.h"
+#include "native_vk.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -48,6 +50,9 @@
 #define GL_DEPTH_ 0x1801
 #define GL_STENCIL_ 0x1802
 
+/* Native platform profile does not initialize compatibility contexts. */
+static int platform_native_profile, platform_created, platform_create_attempted, native_frame_claimed;
+
 static void logf_(const char *fmt, ...) {
   va_list a;
   va_start(a, fmt);
@@ -62,6 +67,12 @@ static void logf_(const char *fmt, ...) {
     VkResult r_ = (x);                                                     \
     if (r_ != VK_SUCCESS) logf_("%s failed: %d (line %d)", #x, r_, __LINE__); \
   } while (0)
+
+/* Native main/device errors cannot be mistaken for completed GPU ownership.
+ * Loader submission/wait uses its separate lease-preserving nonfatal policy. */
+#define PLATFORM_CHECK(x) do { VkResult result_ = (x); if (result_ != VK_SUCCESS) { \
+  logf_("%s failed: %d (line %d)", #x, result_, __LINE__); \
+  if (platform_native_profile) abort(); } } while (0)
 
 static void *xcalloc(size_t n, size_t s) {
   void *p = calloc(n ? n : 1, s);
@@ -112,11 +123,21 @@ static struct {
   VkFormat vfmt_short3;
   uint32_t lazy_type; /* a lazily allocated memory type, or ~0 */
   char renderer[300], extensions[400];
-  uint64_t serial;         /* the frame being recorded */
+  _Atomic uint64_t serial; /* main writer; loader retirement/creation also reads it */
   volatile uint64_t done;  /* the last frame the GPU has finished */
   uint32_t uid;            /* for images and programs */
 } D = { .lazy_type = ~0u };
 
+/* Images and programs share this sequence. Every writer must be atomic and
+ * nonwrapping: a loader image must not roll back a concurrently published
+ * program UID and accidentally reuse a cached pipeline's program identity. */
+static uint32_t resource_uid_next(void) {
+  uint32_t uid = __atomic_load_n(&D.uid, __ATOMIC_RELAXED);
+  do {
+    if (uid == UINT32_MAX) return 0;
+  } while (!__atomic_compare_exchange_n(&D.uid, &uid, uid + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+  return uid + 1;
+}
 static uint64_t done_serial(void) { return __atomic_load_n(&D.done, __ATOMIC_ACQUIRE); }
 
 /* ---- memory: blocks of a type, each its free ranges; buffers and images in blocks of their
@@ -273,26 +294,42 @@ typedef struct {
   uint64_t serial; /* the last frame that used it */
 } vbufmem;
 
-static vbufmem *bufmem_new(VkDeviceSize size, VkBufferUsageFlags usage) {
-  vbufmem *b = xcalloc(1, sizeof *b);
+/* Recoverable allocation for explicit native ownership. Never publish a partial
+ * VkBuffer/backing, including bind/map failures after memory allocation. */
+static vbufmem *bufmem_try_new(VkDeviceSize size, VkBufferUsageFlags usage) {
+  if (!D.dev) return NULL;
+  vbufmem *b = calloc(1, sizeof *b);
+  if (!b) return NULL;
   b->mem.block = -1;
   b->size = size ? size : 4;
   VkBufferCreateInfo ci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
   ci.size = b->size;
   ci.usage = usage;
-  VKCHECK(vkCreateBuffer(D.dev, &ci, NULL, &b->buf));
+  if (vkCreateBuffer(D.dev, &ci, NULL, &b->buf) != VK_SUCCESS) { free(b); return NULL; }
   VkMemoryRequirements r;
   vkGetBufferMemoryRequirements(D.dev, b->buf, &r);
   pthread_mutex_lock(&D.lock);
   int ok = mem_alloc(r, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &b->mem);
   pthread_mutex_unlock(&D.lock);
-  if (ok != 0) {
-    logf_("no memory for a buffer of %llu", (unsigned long long)size);
-    abort();
-  }
-  VKCHECK(vkBindBufferMemory(D.dev, b->buf, blocks[b->mem.block].mem, b->mem.off));
+  if (ok != 0) goto fail;
+  if (vkBindBufferMemory(D.dev, b->buf, blocks[b->mem.block].mem, b->mem.off) != VK_SUCCESS) goto fail;
   b->map = mem_map(&b->mem);
+  if (!b->map) goto fail;
+  return b;
+fail:
+  vkDestroyBuffer(D.dev, b->buf, NULL);
+  if (b->mem.block >= 0) {
+    pthread_mutex_lock(&D.lock);
+    mem_free(&b->mem);
+    pthread_mutex_unlock(&D.lock);
+  }
+  free(b);
+  return NULL;
+}
+static vbufmem *bufmem_new(VkDeviceSize size, VkBufferUsageFlags usage) {
+  vbufmem *b = bufmem_try_new(size, usage);
+  if (!b) { logf_("no memory for a buffer of %llu", (unsigned long long)size); abort(); }
   return b;
 }
 
@@ -311,6 +348,7 @@ typedef struct vimg {
   VkImageView att;  /* attachment: level 0 */
   VkFormat fmt;
   VkImageAspectFlags aspect;
+  VkImageUsageFlags usage; /* actual create usage, including optional swapchain flags */
   VkComponentMapping swz;
   int w, h, levels, layers, samples;
   int view_levels;     /* the levels the sampled view has */
@@ -324,6 +362,8 @@ typedef struct vimg {
                  * swapchain image) */
   uint64_t serial;
   uint32_t uid;
+  int native_upload_pending, native_retire_pending; /* D.lock: deferred ownership */
+  uint32_t native_target_refs; /* D.lock: strong immutable target snapshots */
 } vimg;
 
 static int is_depth(VkFormat f) {
@@ -350,10 +390,30 @@ static VkResult view_try(const vimg *im, int sampled, int levels, VkImageView *v
   vi.subresourceRange.levelCount = (uint32_t)levels;
   vi.subresourceRange.layerCount = sampled ? (uint32_t)im->layers : 1;
   *v = VK_NULL_HANDLE;
+  if (platform_native_profile) {
+    /* Runtime-error output is undefined, not an owned view to roll back.
+     * Publish only success; every try caller still checks result + non-NULL. */
+    VkImageView view = VK_NULL_HANDLE;
+    VkResult result = vkCreateImageView(D.dev, &vi, NULL, &view);
+    if (result == VK_SUCCESS) *v = view;
+    return result;
+  }
   return vkCreateImageView(D.dev, &vi, NULL, v);
 }
 
 static VkImageView view_new(const vimg *im, int sampled, int levels) {
+  if (platform_native_profile) {
+    VkImageView v = VK_NULL_HANDLE;
+    VkResult result = view_try(im, sampled, levels, &v);
+    VKCHECK(result);
+    /* Live view replacement must not continue with a missing/undefined view.
+     * Recoverable constructors use view_try directly, including strict WSI. */
+    if (result != VK_SUCCESS || !v) {
+      logf_("native live image view unavailable: %d", result);
+      abort();
+    }
+    return v;
+  }
   VkImageView v = VK_NULL_HANDLE;
   VKCHECK(view_try(im, sampled, levels, &v));
   return v;
@@ -362,8 +422,8 @@ static VkImageView view_new(const vimg *im, int sampled, int levels) {
 /* sampled: a texture (rests SHADER_READ_ONLY); else an attachment (a renderbuffer's, the
  * screen's depth, a multisampled one of a texture's), transient when its samples are
  * never kept */
-static vimg *image_new(VkFormat fmt, int w, int h, int levels, int layers, int samples, int sampled, int transient,
-                       VkComponentMapping swz) {
+static vimg *image_new_usage(VkFormat fmt, int w, int h, int levels, int layers, int samples, int sampled, int transient,
+                             VkComponentMapping swz, VkImageUsageFlags requested_usage) {
   vimg *im = calloc(1, sizeof *im);
   if (!im) return NULL;
   im->mem.block = -1;
@@ -391,9 +451,14 @@ static vimg *image_new(VkFormat fmt, int w, int h, int levels, int layers, int s
     ci.usage = att | (samples == 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0);
     transient = 0;
   }
+  if (requested_usage) {
+    ci.usage = requested_usage;
+    transient = !!(requested_usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+  }
   im->transient = transient;
+  im->usage = ci.usage;
   ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vkCreateImage(D.dev, &ci, NULL, &im->img) != VK_SUCCESS) {
+  if (vkCreateImage(D.dev, &ci, NULL, &im->img) != VK_SUCCESS || !im->img) {
     logf_("no image %d x %d format %d", w, h, fmt);
     free(im);
     return NULL;
@@ -404,7 +469,7 @@ static vimg *image_new(VkFormat fmt, int w, int h, int levels, int layers, int s
   int ok = transient ? mem_alloc(r, VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, 0, 1, &im->mem) : -1;
   if (ok != 0) ok = mem_alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 1, &im->mem);
   if (ok != 0) ok = mem_alloc(r, 0, 0, 1, &im->mem);
-  im->uid = ++D.uid;
+  im->uid = ok == 0 ? resource_uid_next() : 0;
   pthread_mutex_unlock(&D.lock);
   if (ok != 0) {
     logf_("no memory for an image %d x %d", w, h);
@@ -412,14 +477,15 @@ static vimg *image_new(VkFormat fmt, int w, int h, int levels, int layers, int s
     free(im);
     return NULL;
   }
-  if (vkBindImageMemory(D.dev, im->img, blocks[im->mem.block].mem, im->mem.off) != VK_SUCCESS) goto fail;
+  if (!im->uid || vkBindImageMemory(D.dev, im->img, blocks[im->mem.block].mem, im->mem.off) != VK_SUCCESS) goto fail;
   im->rest = sampled ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                      : is_depth(fmt) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   if (sampled) {
     im->view_levels = 1;
-    if (view_try(im, 1, 1, &im->view) != VK_SUCCESS) goto fail;
+    if (view_try(im, 1, 1, &im->view) != VK_SUCCESS || !im->view) goto fail;
   }
-  if (!comp && layers == 1 && view_try(im, 0, 1, &im->att) != VK_SUCCESS) goto fail;
+  if (!comp && layers == 1 && (im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+      (view_try(im, 0, 1, &im->att) != VK_SUCCESS || !im->att)) goto fail;
   return im;
 fail:
   if (im->view) vkDestroyImageView(D.dev, im->view, NULL);
@@ -430,6 +496,13 @@ fail:
   pthread_mutex_unlock(&D.lock);
   free(im);
   return NULL;
+}
+
+/* Compatibility allocation keeps the previous usage policy exactly. Native
+ * sampled resources supply explicit usage instead of inheriting attachment bits. */
+static vimg *image_new(VkFormat fmt, int w, int h, int levels, int layers, int samples, int sampled, int transient,
+                       VkComponentMapping swz) {
+  return image_new_usage(fmt, w, h, levels, layers, samples, sampled, transient, swz, 0);
 }
 
 /* ---- the dead: freed once the GPU is past the frame that last used them ---- */
@@ -454,6 +527,9 @@ static void dead_add(int kind, void *p, uint64_t h, uint64_t serial) {
 }
 
 static void image_free_now(vimg *im) {
+  /* Only unpublished constructor failures or serial/fence-safe retirement reach
+   * this point. Cached framebuffers must outlive every in-flight use too. */
+  if (im->att) fb_cache_forget(im->att);
   if (im->view) vkDestroyImageView(D.dev, im->view, NULL);
   if (im->att) vkDestroyImageView(D.dev, im->att, NULL);
   if (!im->swapchain) {
@@ -490,12 +566,81 @@ int vkgl_ssao_depth_supported(int w, int h) {
   return 1;
 }
 
+/* Native loader commands are not covered by the main frame's serial until their
+ * own fence has completed. Pin images even if their public texture is deleted
+ * before the platform loader flush/handoff. All lease flags/list use D.lock. */
+static vimg **native_upload_images;
+static size_t n_native_upload_images, cap_native_upload_images;
+static _Atomic int native_loader_failed; /* unknown completion: atomic diagnostic visibility across owners */
+static int native_image_upload_hold(vimg *im) {
+  pthread_mutex_lock(&D.lock);
+  if (!im->native_upload_pending) {
+    if (n_native_upload_images == cap_native_upload_images) {
+      size_t cap = cap_native_upload_images ? cap_native_upload_images * 2 : 16;
+      if (cap < cap_native_upload_images || cap > SIZE_MAX / sizeof *native_upload_images) {
+        pthread_mutex_unlock(&D.lock); return 0;
+      }
+      vimg **images = realloc(native_upload_images, cap * sizeof *images);
+      if (!images) { pthread_mutex_unlock(&D.lock); return 0; }
+      native_upload_images = images; cap_native_upload_images = cap;
+    }
+    native_upload_images[n_native_upload_images++] = im;
+    im->native_upload_pending = 1;
+  }
+  pthread_mutex_unlock(&D.lock);
+  return 1;
+}
 /* (the image's framebuffers go now: no pass is made with them after this) */
 static void image_drop(vimg *im) {
   if (!im) return;
-  if (im->att) fb_cache_forget(im->att);
+  pthread_mutex_lock(&D.lock);
+  if (im->native_upload_pending || im->native_target_refs) {
+    im->native_retire_pending = 1;
+    pthread_mutex_unlock(&D.lock);
+    return;
+  }
+  pthread_mutex_unlock(&D.lock);
   uint64_t s = im->serial > D.serial ? im->serial : D.serial;
   dead_add(DEAD_IMAGE, im, 0, s);
+}
+/* Strong target snapshots keep an image alive even after its public resource
+ * handle is removed/reused. Table access and recording still obey the port's
+ * designated-owner/loader-fence handoff protocol, not arbitrary concurrent use. */
+static int native_target_image_hold(vimg *im) {
+  if (!im) return 0;
+  pthread_mutex_lock(&D.lock);
+  int ok = !im->native_upload_pending && !im->native_retire_pending && im->native_target_refs < UINT32_MAX;
+  if (ok) ++im->native_target_refs;
+  pthread_mutex_unlock(&D.lock);
+  return ok;
+}
+static void native_target_image_release(vimg *im) {
+  if (!im) return;
+  pthread_mutex_lock(&D.lock);
+  if (!im->native_target_refs) {
+    pthread_mutex_unlock(&D.lock);
+    logf_("native target image reference underflow");
+    return;
+  }
+  --im->native_target_refs;
+  int retire = !im->native_target_refs && !im->native_upload_pending && im->native_retire_pending;
+  pthread_mutex_unlock(&D.lock);
+  if (retire) image_drop(im);
+}
+/* Only call after a successful wait for LOADER_UP's submitted upload fence. The
+ * single loader owner cannot append new commands while completing this batch. */
+static void native_image_upload_complete(void) {
+  for (;;) {
+    pthread_mutex_lock(&D.lock);
+    if (!n_native_upload_images) { pthread_mutex_unlock(&D.lock); return; }
+    vimg *im = native_upload_images[--n_native_upload_images];
+    im->native_upload_pending = 0;
+    int retire = im->native_retire_pending && !im->native_target_refs;
+    pthread_mutex_unlock(&D.lock);
+    /* Do not touch a nonretired image after unlocking: its owner can now drop
+     * it and a concurrently advancing main fence may free it. */
+    if (retire) image_drop(im);
+  }
 }
 
 static void bufmem_drop(vbufmem *b) {
@@ -565,6 +710,7 @@ typedef struct {
   vimg *im;
   GLenum min, mag, wrap_s, wrap_t;
   float aniso;
+  cinder_vk_sampler native_sampler; /* explicit defaults for native-owned textures */
 } vtex;
 TABLE(vtex, tex)
 
@@ -589,6 +735,8 @@ typedef struct {
   int used;
   vatt color, depth, stencil;
   vimg *ms; /* the multisampled image a texture is rendered through */
+  int native; /* immutable strong image snapshots, never public-name lookup */
+  vimg *native_color, *native_depth;
 } vfbo;
 TABLE(vfbo, fbo)
 
@@ -726,6 +874,16 @@ void vkgl_preview_restore(void *snapshot) {
   *ctx() = s->state;
   *cur_vao(ctx()) = s->vao;
   free(s->shadow); free(s);
+}
+
+/* Unlike preview restore, preserve an unconsumed error raised inside the scope.
+ * A sticky error from before the scope retains priority, even if consumed inside it. */
+void vkgl_scope_restore_preserve_error(void *snapshot) {
+  if (!snapshot) return;
+  vctx *c = ctx();
+  GLenum pending = c->err;
+  vkgl_preview_restore(snapshot);
+  if (c->err == GL_NO_ERROR) c->err = pending;
 }
 
 /* ---- formats ---- */
@@ -901,12 +1059,12 @@ static void uploader_init(uploader *u) {
   VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
   pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
   pi.queueFamilyIndex = D.qfam;
-  VKCHECK(vkCreateCommandPool(D.dev, &pi, NULL, &u->pool));
+  PLATFORM_CHECK(vkCreateCommandPool(D.dev, &pi, NULL, &u->pool));
   VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, u->pool,
                                      VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
-  VKCHECK(vkAllocateCommandBuffers(D.dev, &ai, &u->cmd));
+  PLATFORM_CHECK(vkAllocateCommandBuffers(D.dev, &ai, &u->cmd));
   VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-  VKCHECK(vkCreateFence(D.dev, &fi, NULL, &u->fence));
+  PLATFORM_CHECK(vkCreateFence(D.dev, &fi, NULL, &u->fence));
   u->stage.chunk = 8 << 20;
   u->stage.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 }
@@ -923,7 +1081,7 @@ static VkCommandBuffer up_cmd(uploader *u) {
 
 static uploader *cur_up(void) { return ctx()->loader ? &LOADER_UP : &F->up; }
 
-static void submit(VkCommandBuffer *cmds, uint32_t n, VkSemaphore wait, VkSemaphore signal, VkFence fence) {
+static VkResult submit(VkCommandBuffer *cmds, uint32_t n, VkSemaphore wait, VkSemaphore signal, VkFence fence) {
   VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
   VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
   si.commandBufferCount = n;
@@ -931,20 +1089,33 @@ static void submit(VkCommandBuffer *cmds, uint32_t n, VkSemaphore wait, VkSemaph
   if (wait) si.waitSemaphoreCount = 1, si.pWaitSemaphores = &wait, si.pWaitDstStageMask = &stage;
   if (signal) si.signalSemaphoreCount = 1, si.pSignalSemaphores = &signal;
   pthread_mutex_lock(&D.qlock);
-  VKCHECK(vkQueueSubmit(D.q, 1, &si, fence));
+  VkResult result = vkQueueSubmit(D.q, 1, &si, fence);
   pthread_mutex_unlock(&D.qlock);
+  VKCHECK(result);
+  return result;
 }
 
 /* the loading thread's uploads to the GPU and done with: what it made is the game's to use */
 static void loader_flush(void) {
   uploader *u = &LOADER_UP;
-  if (!u->open) return;
-  VKCHECK(vkEndCommandBuffer(u->cmd));
+  if (!u->open || native_loader_failed) return;
+  VkResult ended = vkEndCommandBuffer(u->cmd);
+  VKCHECK(ended);
+  if (ended != VK_SUCCESS) { native_loader_failed = 1; return; }
   u->open = 0;
-  submit(&u->cmd, 1, VK_NULL_HANDLE, VK_NULL_HANDLE, u->fence);
-  VKCHECK(vkWaitForFences(D.dev, 1, &u->fence, VK_TRUE, UINT64_MAX));
-  VKCHECK(vkResetFences(D.dev, 1, &u->fence));
-  VKCHECK(vkResetCommandPool(D.dev, u->pool, 0));
+  if (submit(&u->cmd, 1, VK_NULL_HANDLE, VK_NULL_HANDLE, u->fence) != VK_SUCCESS) {
+    native_loader_failed = 1; return; /* never wait forever on an unsubmitted fence */
+  }
+  VkResult completion = vkWaitForFences(D.dev, 1, &u->fence, VK_TRUE, UINT64_MAX);
+  VKCHECK(completion);
+  if (completion != VK_SUCCESS) { native_loader_failed = 1; return; }
+  native_image_upload_complete();
+  VkResult fence_reset = vkResetFences(D.dev, 1, &u->fence);
+  VKCHECK(fence_reset);
+  if (fence_reset != VK_SUCCESS) { native_loader_failed = 1; return; }
+  VkResult pool_reset = vkResetCommandPool(D.dev, u->pool, 0);
+  VKCHECK(pool_reset);
+  if (pool_reset != VK_SUCCESS) { native_loader_failed = 1; return; }
   ring_reset(&u->stage);
 }
 
@@ -1033,6 +1204,15 @@ static vimg *tex_image_for(vtex *t, int level, int layers, VkFormat fmt, VkCompo
   return n;
 }
 
+/* Shared Vulkan upload recording; caller supplies the uploader's staged bytes. */
+static void image_upload_record(VkCommandBuffer c, vimg *im, int level, int face, int w, int h,
+                                VkBuffer sb, VkDeviceSize so) {
+  barrier(c, im, level, 1, face, 1, im->rest, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  VkBufferImageCopy r = { so, 0, 0, { im->aspect, (uint32_t)level, (uint32_t)face, 1 }, { 0, 0, 0 }, { (uint32_t)w, (uint32_t)h, 1 } };
+  vkCmdCopyBufferToImage(c, sb, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+  barrier(c, im, level, 1, face, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, im->rest);
+}
+
 /* pixels into level, face of im (from the staging ring), rows packed by the unpack alignment */
 static void image_upload(vimg *im, int level, int face, int w, int h, const tfmt *f, const void *data, size_t raw_size,
                          int unpack) {
@@ -1062,10 +1242,7 @@ static void image_upload(vimg *im, int level, int face, int w, int h, const tfmt
     }
   }
   VkCommandBuffer c = up_cmd(u);
-  barrier(c, im, level, 1, face, 1, im->rest, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-  VkBufferImageCopy r = { so, 0, 0, { im->aspect, (uint32_t)level, (uint32_t)face, 1 }, { 0, 0, 0 }, { (uint32_t)w, (uint32_t)h, 1 } };
-  vkCmdCopyBufferToImage(c, sb, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-  barrier(c, im, level, 1, face, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, im->rest);
+  image_upload_record(c, im, level, face, w, h, sb, so);
   if (ctx()->loader && u->stage.n > 4) loader_flush(); /* (a big step: its staging back sooner) */
 }
 
@@ -1096,52 +1273,84 @@ static void tex_spec(GLenum target, GLint level, const tfmt *f, int w, int h, co
 /* ---- samplers, by the texture's parameters ---- */
 
 typedef struct {
-  GLenum min, mag, ws, wt;
-  int aniso, levels;
+  cinder_vk_sampler state;
+  int levels;
   VkSampler s;
 } samp_t;
 static samp_t *samps;
 static size_t n_samps, cap_samps;
 
-static VkSamplerAddressMode wrap_mode(GLenum w) {
-  return w == GL_CLAMP_TO_EDGE ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
-         : w == GL_MIRRORED_REPEAT ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : VK_SAMPLER_ADDRESS_MODE_REPEAT;
-}
-
-static VkSampler sampler_for(const vtex *t, int levels) {
-  GLenum min = t->min ? t->min : GL_NEAREST_MIPMAP_LINEAR, mag = t->mag ? t->mag : GL_LINEAR;
-  GLenum ws = t->wrap_s ? t->wrap_s : GL_REPEAT, wt = t->wrap_t ? t->wrap_t : GL_REPEAT;
-  int mip = min != GL_NEAREST && min != GL_LINEAR;
-  int an = mip && D.aniso && t->aniso > 1.0f ? (int)(t->aniso + 0.5f) : 1;
-  if (!mip) levels = 1;
+/* The cache/driver boundary takes Vulkan values only. Compatibility texture
+ * defaults are translated by sampler_for; native packets bypass translation
+ * and never mutate texture resources to change addressing. */
+static VkSampler cinder_vk_sampler_get(const cinder_vk_sampler *requested, int levels) {
+  cinder_vk_sampler key = *requested;
+  key.use_state = 1;
+  if (!key.mipmaps) {
+    levels = 1;
+    key.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST; /* maxLod .25 must stay at L0 */
+  }
+  if (!key.mipmaps || !D.aniso || key.anisotropy < 1.0f) key.anisotropy = 1.0f;
+  else if (key.anisotropy > D.max_aniso) key.anisotropy = D.max_aniso;
   pthread_mutex_lock(&D.lock);
   for (size_t i = 0; i < n_samps; ++i) {
-    samp_t *s = &samps[i];
-    if (s->min == min && s->mag == mag && s->ws == ws && s->wt == wt && s->aniso == an && s->levels == levels) {
+    samp_t *s = &samps[i]; const cinder_vk_sampler *k = &s->state;
+    if (s->levels == levels && k->min_filter == key.min_filter && k->mag_filter == key.mag_filter &&
+        k->mipmap_mode == key.mipmap_mode && k->address_u == key.address_u && k->address_v == key.address_v &&
+        k->mipmaps == key.mipmaps && k->anisotropy == key.anisotropy) {
+      if (platform_native_profile && !s->s) continue; /* never perpetuate a failed Native cache entry */
       pthread_mutex_unlock(&D.lock);
       return s->s;
     }
   }
   VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-  si.magFilter = mag == GL_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-  si.minFilter = min == GL_NEAREST || min == GL_NEAREST_MIPMAP_NEAREST || min == GL_NEAREST_MIPMAP_LINEAR ? VK_FILTER_NEAREST
-                                                                                                           : VK_FILTER_LINEAR;
-  si.mipmapMode = min == GL_NEAREST_MIPMAP_LINEAR || min == GL_LINEAR_MIPMAP_LINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-                                                                                    : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  si.addressModeU = wrap_mode(ws);
-  si.addressModeV = wrap_mode(wt);
+  si.magFilter = key.mag_filter; si.minFilter = key.min_filter;
+  si.mipmapMode = key.mipmap_mode;
+  si.addressModeU = key.address_u; si.addressModeV = key.address_v;
   si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  si.anisotropyEnable = an > 1;
-  si.maxAnisotropy = (float)(an > 1 ? (an < D.max_aniso ? an : D.max_aniso) : 1);
-  si.minLod = 0;
-  si.maxLod = mip ? (float)levels : 0.25f; /* (no mipmaps: the base alone, GL's GL_LINEAR) */
+  si.anisotropyEnable = key.anisotropy > 1.0f; si.maxAnisotropy = key.anisotropy;
+  si.minLod = 0; si.maxLod = key.mipmaps ? (float)levels : 0.25f;
   si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-  VkSampler s;
-  VKCHECK(vkCreateSampler(D.dev, &si, NULL, &s));
-  GROW(samps, n_samps, cap_samps);
-  samps[n_samps++] = (samp_t){ min, mag, ws, wt, an, levels, s };
+  VkSampler s = VK_NULL_HANDLE;
+  VkResult result = vkCreateSampler(D.dev, &si, NULL, &s);
+  if (platform_native_profile && (result != VK_SUCCESS || !s)) {
+    /* Error output is undefined; a missing success handle is not a cache hit.
+     * The actual Native binding caller rejects NULL without descriptor writes. */
+    logf_("native sampler unavailable: %d", result);
+    pthread_mutex_unlock(&D.lock);
+    return VK_NULL_HANDLE;
+  }
+  if (result == VK_SUCCESS) {
+    GROW(samps, n_samps, cap_samps);
+    samps[n_samps++] = (samp_t){ key, levels, s };
+  } else logf_("sampler creation failed: %d", result);
   pthread_mutex_unlock(&D.lock);
   return s;
+}
+static VkSamplerAddressMode wrap_mode(GLenum w) {
+  return w == GL_CLAMP_TO_EDGE ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+         : w == GL_MIRRORED_REPEAT ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+}
+static cinder_vk_sampler sampler_defaults(const vtex *t) {
+  GLenum min = t->min ? t->min : GL_NEAREST_MIPMAP_LINEAR, mag = t->mag ? t->mag : GL_LINEAR;
+  int mip = min != GL_NEAREST && min != GL_LINEAR;
+  cinder_vk_sampler state = { .use_state=1, .mipmaps=(VkBool32)mip,
+    .min_filter=min == GL_NEAREST || min == GL_NEAREST_MIPMAP_NEAREST || min == GL_NEAREST_MIPMAP_LINEAR ? VK_FILTER_NEAREST : VK_FILTER_LINEAR,
+    .mag_filter=mag == GL_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR,
+    .mipmap_mode=min == GL_NEAREST_MIPMAP_LINEAR || min == GL_LINEAR_MIPMAP_LINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+    .address_u=wrap_mode(t->wrap_s), .address_v=wrap_mode(t->wrap_t),
+    .anisotropy=mip && D.aniso && t->aniso > 1.0f ? floorf(t->aniso + 0.5f) : 1.0f };
+  return state;
+}
+static VkSampler sampler_for(const vtex *t, int levels) {
+  cinder_vk_sampler state = t->native_sampler.use_state ? t->native_sampler : sampler_defaults(t);
+  return cinder_vk_sampler_get(&state, levels);
+}
+int cinder_vk_texture_sampler(uint32_t texture, cinder_vk_sampler *out) {
+  const vtex *t = tex_get(texture);
+  if (!out || !t || !t->im) return 0;
+  *out = t->native_sampler.use_state ? t->native_sampler : sampler_defaults(t);
+  return 1;
 }
 
 /* ---- the GL calls: textures ---- */
@@ -1383,6 +1592,12 @@ void vkgl_glDeleteFramebuffers(GLsizei n, const GLuint *names) {
   for (GLsizei i = 0; i < n; ++i) {
     vfbo *f = fbo_get(names[i]);
     if (!f) continue;
+    if (f->native) {
+      cinder_vk_target_destroy(names[i]);
+      if (c->draw_fb == names[i]) c->draw_fb = 0;
+      if (c->read_fb == names[i]) c->read_fb = 0;
+      continue;
+    }
     image_drop(f->ms);
     f->ms = NULL;
     if (c->draw_fb == names[i]) c->draw_fb = 0;
@@ -1408,6 +1623,7 @@ static void fbo_attach(GLenum target, GLenum point, int kind, GLuint name, int s
     set_err(GL_INVALID_OPERATION);
     return;
   }
+  if (f->native) { set_err(GL_INVALID_OPERATION); return; } /* immutable snapshot target */
   vatt a = { name ? kind : 0, name, samples > 1 ? samples : 0 };
   if (point == GL_COLOR_ATTACHMENT0) f->color = a;
   else if (point == GL_DEPTH_ATTACHMENT) f->depth = a;
@@ -1483,6 +1699,21 @@ static uint64_t prog_key(const char *vs, const char *fs, const char **attribs, i
 }
 
 static VkShaderModule shader_module(const uint32_t *words, size_t n) {
+  if (platform_native_profile) {
+    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    ci.codeSize = n * 4;
+    ci.pCode = words;
+    VkShaderModule m = VK_NULL_HANDLE;
+    VkResult result = vkCreateShaderModule(D.dev, &ci, NULL, &m);
+    VKCHECK(result);
+    /* Native off-table program construction already owns rollback. Failure
+     * output is undefined: neither publish it nor guess that it can be freed. */
+    if (result != VK_SUCCESS || !m) {
+      logf_("native shader module unavailable: %d", result);
+      return VK_NULL_HANDLE;
+    }
+    return m;
+  }
   VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
   ci.codeSize = n * 4;
   ci.pCode = words;
@@ -1569,7 +1800,7 @@ GLuint vkgl_program(const char *vs, const char *fs, const char **attribs, int n_
       p->vs2 = shader_module(VKGL_SPV[i].vs2, (size_t)VKGL_SPV[i].n_vs2);
       p->fs2 = shader_module(VKGL_SPV[i].fs2, (size_t)VKGL_SPV[i].n_fs2);
     }
-    p->uid = __atomic_add_fetch(&D.uid, 1, __ATOMIC_RELAXED);
+    if (!(p->uid = resource_uid_next())) { vkgl_glDeleteProgram(id); return 0; }
     return id;
   }
   /* not made ahead: on the desktop, made now by vkglsl.py; else kept for the next build */
@@ -1599,7 +1830,7 @@ GLuint vkgl_program(const char *vs, const char *fs, const char **attribs, int n_
       free(v);
       free(f);
       if (ok) {
-        p->uid = __atomic_add_fetch(&D.uid, 1, __ATOMIC_RELAXED);
+        if (!(p->uid = resource_uid_next())) { vkgl_glDeleteProgram(id); return 0; }
         return id;
       }
     }
@@ -1612,7 +1843,7 @@ GLuint vkgl_program(const char *vs, const char *fs, const char **attribs, int n_
     }
   }
   /* (a program that draws nothing, so the game goes on) */
-  p->uid = __atomic_add_fetch(&D.uid, 1, __ATOMIC_RELAXED);
+  if (!(p->uid = resource_uid_next())) { vkgl_glDeleteProgram(id); return 0; }
   if (!p->shadow) p->shadow = xcalloc(16, 1);
   return id;
 }
@@ -1894,7 +2125,15 @@ static VkRenderPass rp_make(const compat_t *k, const rp_t *o) {
   ci.dependencyCount = 2;
   ci.pDependencies = dep;
   VkRenderPass rp;
-  VKCHECK(vkCreateRenderPass(D.dev, &ci, NULL, &rp));
+  if (platform_native_profile) rp = VK_NULL_HANDLE;
+  VkResult result = vkCreateRenderPass(D.dev, &ci, NULL, &rp);
+  VKCHECK(result);
+  /* Do not publish a compatibility/cache entry with an undefined render pass.
+   * This native-only fatal boundary is deliberately not global VKCHECK policy:
+   * the loader's explicit nonfatal failures must preserve unknown leases. */
+  if (platform_native_profile && (result != VK_SUCCESS || !rp)) {
+    logf_("native render pass unavailable: %d", result); abort();
+  }
   return rp;
 }
 
@@ -1915,6 +2154,17 @@ static int compat_id(VkFormat cfmt, VkFormat dfmt, int samples, int resolve) {
   o.drest = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
   k->rp = rp_make(k, &o);
   return n_compats++;
+}
+
+/* Native targets must not alias compatibility kind zero when the cache is full.
+ * Native-profile rp_make now explicitly fails fatally before publication;
+ * legacy VKCHECK remains log-only. Capacity admission is not device recovery. */
+static int native_compat_id(VkFormat cfmt, VkFormat dfmt, int samples, int resolve) {
+  for (int i = 0; i < n_compats; ++i) {
+    const compat_t *k = &compats[i];
+    if (k->cfmt == cfmt && k->dfmt == dfmt && k->samples == samples && k->resolve == resolve) return i;
+  }
+  return n_compats < 64 ? compat_id(cfmt, dfmt, samples, resolve) : -1;
 }
 
 static VkRenderPass rp_get(const rp_t *o) {
@@ -1942,9 +2192,56 @@ static fbent *fbs;
 static size_t n_fbs, cap_fbs;
 
 static VkFramebuffer fb_get(int compat, const VkImageView *v, int n, int w, int h) {
+  if (platform_native_profile) {
+    if (!v || n < 1 || n > 3 || w < 1 || h < 1 || compat < 0 || compat >= n_compats || !compats[compat].rp) {
+      logf_("native framebuffer key unavailable"); abort();
+    }
+    VkImageView key[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    for (int i = 0; i < n; ++i) {
+      if (!v[i]) { logf_("native framebuffer has a missing view"); abort(); }
+      key[i] = v[i];
+    }
+    pthread_mutex_lock(&D.lock);
+    for (size_t i = 0; i < n_fbs; ++i) {
+      fbent *e = &fbs[i];
+      if (e->compat == compat && e->w == w && e->h == h && !memcmp(e->v, key, sizeof key)) {
+        VkFramebuffer fb = e->fb;
+        pthread_mutex_unlock(&D.lock);
+        if (!fb) { logf_("native framebuffer cache contains a missing handle"); abort(); }
+        return fb;
+      }
+    }
+    VkFramebufferCreateInfo ci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    ci.renderPass = compats[compat].rp;
+    ci.attachmentCount = (uint32_t)n;
+    ci.pAttachments = v;
+    ci.width = (uint32_t)w;
+    ci.height = (uint32_t)h;
+    ci.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkResult result = vkCreateFramebuffer(D.dev, &ci, NULL, &fb);
+    VKCHECK(result);
+    if (result != VK_SUCCESS || !fb) {
+      pthread_mutex_unlock(&D.lock);
+      logf_("native framebuffer unavailable: %d", result); abort();
+    }
+    GROW(fbs, n_fbs, cap_fbs);
+    fbent *e = &fbs[n_fbs];
+    memset(e, 0, sizeof *e);
+    e->compat = compat; e->w = w; e->h = h; e->fb = fb;
+    memcpy(e->v, key, sizeof key);
+    ++n_fbs;
+    pthread_mutex_unlock(&D.lock);
+    return fb;
+  }
+  pthread_mutex_lock(&D.lock);
   for (size_t i = 0; i < n_fbs; ++i) {
     fbent *e = &fbs[i];
-    if (e->compat == compat && e->w == w && e->h == h && !memcmp(e->v, v, (size_t)n * sizeof *v)) return e->fb;
+    if (e->compat == compat && e->w == w && e->h == h && !memcmp(e->v, v, (size_t)n * sizeof *v)) {
+      VkFramebuffer fb = e->fb;
+      pthread_mutex_unlock(&D.lock);
+      return fb;
+    }
   }
   VkFramebufferCreateInfo ci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
   ci.renderPass = compats[compat].rp;
@@ -1959,11 +2256,16 @@ static VkFramebuffer fb_get(int compat, const VkImageView *v, int n, int w, int 
   e->compat = compat, e->w = w, e->h = h;
   memcpy(e->v, v, (size_t)n * sizeof *v);
   VKCHECK(vkCreateFramebuffer(D.dev, &ci, NULL, &e->fb));
-  return e->fb;
+  VkFramebuffer fb = e->fb;
+  pthread_mutex_unlock(&D.lock);
+  return fb;
 }
 
 /* (when the view is destroyed: the GPU is done with its framebuffers) */
 static void fb_cache_forget(VkImageView view) {
+  /* Constructor cleanup may run on the loader while the main owner caches an
+   * unrelated framebuffer. Do not race array growth/swap-removal. */
+  pthread_mutex_lock(&D.lock);
   for (size_t i = 0; i < n_fbs;) {
     fbent *e = &fbs[i];
     if (e->v[0] == view || e->v[1] == view || e->v[2] == view) {
@@ -1973,6 +2275,7 @@ static void fb_cache_forget(VkImageView view) {
       i++;
     }
   }
+  pthread_mutex_unlock(&D.lock);
 }
 
 /* ---- pipelines, by the state a draw has ---- */
@@ -2067,7 +2370,116 @@ static VkStencilOp stencil_op(GLenum o) {
   return VK_STENCIL_OP_KEEP;
 }
 
+/* Native cache observation/replacement shares the pipeline-table mutex with
+ * actual pipeline creation, including creation outside the table lookup lock. */
+static VkResult backend_pipeline_create(const VkGraphicsPipelineCreateInfo *info, VkPipeline *pipeline) {
+  if (platform_native_profile) pthread_mutex_lock(&D.plock);
+  VkResult result = vkCreateGraphicsPipelines(D.dev, D.pcache, 1, info, NULL, pipeline);
+  if (platform_native_profile) pthread_mutex_unlock(&D.plock);
+  return result;
+}
+
 static VkPipeline pipeline_make(const pkey *k, vprog *p) {
+  if (platform_native_profile) {
+    /* Program modules/key fields are immutable while published. Only this
+     * preference changes across main/loader creation, so snapshot it atomically
+     * once: a single create must never mix the two shader pairs. */
+    int alt = __atomic_load_n(&p->alt, __ATOMIC_ACQUIRE) != 0;
+    if (alt && (!p->vs2 || !p->fs2)) return VK_NULL_HANDLE;
+    const compat_t *cp = &compats[k->compat];
+    float flip = k->flip ? -1.0f : 1.0f;
+    VkSpecializationMapEntry me = { 0, 0, 4 };
+    VkSpecializationInfo spec = { 1, &me, 4, &flip };
+    VkPipelineShaderStageCreateInfo st[2] = {
+      { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, alt ? p->vs2 : p->vs, "main",
+        &spec },
+      { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, alt ? p->fs2 : p->fs, "main",
+        NULL },
+    };
+    VkVertexInputBindingDescription vb[MAX_ATTR];
+    VkVertexInputAttributeDescription va[MAX_ATTR];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < MAX_ATTR; ++i) {
+      if (!(p->inputs >> i & 1)) continue;
+      vb[n] = (VkVertexInputBindingDescription){ i, k->astride[i],
+                                                 (k->inst >> i & 1) ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX };
+      va[n] = (VkVertexInputAttributeDescription){ i, i, vfmt_dev[k->afmt[i]], 0 };
+      n++;
+    }
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    vi.vertexBindingDescriptionCount = n;
+    vi.pVertexBindingDescriptions = vb;
+    vi.vertexAttributeDescriptionCount = n;
+    vi.pVertexAttributeDescriptions = va;
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = (VkPrimitiveTopology)k->topo;
+    VkPipelineViewportStateCreateInfo vs = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vs.viewportCount = vs.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = k->cull;
+    rs.frontFace = k->front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = (VkSampleCountFlagBits)cp->samples;
+    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    ds.depthTestEnable = k->depth_test;
+    ds.depthWriteEnable = k->depth_test && k->depth_write;
+    ds.depthCompareOp = (VkCompareOp)k->dfunc;
+    ds.stencilTestEnable = k->stencil;
+    ds.front = (VkStencilOpState){ (VkStencilOp)k->sfail, (VkStencilOp)k->szpass, (VkStencilOp)k->szfail, (VkCompareOp)k->sfunc,
+                                   k->smask, k->swmask, 0 };
+    ds.back = ds.front;
+    VkPipelineColorBlendAttachmentState cb = { 0 };
+    cb.blendEnable = k->blend;
+    cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = (VkBlendFactor)k->bsrc;
+    cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = (VkBlendFactor)k->bdst;
+    cb.colorBlendOp = cb.alphaBlendOp = (VkBlendOp)k->beq;
+    cb.colorWriteMask = k->cmask;
+    VkPipelineColorBlendStateCreateInfo bs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    bs.attachmentCount = cp->cfmt ? 1 : 0;
+    bs.pAttachments = &cb;
+    VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 3;
+    dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    ci.stageCount = 2;
+    ci.pStages = st;
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vs;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms;
+    ci.pDepthStencilState = &ds;
+    ci.pColorBlendState = &bs;
+    ci.pDynamicState = &dy;
+    ci.layout = playout[p->n_samp];
+    ci.renderPass = cp->rp;
+    VkPipeline pl = VK_NULL_HANDLE;
+    if (getenv("VKGL_DEBUG")) logf_("pipeline for %s, compat %d, flip %d", p->key, k->compat, k->flip);
+    VkResult r = getenv("VKGL_TEST_ALT") && !alt ? VK_ERROR_INITIALIZATION_FAILED
+                                                 : backend_pipeline_create(&ci, &pl);
+    if (r == VK_SUCCESS && pl) return pl;
+    /* Pipeline creation has defined per-element outputs even on failed calls:
+     * every non-null returned pipeline is owned and must not be discarded. */
+    if (pl) { vkDestroyPipeline(D.dev, pl, NULL); pl = VK_NULL_HANDLE; }
+    logf_("native pipeline unavailable: %d (program %s%s, compat %d)", r, p->key, alt ? " all highp" : "", k->compat);
+    if (r == VK_ERROR_DEVICE_LOST) return VK_NULL_HANDLE;
+    if (!alt && p->vs2 && p->fs2) {
+      st[0].module = p->vs2; st[1].module = p->fs2;
+      pl = VK_NULL_HANDLE;
+      r = backend_pipeline_create(&ci, &pl);
+      if (r == VK_SUCCESS && pl) {
+        __atomic_store_n(&p->alt, 1, __ATOMIC_RELEASE);
+        logf_("program %s all highp: made", p->key);
+        return pl;
+      }
+      if (pl) vkDestroyPipeline(D.dev, pl, NULL);
+      logf_("program %s all highp: unavailable (%d)", p->key, r);
+    }
+    return VK_NULL_HANDLE;
+  }
   const compat_t *cp = &compats[k->compat];
   float flip = k->flip ? -1.0f : 1.0f;
   VkSpecializationMapEntry me = { 0, 0, 4 };
@@ -2139,15 +2551,15 @@ static VkPipeline pipeline_make(const pkey *k, vprog *p) {
   ci.layout = playout[p->n_samp];
   ci.renderPass = cp->rp;
   VkPipeline pl = VK_NULL_HANDLE;
-  if (getenv("VKGL_DEBUG")) logf_("pipeline for %s, compat %d, flip %d%s", p->key, k->compat, k->flip, ctx()->loader ? ", loader" : "");
+  if (getenv("VKGL_DEBUG")) logf_("pipeline for %s, compat %d, flip %d", p->key, k->compat, k->flip);
   VkResult r = getenv("VKGL_TEST_ALT") && !p->alt ? VK_ERROR_INITIALIZATION_FAILED /* (the second try tested) */
-                                                  : vkCreateGraphicsPipelines(D.dev, D.pcache, 1, &ci, NULL, &pl);
+                                                  : backend_pipeline_create(&ci, &pl);
   if (r != VK_SUCCESS) {
     logf_("pipeline failed: %d (program %s%s, compat %d)", r, p->key, p->alt ? " all highp" : "", k->compat);
     if (!p->alt && p->vs2) { /* the program's from now on all highp, if that one goes */
       st[0].module = p->vs2, st[1].module = p->fs2;
       pl = VK_NULL_HANDLE;
-      r = vkCreateGraphicsPipelines(D.dev, D.pcache, 1, &ci, NULL, &pl);
+      r = backend_pipeline_create(&ci, &pl);
       logf_("program %s all highp: %s", p->key, r == VK_SUCCESS ? "made" : "failed too");
       if (r == VK_SUCCESS) p->alt = 1;
       else pl = VK_NULL_HANDLE;
@@ -2159,6 +2571,65 @@ static VkPipeline pipeline_make(const pkey *k, vprog *p) {
 }
 
 static VkPipeline pipeline_get(const pkey *k, vprog *p, int *made) {
+  if (platform_native_profile) {
+    uint64_t h = hash_bytes(k, sizeof *k);
+    pthread_mutex_lock(&D.plock);
+    if (cap_pipes) {
+      for (size_t probe = 0, i = h & (cap_pipes - 1); probe < cap_pipes;
+           ++probe, i = (i + 1) & (cap_pipes - 1)) {
+        if (!pipes[i].used) break;
+        if (!memcmp(&pipes[i].k, k, sizeof *k)) {
+          VkPipeline cached = pipes[i].p;
+          if (cached) { pthread_mutex_unlock(&D.plock); return cached; }
+          break; /* Old/corrupt NULL row is not a successful cache hit. */
+        }
+      }
+    }
+    pthread_mutex_unlock(&D.plock);
+    VkPipeline pl = pipeline_make(k, p);
+    pthread_mutex_lock(&D.plock);
+    /* Even a failed creator may use a valid winner published meanwhile. */
+    if (cap_pipes) {
+      for (size_t probe = 0, i = h & (cap_pipes - 1); probe < cap_pipes;
+           ++probe, i = (i + 1) & (cap_pipes - 1)) {
+        if (!pipes[i].used) break;
+        if (!memcmp(&pipes[i].k, k, sizeof *k)) {
+          if (pipes[i].p) {
+            if (pl) vkDestroyPipeline(D.dev, pl, NULL);
+            pl = pipes[i].p;
+            pthread_mutex_unlock(&D.plock);
+            return pl;
+          }
+          if (pl) { /* Repair in place without a duplicate entry/count. */
+            pipes[i].p = pl;
+            if (made) *made = 1;
+          }
+          pthread_mutex_unlock(&D.plock);
+          return pl;
+        }
+      }
+    }
+    if (!pl) { pthread_mutex_unlock(&D.plock); return VK_NULL_HANDLE; }
+    if ((n_pipes + 1) * 2 > cap_pipes) {
+      size_t cap = cap_pipes ? cap_pipes * 2 : 1024;
+      pent *t = xcalloc(cap, sizeof *t);
+      for (size_t i = 0; i < cap_pipes; ++i) {
+        if (!pipes[i].used) continue;
+        size_t j = hash_bytes(&pipes[i].k, sizeof *k) & (cap - 1);
+        while (t[j].used) j = (j + 1) & (cap - 1);
+        t[j] = pipes[i];
+      }
+      free(pipes); pipes = t; cap_pipes = cap;
+    }
+    size_t i = h & (cap_pipes - 1);
+    while (pipes[i].used) i = (i + 1) & (cap_pipes - 1);
+    pipes[i] = (pent){ *k, pl, 1 };
+    ++n_pipes;
+    /* Accumulate successful insertion/repair, not mere attempts/race winners. */
+    if (made) *made = 1;
+    pthread_mutex_unlock(&D.plock);
+    return pl;
+  }
   uint64_t h = hash_bytes(k, sizeof *k);
   pthread_mutex_lock(&D.plock);
   if (cap_pipes) {
@@ -2220,6 +2691,89 @@ typedef struct {
 static dent dcache[DCACHE];
 
 static VkDescriptorSet desc_alloc(int n) {
+  if (platform_native_profile) {
+    vframe *f = F;
+    if (!f || n < 0 || n > MAX_SAMP || f->dpool_i > f->n_dpool) {
+      logf_("native descriptor allocator state unavailable"); abort();
+    }
+    /* Main owns descriptor replay. frame_begin resets all of this frame's
+     * pools after a new D.serial; same-serial flush_wait does not reset them.
+     * Cursor movement within a serial is forward-only. New pool creation also
+     * resets counts, including numerical handle reuse after device recreation. */
+    static struct {
+      vframe *frame;
+      uint64_t serial;
+      VkDescriptorPool pool;
+      uint32_t sets, samplers;
+    } budget;
+    if (budget.frame != f || budget.serial != D.serial) {
+      memset(&budget, 0, sizeof budget);
+      budget.frame = f;
+      budget.serial = D.serial;
+    }
+    /* Current device negotiation does not enable KHR_maintenance2. Before
+     * physical-device Vulkan 1.1, negative allocation errors may be historical
+     * fragmentation codes; that bounded ambiguity is not general OOM recovery. */
+    int ambiguous_fragmentation = D.props.apiVersion < VK_API_VERSION_1_1;
+    /* Bound actual allocation attempts. Capacity-only rollover does not use an
+     * attempt: never probe a full pool on Vulkan 1.0 without maintenance1. */
+    for (int attempt = 0; attempt < 8;) {
+      if (f->dpool_i == f->n_dpool) {
+        VkDescriptorPoolSize sz[2] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1024 },
+                                       { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 } };
+        VkDescriptorPoolCreateInfo ci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        ci.maxSets = 1024;
+        ci.poolSizeCount = 2;
+        ci.pPoolSizes = sz;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkResult result = vkCreateDescriptorPool(D.dev, &ci, NULL, &pool);
+        VKCHECK(result);
+        if (result != VK_SUCCESS || !pool) {
+          logf_("native descriptor pool unavailable: %d", result); abort();
+        }
+        GROW(f->dpool, f->n_dpool, f->cap_dpool);
+        f->dpool[f->n_dpool++] = pool;
+        budget.pool = pool;
+        budget.sets = budget.samplers = 0;
+      }
+      VkDescriptorPool pool = f->dpool[f->dpool_i];
+      if (!pool) { logf_("native descriptor pool handle missing"); abort(); }
+      if (budget.pool != pool) {
+        budget.pool = pool;
+        budget.sets = budget.samplers = 0;
+      }
+      /* Every dsl[n] consumes one UBO and n combined-image samplers. */
+      if (budget.sets >= 1024 || (uint32_t)n > 4096 - budget.samplers) {
+        ++f->dpool_i;
+        budget.pool = VK_NULL_HANDLE;
+        budget.sets = budget.samplers = 0;
+        continue;
+      }
+      VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+      ai.descriptorPool = f->dpool[f->dpool_i];
+      ai.descriptorSetCount = 1;
+      ai.pSetLayouts = &dsl[n];
+      VkDescriptorSet s = VK_NULL_HANDLE;
+      ++attempt;
+      VkResult result = vkAllocateDescriptorSets(D.dev, &ai, &s);
+      if (result == VK_SUCCESS && s) {
+        ++budget.sets;
+        budget.samplers += (uint32_t)n;
+        return s;
+      }
+      if (result == VK_ERROR_DEVICE_LOST ||
+          (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL &&
+           !(ambiguous_fragmentation && result < 0))) {
+        logf_("native descriptor allocation unavailable: %d", result); abort();
+      }
+      if (ambiguous_fragmentation && result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)
+        logf_("native Vulkan 1.0 descriptor allocation ambiguous fragmentation: %d", result);
+      ++f->dpool_i;
+      budget.pool = VK_NULL_HANDLE;
+      budget.sets = budget.samplers = 0;
+    }
+    logf_("native descriptor allocation made no progress in eight attempts"); abort();
+  }
   vframe *f = F;
   for (;;) {
     if (f->dpool_i == f->n_dpool) {
@@ -2293,6 +2847,7 @@ typedef struct {
   vimg *src, *dst;
   int src_screen, dst_screen;
   int s[4], d[4];
+  VkImageAspectFlags copy_aspects; /* 0 keeps legacy GL copy projection */
   VkFilter filter;
   int resolve_blit;
 } vop;
@@ -2338,6 +2893,40 @@ static struct {
   int compat; /* the screen's framebuffer kind (-1 without one), for the loading's first draws */
 } S = { .compat = -1 };
 
+/* Native metadata is immutable and holds its images independently of public
+ * texture/attachment handle lifetime. Never lazily allocate or resolve names. */
+static int native_fb_target(const vfbo *f, vop *t) {
+  memset(t, 0, sizeof *t); t->kind = OP_PASS;
+  if (!f || !f->native) return 0;
+  vimg *c = f->native_color, *d = f->native_depth;
+  if (!c && !d) return 0;
+  if (c && (!c->native_target_refs || !c->img || !c->uid || !c->att || is_depth(c->fmt) || c->layers != 1 || c->levels != 1 ||
+            c->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(c->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || c->native_upload_pending ||
+            (c->samples != 1 && c->samples != 2 && c->samples != 4 && c->samples != 8) ||
+            (f->color.kind != 1 && f->color.kind != 2) || c->sampled != (f->color.kind == 1) || (c->sampled && (c->samples != 1 || !c->view || c->view_levels != 1 || !(c->usage & VK_IMAGE_USAGE_SAMPLED_BIT))))) return 0;
+  if (d && (!d->native_target_refs || !d->img || !d->uid || !d->att || !is_depth(d->fmt) || d->layers != 1 || d->levels != 1 ||
+            d->aspect != (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (has_stencil(d->fmt) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) ||
+            !(d->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) || d->native_upload_pending ||
+            (d->samples != 1 && d->samples != 2 && d->samples != 4 && d->samples != 8) ||
+            (f->depth.kind != 1 && f->depth.kind != 2) || d->sampled != (f->depth.kind == 1) || (d->sampled && (d->samples != 1 || !d->view || d->view_levels != 1 || !(d->usage & VK_IMAGE_USAGE_SAMPLED_BIT))))) return 0;
+  if ((!c && f->color.kind) || (!d && (f->depth.kind || f->stencil.kind))) return 0;
+  t->color = c; t->depth = d;
+  if (f->color.samples) {
+    vimg *m = f->ms;
+    if (!c || c->samples != 1 || f->color.kind != 1 || !c->view ||
+        (f->color.samples != 2 && f->color.samples != 4 && f->color.samples != 8) ||
+        !m || !m->img || !m->uid || !m->att || !m->implicit || !m->transient || m->sampled || m->levels != 1 || m->layers != 1 ||
+        m->aspect != VK_IMAGE_ASPECT_COLOR_BIT || m->fmt != c->fmt || m->w != c->w || m->h != c->h ||
+        m->samples != f->color.samples || m->usage != (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) return 0;
+    t->color = m; t->resolve = c;
+  } else if (f->ms) return 0;
+  t->w = c ? c->w : d->w; t->h = c ? c->h : d->h;
+  if (t->w <= 0 || t->h <= 0 || (c && d && (c->w != d->w || c->h != d->h || t->color->samples != d->samples))) return 0;
+  t->compat = native_compat_id(c ? c->fmt : VK_FORMAT_UNDEFINED, d ? d->fmt : VK_FORMAT_UNDEFINED,
+                               t->color ? t->color->samples : d->samples, t->resolve != NULL);
+  return t->compat >= 0;
+}
+
 /* the target of framebuffer name as a pass's (0 if it can't be drawn to) */
 static int fb_target(GLuint name, vop *t) {
   memset(t, 0, sizeof *t);
@@ -2352,6 +2941,7 @@ static int fb_target(GLuint name, vop *t) {
   } else {
     vfbo *f = fbo_get(name);
     if (!f) return 0;
+    if (f->native) return native_fb_target(f, t);
     vimg *c = att_image(&f->color), *d = att_image(&f->depth);
     if ((f->color.kind && !c) || (f->depth.kind && !d) || (!c && !d)) return 0;
     if (c && f->color.samples) { /* rendered multisampled into the texture */
@@ -2394,6 +2984,8 @@ static vop *open_pass(vctx *c) {
 
 static int D_warm_compat = -1; /* the scene's framebuffer kind, for the loading's first draws */
 static uint64_t frame_draws;
+/* Kept separately: a mixed frame must never be reported as native-complete. */
+static uint64_t compat_draw_count;
 
 /* GL's viewport or scissor box as Vulkan's (rows from the top on the screen) */
 static void box_vk(const GLint *b, const vop *o, int *out) {
@@ -2575,6 +3167,7 @@ static void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const vo
       dk.v[i] = p->samp_cube[i] ? dummycube->view : dummy2d->view;
       dk.s[i] = dummy_sampler;
     }
+    if (!dk.s[i]) { set_err(GL_INVALID_OPERATION); return; }
   }
   GROW(items, n_items, cap_items);
   vitem *it = &items[n_items++];
@@ -2609,7 +3202,17 @@ static void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const vo
   it->first = (uint32_t)first;
   o->n = n_items - o->first;
   frame_draws++;
+  __atomic_add_fetch(&compat_draw_count, 1, __ATOMIC_RELAXED);
 }
+
+/* Independent packet entry, reusing only the low-level Vulkan executor. */
+#include "native_vk.inc"
+#include "native_vk_upload.inc"
+#include "native_vk_resources.inc"
+#include "native_vk_objects.inc"
+#include "native_vk_images.inc"
+#include "native_vk_mipmap.inc"
+#include "native_vk_targets.inc"
 
 void vkgl_glDrawArrays(GLenum mode, GLint first, GLsizei count) { draw(mode, first, count, 0, NULL, 0); }
 void vkgl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
@@ -2705,11 +3308,25 @@ void vkgl_glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx
  * stored only as what comes after needs ---- */
 
 static int S_waited, S_out_of_date;
+/* A frame fence does not prove WSI has consumed a presentation wait. Native
+ * presentation semaphores belong to swapchain images, reused only after that
+ * image is acquired again and the submit waits its acquire semaphore. */
+static VkSemaphore *native_present_wait;
+static uint32_t native_present_count;
+#include "native_vk_present.inc"
+static VkSemaphore backend_render_semaphore(void) {
+  if (!platform_native_profile) return F->render_done;
+  if (!native_present_wait || S.cur >= native_present_count || !native_present_wait[S.cur]) {
+    logf_("missing native presentation semaphore"); abort();
+  }
+  return native_present_wait[S.cur];
+}
 
 static vimg *real(vimg *im) { return im == &SCREEN ? (S.acquired ? S.img[S.cur] : NULL) : im; }
 
 static int acquire(void) {
   if (S.acquired) return 1;
+  if (platform_native_profile && (!D.dev || !F || !S.img || S.w <= 0 || S.h <= 0 || (!S.headless && !S.chain))) return 0;
   if (!S.n) return 0;
   if (S.headless) {
     S.cur = 0;
@@ -2718,11 +3335,18 @@ static int acquire(void) {
   }
   VkResult r = vkAcquireNextImageKHR(D.dev, S.chain, UINT64_MAX, F->acquire, VK_NULL_HANDLE, &S.cur);
   if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+    if (platform_native_profile && r != VK_ERROR_OUT_OF_DATE_KHR && r != VK_ERROR_SURFACE_LOST_KHR) {
+      logf_("native acquire unavailable: %d", r); abort();
+    }
     S_out_of_date = 1;
     return 0;
   }
   /* (suboptimal goes on: Android says so of a swapchain not turned as the screen is, which the
    * compositor turns, as it did GL's) */
+  if (platform_native_profile && S.cur >= S.n) { logf_("invalid acquired image index"); abort(); }
+  native_present_image_reuse(S.cur);
+  /* SUBOPTIMAL acquired a usable image; persistent Android rotation must not
+   * invalidate the surface every frame. Real acquire errors above stay stale. */
   S.acquired = 1;
   S_waited = 0;
   S.img[S.cur]->in_rest = 0;
@@ -2886,7 +3510,7 @@ static void replay_blit(VkCommandBuffer cmd, vop *o) {
   VkImageLayout sl = s->in_rest ? s->rest : VK_IMAGE_LAYOUT_UNDEFINED, dl = d->in_rest ? d->rest : VK_IMAGE_LAYOUT_UNDEFINED;
   barrier(cmd, s, 0, 1, 0, 1, sl, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
   barrier(cmd, d, 0, 1, 0, 1, dl, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-  VkImageAspectFlags a = is_depth(s->fmt) ? s->aspect & d->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
+  VkImageAspectFlags a = o->copy_aspects ? o->copy_aspects : is_depth(s->fmt) ? s->aspect & d->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
   if (o->resolve_blit) {
     int x = o->s[0] < o->s[2] ? o->s[0] : o->s[2], y = o->s[1] < o->s[3] ? o->s[1] : o->s[3];
     int w = abs(o->s[2] - o->s[0]), h = abs(o->s[3] - o->s[1]);
@@ -2928,19 +3552,19 @@ static void replay(VkCommandBuffer cmd, int final) {
 static void frame_begin(void) {
   F = &FR[D.serial % FRAMES];
   if (F->submitted) {
-    VKCHECK(vkWaitForFences(D.dev, 1, &F->fence, VK_TRUE, UINT64_MAX));
-    VKCHECK(vkResetFences(D.dev, 1, &F->fence));
+    PLATFORM_CHECK(vkWaitForFences(D.dev, 1, &F->fence, VK_TRUE, UINT64_MAX));
+    PLATFORM_CHECK(vkResetFences(D.dev, 1, &F->fence));
     F->submitted = 0;
   }
   if (D.serial > FRAMES && D.done < D.serial - FRAMES) __atomic_store_n(&D.done, D.serial - FRAMES, __ATOMIC_RELEASE);
   dead_free(done_serial());
-  VKCHECK(vkResetCommandPool(D.dev, F->pool, 0));
-  VKCHECK(vkResetCommandPool(D.dev, F->up.pool, 0));
+  PLATFORM_CHECK(vkResetCommandPool(D.dev, F->pool, 0));
+  PLATFORM_CHECK(vkResetCommandPool(D.dev, F->up.pool, 0));
   F->open = F->up.open = 0;
   ring_reset(&F->up.stage);
   ring_reset(&F->ubo);
   ring_reset(&F->vtx);
-  for (size_t i = 0; i < F->n_dpool; ++i) VKCHECK(vkResetDescriptorPool(D.dev, F->dpool[i], 0));
+  for (size_t i = 0; i < F->n_dpool; ++i) PLATFORM_CHECK(vkResetDescriptorPool(D.dev, F->dpool[i], 0));
   F->dpool_i = 0;
 }
 
@@ -2950,20 +3574,21 @@ static void flush(int final, int present) {
   VkCommandBuffer cmds[2];
   uint32_t n = 0;
   if (F->up.open) {
-    VKCHECK(vkEndCommandBuffer(F->up.cmd));
+    PLATFORM_CHECK(vkEndCommandBuffer(F->up.cmd));
     F->up.open = 0;
     cmds[n++] = F->up.cmd;
   }
   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  VKCHECK(vkBeginCommandBuffer(F->cmd, &bi));
+  PLATFORM_CHECK(vkBeginCommandBuffer(F->cmd, &bi));
   replay(F->cmd, final);
-  VKCHECK(vkEndCommandBuffer(F->cmd));
+  PLATFORM_CHECK(vkEndCommandBuffer(F->cmd));
   cmds[n++] = F->cmd;
   VkSemaphore wait = VK_NULL_HANDLE, signal = VK_NULL_HANDLE;
   if (S.acquired && !S.headless && !S_waited) wait = F->acquire, S_waited = 1;
-  if (present && S.acquired && !S.headless) signal = F->render_done;
-  submit(cmds, n, wait, signal, F->fence);
+  if (present && S.acquired && !S.headless) signal = backend_render_semaphore();
+  VkResult queued = submit(cmds, n, wait, signal, F->fence);
+  if (platform_native_profile && queued != VK_SUCCESS) abort();
   F->submitted = 1;
   n_ops = n_items = n_vb = 0;
 }
@@ -2971,28 +3596,63 @@ static void flush(int final, int present) {
 /* (a glFinish, a glReadPixels: all of it done before going on) */
 static void flush_wait(void) {
   flush(0, 0);
-  VKCHECK(vkWaitForFences(D.dev, 1, &F->fence, VK_TRUE, UINT64_MAX));
-  VKCHECK(vkResetFences(D.dev, 1, &F->fence));
+  PLATFORM_CHECK(vkWaitForFences(D.dev, 1, &F->fence, VK_TRUE, UINT64_MAX));
+  PLATFORM_CHECK(vkResetFences(D.dev, 1, &F->fence));
   F->submitted = 0;
   if (D.done < D.serial - 1) __atomic_store_n(&D.done, D.serial - 1, __ATOMIC_RELEASE);
-  VKCHECK(vkResetCommandPool(D.dev, F->pool, 0));
-  VKCHECK(vkResetCommandPool(D.dev, F->up.pool, 0));
+  PLATFORM_CHECK(vkResetCommandPool(D.dev, F->pool, 0));
+  PLATFORM_CHECK(vkResetCommandPool(D.dev, F->up.pool, 0));
   ring_reset(&F->up.stage);
 }
 
-int vkgl_present(void) {
+/* Native stream ownership is explicit and independent of compatibility ctx().
+ * Main submission/fence error handling retains the shared process-fatal policy;
+ * loader_flush already reports unknown completion by preserving its leases. */
+int cinder_vk_flush(void) {
+  if (!D.dev || native_loader_failed || cinder_vk_error_epoch() == UINT64_MAX) return native_reject();
+  if (native_upload_stream == CINDER_VK_UPLOAD_LOADER) {
+    loader_flush();
+    return !native_loader_failed;
+  }
+  if (native_upload_stream != CINDER_VK_UPLOAD_FRAME || !F) return native_reject();
+  return 1; /* main commands are submitted at presentation or explicit finish */
+}
+int cinder_vk_finish(void) {
+  if (!D.dev || native_loader_failed || cinder_vk_error_epoch() == UINT64_MAX) return native_reject();
+  if (native_upload_stream == CINDER_VK_UPLOAD_LOADER) {
+    loader_flush();
+    return !native_loader_failed;
+  }
+  if (native_upload_stream != CINDER_VK_UPLOAD_FRAME || !F) return native_reject();
+  flush_wait();
+  return 1;
+}
+int cinder_vk_error_pending(void) {
+  return native_loader_failed || cinder_vk_error_epoch() == UINT64_MAX;
+}
+
+static int backend_present(void) {
   flush(1, 1);
   int r = 0;
   if (S.acquired && !S.headless) {
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &F->render_done;
+    VkSemaphore render_done = backend_render_semaphore();
+    pi.pWaitSemaphores = &render_done;
     pi.swapchainCount = 1;
     pi.pSwapchains = &S.chain;
     pi.pImageIndices = &S.cur;
+    VkSwapchainPresentFenceInfoEXT fence_info;
+    VkResult image_result = (VkResult)INT32_MIN;
+    int fenced = native_present_attach(&pi, &fence_info, &image_result);
     pthread_mutex_lock(&D.qlock);
     VkResult pr = vkQueuePresentKHR(D.q, &pi);
     pthread_mutex_unlock(&D.qlock);
+    if (fenced) native_present_result(pr, image_result);
+    if (platform_native_profile && pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR &&
+        pr != VK_ERROR_OUT_OF_DATE_KHR && pr != VK_ERROR_SURFACE_LOST_KHR) {
+      logf_("native present unavailable: %d", pr); abort();
+    }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR) r = 1;
     else if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) r = -1;
   }
@@ -3004,10 +3664,17 @@ int vkgl_present(void) {
   return r;
 }
 
+int vkgl_present(void) { return backend_present(); }
+
 /* ---- the screen ---- */
 
 static void screen_free(void) {
-  vkDeviceWaitIdle(D.dev);
+  /* PRESENT fences, not submission fences/device idle, authorize strict WSI
+   * resource retirement. Complete all pending presentations before any view,
+   * swapchain, semaphore or surface owner can be destroyed. */
+  native_present_retire_all();
+  VkResult idle = vkDeviceWaitIdle(D.dev);
+  if (platform_native_profile && idle != VK_SUCCESS) { logf_("surface wait idle failed: %d", idle); abort(); }
   for (uint32_t i = 0; i < S.n; ++i) {
     if (S.img[i]->att) fb_cache_forget(S.img[i]->att);
     if (S.img[i]->swapchain) {
@@ -3029,7 +3696,7 @@ static void screen_free(void) {
 
 void vkgl_screen_size(int *w, int *h) { *w = S.w, *h = S.h; }
 
-int vkgl_surface(VkSurfaceKHR surface, int w, int h) {
+static int backend_surface(VkSurfaceKHR surface, int w, int h, int strict, int (*screen_target)(vop *)) {
   if (n_ops) flush_wait(); /* (what was drawn for the old one) */
   VkSwapchainKHR old = S.chain;
   screen_free();
@@ -3049,23 +3716,40 @@ int vkgl_surface(VkSurfaceKHR surface, int w, int h) {
     S.samples = getenv("VKGL_SCREEN_MSAA") ? atoi(getenv("VKGL_SCREEN_MSAA")) : 1;
   } else {
     VkBool32 ok = VK_FALSE;
-    vkGetPhysicalDeviceSurfaceSupportKHR(D.pd, D.qfam, surface, &ok);
+    VkResult support = vkGetPhysicalDeviceSurfaceSupportKHR(D.pd, D.qfam, surface, &ok);
+    if (strict && support != VK_SUCCESS) return -1;
     if (!ok) {
       logf_("the queue can't present to this surface");
       return -1;
     }
     VkSurfaceCapabilitiesKHR caps;
-    VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(D.pd, surface, &caps));
+    VkResult capability = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(D.pd, surface, &caps);
+    VKCHECK(capability);
+    if (strict && capability != VK_SUCCESS) return -1;
     uint32_t nf = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(D.pd, surface, &nf, NULL);
+    VkResult formats = vkGetPhysicalDeviceSurfaceFormatsKHR(D.pd, surface, &nf, NULL);
+    if (strict && (formats != VK_SUCCESS || !nf || nf > 65536)) return -1;
+    uint32_t format_capacity = nf;
     VkSurfaceFormatKHR *fs = xcalloc(nf, sizeof *fs);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(D.pd, surface, &nf, fs);
+    formats = vkGetPhysicalDeviceSurfaceFormatsKHR(D.pd, surface, &nf, fs);
+    if (strict && (formats != VK_SUCCESS || !nf || nf > format_capacity)) { free(fs); return -1; }
     VkSurfaceFormatKHR sf = fs[0];
     for (uint32_t i = 0; i < nf; ++i)
       if (fs[i].format == VK_FORMAT_R8G8B8A8_UNORM || (fs[i].format == VK_FORMAT_B8G8R8A8_UNORM && sf.format != VK_FORMAT_R8G8B8A8_UNORM))
         sf = fs[i];
     free(fs);
     if (caps.currentExtent.width != 0xffffffffu) w = (int)caps.currentExtent.width, h = (int)caps.currentExtent.height;
+    if (strict) {
+      if (w <= 0 || h <= 0 || !(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return -1;
+      if (caps.currentExtent.width == UINT32_MAX) {
+        if ((uint32_t)w < caps.minImageExtent.width) w = (int)caps.minImageExtent.width;
+        if ((uint32_t)h < caps.minImageExtent.height) h = (int)caps.minImageExtent.height;
+        if ((uint32_t)w > caps.maxImageExtent.width) w = (int)caps.maxImageExtent.width;
+        if ((uint32_t)h > caps.maxImageExtent.height) h = (int)caps.maxImageExtent.height;
+      }
+      if (w <= 0 || h <= 0 || (uint32_t)w > D.props.limits.maxImageDimension2D ||
+          (uint32_t)h > D.props.limits.maxImageDimension2D) return -1;
+    }
     uint32_t count = caps.minImageCount < 3 ? 3 : caps.minImageCount;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     VkSwapchainCreateInfoKHR ci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
@@ -3095,9 +3779,12 @@ int vkgl_surface(VkSurfaceKHR surface, int w, int h) {
     }
     S.fmt = sf.format;
     uint32_t n = 0;
-    vkGetSwapchainImagesKHR(D.dev, S.chain, &n, NULL);
+    VkResult images = vkGetSwapchainImagesKHR(D.dev, S.chain, &n, NULL);
+    if (strict && (images != VK_SUCCESS || !n || n > 65536)) return -1;
+    uint32_t image_capacity = n;
     VkImage *imgs = xcalloc(n, sizeof *imgs);
-    vkGetSwapchainImagesKHR(D.dev, S.chain, &n, imgs);
+    images = vkGetSwapchainImagesKHR(D.dev, S.chain, &n, imgs);
+    if (strict && (images != VK_SUCCESS || !n || n > image_capacity)) { free(imgs); return -1; }
     S.img = xcalloc(n, sizeof *S.img);
     for (uint32_t i = 0; i < n; ++i) {
       vimg *im = xcalloc(1, sizeof *im);
@@ -3105,12 +3792,23 @@ int vkgl_surface(VkSurfaceKHR surface, int w, int h) {
       im->mem.block = -1;
       im->fmt = S.fmt, im->w = w, im->h = h, im->levels = im->layers = im->samples = 1;
       im->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      im->usage = ci.imageUsage;
       im->swz = SWZ_ID;
       im->rest = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
       im->swapchain = 1;
-      im->uid = ++D.uid;
-      im->att = view_new(im, 0, 1);
-      S.img[i] = im;
+      im->uid = resource_uid_next();
+      if (!im->uid) { S.n = i; free(im); free(imgs); screen_free(); return -1; }
+      if (strict) {
+        /* Constructor failure is recoverable; do not enter the deep/live
+         * view_new fatal boundary or publish an undefined error output. */
+        S.img[i] = im; S.n = i + 1;
+        VkImageView attachment = VK_NULL_HANDLE;
+        if (view_try(im, 0, 1, &attachment) != VK_SUCCESS || !attachment) { free(imgs); return -1; }
+        im->att = attachment;
+      } else {
+        im->att = view_new(im, 0, 1);
+        S.img[i] = im;
+      }
     }
     free(imgs);
     S.n = n;
@@ -3121,6 +3819,7 @@ int vkgl_surface(VkSurfaceKHR surface, int w, int h) {
   if (S.samples < 1) S.samples = 1;
   S.w = w, S.h = h;
   SCREEN.fmt = S.fmt, SCREEN.w = w, SCREEN.h = h, SCREEN.samples = 1;
+  SCREEN.usage = S.n && S.img[0] ? S.img[0]->usage : 0;
   if (S.samples > 1) {
     S.ms = image_new(S.fmt, w, h, 1, 1, S.samples, 0, 1, SWZ_ID);
     if (S.ms) S.ms->implicit = 1;
@@ -3128,11 +3827,12 @@ int vkgl_surface(VkSurfaceKHR surface, int w, int h) {
   S.depth = image_new(D.fd24, w, h, 1, 1, S.ms ? S.samples : 1, 0, 1, SWZ_ID);
   if (!S.depth) return -1;
   vop t;
-  S.compat = fb_target(0, &t) ? t.compat : -1;
+  S.compat = screen_target(&t) ? t.compat : -1;
+  if (strict && S.compat < 0) return -1;
   return 0;
 }
 
-void vkgl_release_surface(void) {
+static void backend_release_surface(void) {
   if (n_ops) flush_wait();
   screen_free();
   if (S.chain) vkDestroySwapchainKHR(D.dev, S.chain, NULL);
@@ -3140,6 +3840,11 @@ void vkgl_release_surface(void) {
   if (S.surface) vkDestroySurfaceKHR(D.inst, S.surface, NULL);
   S.surface = VK_NULL_HANDLE;
 }
+
+/* Compatibility entry points keep their original projection and ownership. */
+static int compat_screen_target(vop *t) { return fb_target(0, t); }
+int vkgl_surface(VkSurfaceKHR surface, int w, int h) { return backend_surface(surface, w, h, 0, compat_screen_target); }
+void vkgl_release_surface(void) { backend_release_surface(); }
 
 /* ---- reading back, waiting ---- */
 
@@ -3232,6 +3937,12 @@ void vkgl_glGetIntegerv(GLenum p, GLint *v) {
   case GL_MAX_SAMPLES_: *v = D.max_samples; return;
   case GL_BLEND_SRC_RGB: case GL_BLEND_SRC_ALPHA: *v = (GLint)c->bsrc; return;
   case GL_BLEND_DST_RGB: case GL_BLEND_DST_ALPHA: *v = (GLint)c->bdst; return;
+  case GL_BLEND_EQUATION_RGB: case GL_BLEND_EQUATION_ALPHA: *v = (GLint)c->beq; return;
+  case GL_CULL_FACE_MODE: *v = (GLint)c->cull_face; return;
+  case GL_FRONT_FACE: *v = (GLint)c->front; return;
+  case GL_TEXTURE_BINDING_2D: *v = (GLint)c->tex2d[c->unit]; return;
+  case GL_TEXTURE_BINDING_CUBE_MAP: *v = (GLint)c->texcube[c->unit]; return;
+  case GL_ELEMENT_ARRAY_BUFFER_BINDING: *v = (GLint)cur_vao(c)->ebo; return;
   case GL_CURRENT_PROGRAM: *v = (GLint)c->prog; return;
   case GL_ARRAY_BUFFER_BINDING: *v = (GLint)c->array_buf; return;
   case GL_DEPTH_BITS: *v = 24; return;
@@ -3248,6 +3959,8 @@ void vkgl_glGetBooleanv(GLenum p, GLboolean *v) {
   if (p == GL_DEPTH_WRITEMASK) *v = (GLboolean)c->depth_write;
   else if (p == GL_SCISSOR_TEST) *v = c->scissor_test ? GL_TRUE : GL_FALSE;
   else if (p == GL_DEPTH_TEST) *v = c->depth_test ? GL_TRUE : GL_FALSE;
+  else if (p == GL_BLEND) *v = c->blend ? GL_TRUE : GL_FALSE;
+  else if (p == GL_CULL_FACE) *v = c->cull ? GL_TRUE : GL_FALSE;
   else if (p == GL_COLOR_WRITEMASK) for (int i = 0; i < 4; ++i) v[i] = (GLboolean)(c->cmask >> i & 1);
   else *v = GL_FALSE;
 }
@@ -3291,11 +4004,16 @@ void (*vkgl_get_proc(const char *name))(void) {
   return NULL;
 }
 
-void vkgl_thread_loader(void) { cur_tls = &loader_ctx; }
+void vkgl_thread_loader(void) {
+  cur_tls = &loader_ctx;
+#ifdef WMMT_NATIVE_VK
+  cinder_vk_upload_stream_set(CINDER_VK_UPLOAD_LOADER);
+#endif
+}
 
 /* ---- the pipelines kept between runs ---- */
 
-void vkgl_pipeline_cache_file(const char *path) {
+static void backend_pipeline_cache_file(const char *path) {
   snprintf(D.pcache_path, sizeof D.pcache_path, "%s", path);
   FILE *f = fopen(path, "rb");
   if (!f) return;
@@ -3307,9 +4025,12 @@ void vkgl_pipeline_cache_file(const char *path) {
     VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
     ci.initialDataSize = (size_t)n;
     ci.pInitialData = data;
-    VkPipelineCache pc;
-    if (vkCreatePipelineCache(D.dev, &ci, NULL, &pc) == VK_SUCCESS) {
-      vkMergePipelineCaches(D.dev, pc, 1, &D.pcache);
+    VkPipelineCache pc = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(D.dev, &ci, NULL, &pc) == VK_SUCCESS && (!platform_native_profile || pc)) {
+      /* Without privateData, distinct creations may share the same value.
+       * Self-merge is invalid, but the old creation still owns one reference. */
+      if (!platform_native_profile || (D.pcache && pc != D.pcache))
+        vkMergePipelineCaches(D.dev, pc, 1, &D.pcache);
       vkDestroyPipelineCache(D.dev, D.pcache, NULL);
       D.pcache = pc;
       logf_("pipeline cache: %ld bytes from %s", n, path);
@@ -3319,7 +4040,7 @@ void vkgl_pipeline_cache_file(const char *path) {
   fclose(f);
 }
 
-void vkgl_pipeline_cache_save(void) {
+static void backend_pipeline_cache_save(void) {
   if (!D.pcache_path[0]) return;
   size_t n = 0;
   if (vkGetPipelineCacheData(D.dev, D.pcache, &n, NULL) != VK_SUCCESS || !n) return;
@@ -3337,6 +4058,9 @@ void vkgl_pipeline_cache_save(void) {
   free(data);
 }
 
+void vkgl_pipeline_cache_file(const char *path) { backend_pipeline_cache_file(path); }
+void vkgl_pipeline_cache_save(void) { backend_pipeline_cache_save(); }
+
 /* ---- the start ---- */
 
 VkInstance vkgl_instance(void) { return D.inst; }
@@ -3347,17 +4071,44 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
   return 0;
 }
 
-static vimg *dummy_image(int layers) {
+/* Descriptor fallbacks are real images, uploaded through an explicit frame
+ * uploader. Reserve every byte before recording. Initialization failures after
+ * commands/device creation retain the backend's fatal policy, never fake handles. */
+static vimg *backend_dummy_image(uploader *u, int layers) {
   vimg *im = image_new(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, layers, 1, 1, 0, SWZ_ID);
-  image_settle(im);
-  static const uint8_t black[4] = { 0, 0, 0, 255 };
-  tfmt f = { VK_FORMAT_R8G8B8A8_UNORM, SWZ_ID, CONV_COPY, 4, 4 };
-  for (int i = 0; i < layers; ++i) image_upload(im, 0, i, 1, 1, &f, black, 0, 4);
+  if (!im) return NULL;
+  size_t old_i = u->stage.i;
+  VkDeviceSize old_used = u->stage.used, offset = 0;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  uint8_t *dst = native_ring_alloc(&u->stage, (VkDeviceSize)layers * 4, 16, &buffer, &offset);
+  VkCommandBuffer cmd = dst && buffer ? native_up_cmd(u) : VK_NULL_HANDLE;
+  if (!cmd) {
+    u->stage.i = old_i; u->stage.used = old_used;
+    image_free_now(im);
+    return NULL;
+  }
+  for (int i = 0; i < layers; ++i) { dst[4*i] = dst[4*i+1] = dst[4*i+2] = 0; dst[4*i+3] = 255; }
+  barrier(cmd, im, 0, 1, 0, layers, VK_IMAGE_LAYOUT_UNDEFINED, im->rest);
+  for (int i = 0; i < layers; ++i) image_upload_record(cmd, im, 0, i, 1, 1, buffer, offset + 4*(VkDeviceSize)i);
+  im->in_rest = im->defined = 1;
   im->level_mask = 1;
+  im->serial = D.serial;
   return im;
 }
 
-int vkgl_create(const char *const *inst_ext, int n_ext) {
+static const char *compat_platform_init(void) {
+  ctx_init(&main_ctx, 0);
+  ctx_init(&loader_ctx, 1);
+  snprintf(D.renderer, sizeof D.renderer, "vkgl on %s (Vulkan %u.%u.%u)", D.props.deviceName,
+           VK_VERSION_MAJOR(D.props.apiVersion), VK_VERSION_MINOR(D.props.apiVersion), VK_VERSION_PATCH(D.props.apiVersion));
+  snprintf(D.extensions, sizeof D.extensions,
+           "GL_OES_vertex_array_object GL_EXT_discard_framebuffer GL_EXT_multisampled_render_to_texture%s%s",
+           D.aniso ? " GL_EXT_texture_filter_anisotropic" : "", D.astc ? " GL_KHR_texture_compression_astc_ldr" : "");
+  return D.renderer;
+}
+
+/* Device/queue/layout/frame allocation is shared; no GL state is consulted. */
+static int backend_create(const char *const *inst_ext, int n_ext, const char *(*compat_init)(void)) {
   pthread_mutex_init(&D.lock, NULL);
   pthread_mutex_init(&D.qlock, NULL);
   pthread_mutex_init(&D.plock, NULL);
@@ -3368,27 +4119,38 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
   ici.pApplicationInfo = &app;
   ici.enabledExtensionCount = (uint32_t)n_ext;
   ici.ppEnabledExtensionNames = inst_ext;
+  const char **optional_instance_extensions = platform_native_profile ? native_present_instance_prepare(&ici) : NULL;
   const char *layer = "VK_LAYER_KHRONOS_validation";
   if (getenv("VKGL_VALIDATE")) ici.enabledLayerCount = 1, ici.ppEnabledLayerNames = &layer;
   VkResult r = vkCreateInstance(&ici, NULL, &D.inst);
+  if (platform_native_profile && r == VK_SUCCESS && !D.inst) r = VK_ERROR_INITIALIZATION_FAILED;
+  free(optional_instance_extensions);
+  if (platform_native_profile) native_present_instance_created(r);
   if (r != VK_SUCCESS) {
     logf_("no Vulkan instance: %d", r);
     return -1;
   }
   uint32_t n = 0;
-  vkEnumeratePhysicalDevices(D.inst, &n, NULL);
+  r = vkEnumeratePhysicalDevices(D.inst, &n, NULL);
+  if (platform_native_profile && (r != VK_SUCCESS || n > 1024)) goto native_instance_fail;
   if (!n) {
     logf_("no Vulkan device");
+    if (platform_native_profile) { vkDestroyInstance(D.inst, NULL); D.inst = VK_NULL_HANDLE; }
     return -1;
   }
+  uint32_t pd_capacity = n;
   VkPhysicalDevice *pds = xcalloc(n, sizeof *pds);
-  vkEnumeratePhysicalDevices(D.inst, &n, pds);
+  r = vkEnumeratePhysicalDevices(D.inst, &n, pds);
+  if (platform_native_profile && (r != VK_SUCCESS || !n || n > pd_capacity)) { free(pds); goto native_instance_fail; }
   D.pd = VK_NULL_HANDLE;
   for (uint32_t i = 0; i < n && !D.pd; ++i) {
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, NULL);
+    if (platform_native_profile && (!nq || nq > 4096)) continue;
+    uint32_t queue_capacity = nq;
     VkQueueFamilyProperties *qs = xcalloc(nq, sizeof *qs);
     vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, qs);
+    if (platform_native_profile && nq > queue_capacity) { free(qs); continue; }
     for (uint32_t q = 0; q < nq; ++q)
       if (qs[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
         D.pd = pds[i], D.qfam = q;
@@ -3399,6 +4161,7 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
   free(pds);
   if (!D.pd) {
     logf_("no Vulkan device that draws");
+    if (platform_native_profile) { vkDestroyInstance(D.inst, NULL); D.inst = VK_NULL_HANDLE; }
     return -1;
   }
   vkGetPhysicalDeviceProperties(D.pd, &D.props);
@@ -3410,13 +4173,20 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
   D.astc = want.textureCompressionASTC_LDR = have.textureCompressionASTC_LDR;
   D.max_aniso = D.props.limits.maxSamplerAnisotropy;
   uint32_t ne = 0;
-  vkEnumerateDeviceExtensionProperties(D.pd, NULL, &ne, NULL);
+  r = vkEnumerateDeviceExtensionProperties(D.pd, NULL, &ne, NULL);
+  if (platform_native_profile && (r != VK_SUCCESS || ne > 65536)) goto native_instance_fail;
+  uint32_t extension_capacity = ne;
   VkExtensionProperties *ext = xcalloc(ne, sizeof *ext);
-  vkEnumerateDeviceExtensionProperties(D.pd, NULL, &ne, ext);
-  const char *dext[1];
+  r = vkEnumerateDeviceExtensionProperties(D.pd, NULL, &ne, ext);
+  if (platform_native_profile && (r != VK_SUCCESS || ne > extension_capacity)) { free(ext); goto native_instance_fail; }
+  const char *dext[2];
   uint32_t nd = 0;
   if (n_ext && (D.swapchain_ext = has_ext(ext, ne, VK_KHR_SWAPCHAIN_EXTENSION_NAME))) dext[nd++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+  VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT };
+  const char *maintenance_extension = platform_native_profile ? native_present_device_prepare(ext, ne, &maintenance) : NULL;
+  if (maintenance_extension) dext[nd++] = maintenance_extension;
   free(ext);
+  if (platform_native_profile && n_ext && !D.swapchain_ext) goto native_instance_fail;
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
   qi.queueFamilyIndex = D.qfam;
@@ -3428,8 +4198,13 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
   dci.enabledExtensionCount = nd;
   dci.ppEnabledExtensionNames = dext;
   dci.pEnabledFeatures = &want;
-  if ((r = vkCreateDevice(D.pd, &dci, NULL, &D.dev)) != VK_SUCCESS) {
+  if (maintenance_extension) dci.pNext = &maintenance;
+  r = vkCreateDevice(D.pd, &dci, NULL, &D.dev);
+  if (platform_native_profile && r == VK_SUCCESS && !D.dev) r = VK_ERROR_INITIALIZATION_FAILED;
+  if (platform_native_profile) native_present_device_created(r);
+  if (r != VK_SUCCESS) {
     logf_("no Vulkan device made: %d", r);
+    if (platform_native_profile) { vkDestroyInstance(D.inst, NULL); D.inst = VK_NULL_HANDLE; D.dev = VK_NULL_HANDLE; }
     return -1;
   }
   vkGetDeviceQueue(D.dev, D.qfam, 0, &D.q);
@@ -3455,7 +4230,7 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
     else logf_("vertex format %d: none", VFMT[i]);
   }
   VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-  VKCHECK(vkCreatePipelineCache(D.dev, &pci, NULL, &D.pcache));
+  PLATFORM_CHECK(vkCreatePipelineCache(D.dev, &pci, NULL, &D.pcache));
   for (int k = 0; k <= MAX_SAMP; ++k) {
     VkDescriptorSetLayoutBinding b[MAX_SAMP + 1];
     for (int i = 0; i <= k; ++i)
@@ -3466,45 +4241,40 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
     VkDescriptorSetLayoutCreateInfo li = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     li.bindingCount = (uint32_t)k + 1;
     li.pBindings = b;
-    VKCHECK(vkCreateDescriptorSetLayout(D.dev, &li, NULL, &dsl[k]));
+    PLATFORM_CHECK(vkCreateDescriptorSetLayout(D.dev, &li, NULL, &dsl[k]));
     VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &dsl[k];
-    VKCHECK(vkCreatePipelineLayout(D.dev, &pl, NULL, &playout[k]));
+    PLATFORM_CHECK(vkCreatePipelineLayout(D.dev, &pl, NULL, &playout[k]));
   }
   for (int i = 0; i < FRAMES; ++i) {
     vframe *f = &FR[i];
     VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     pi.queueFamilyIndex = D.qfam;
-    VKCHECK(vkCreateCommandPool(D.dev, &pi, NULL, &f->pool));
+    PLATFORM_CHECK(vkCreateCommandPool(D.dev, &pi, NULL, &f->pool));
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, f->pool,
                                        VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
-    VKCHECK(vkAllocateCommandBuffers(D.dev, &ai, &f->cmd));
+    PLATFORM_CHECK(vkAllocateCommandBuffers(D.dev, &ai, &f->cmd));
     VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VKCHECK(vkCreateFence(D.dev, &fi, NULL, &f->fence));
+    PLATFORM_CHECK(vkCreateFence(D.dev, &fi, NULL, &f->fence));
     VkSemaphoreCreateInfo si = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    VKCHECK(vkCreateSemaphore(D.dev, &si, NULL, &f->acquire));
-    VKCHECK(vkCreateSemaphore(D.dev, &si, NULL, &f->render_done));
+    PLATFORM_CHECK(vkCreateSemaphore(D.dev, &si, NULL, &f->acquire));
+    PLATFORM_CHECK(vkCreateSemaphore(D.dev, &si, NULL, &f->render_done));
     uploader_init(&f->up);
     f->ubo.chunk = 4 << 20, f->ubo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     f->vtx.chunk = 8 << 20, f->vtx.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
   }
   uploader_init(&LOADER_UP);
-  ctx_init(&main_ctx, 0);
-  ctx_init(&loader_ctx, 1);
-  snprintf(D.renderer, sizeof D.renderer, "vkgl on %s (Vulkan %u.%u.%u)", D.props.deviceName,
-           VK_VERSION_MAJOR(D.props.apiVersion), VK_VERSION_MINOR(D.props.apiVersion), VK_VERSION_PATCH(D.props.apiVersion));
-  snprintf(D.extensions, sizeof D.extensions,
-           "GL_OES_vertex_array_object GL_EXT_discard_framebuffer GL_EXT_multisampled_render_to_texture%s%s",
-           D.aniso ? " GL_EXT_texture_filter_anisotropic" : "", D.astc ? " GL_KHR_texture_compression_astc_ldr" : "");
+  const char *device_label = compat_init ? compat_init() : D.props.deviceName;
   D.serial = 1;
   frame_begin();
-  dummy2d = dummy_image(1);
-  dummycube = dummy_image(6);
+  dummy2d = backend_dummy_image(&F->up, 1);
+  dummycube = backend_dummy_image(&F->up, 6);
+  if (!dummy2d || !dummycube) { logf_("no descriptor fallback upload"); abort(); }
   VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
   si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  VKCHECK(vkCreateSampler(D.dev, &si, NULL, &dummy_sampler));
+  PLATFORM_CHECK(vkCreateSampler(D.dev, &si, NULL, &dummy_sampler));
   const VkPhysicalDeviceLimits *L = &D.props.limits;
   logf_("limits: samplers %u per stage (%u in a set), sampled images %u, uniform buffers dynamic %u, vertex out %u, fragment in %u, driver %u",
         L->maxPerStageDescriptorSamplers, L->maxDescriptorSetSamplers, L->maxPerStageDescriptorSampledImages,
@@ -3513,8 +4283,17 @@ int vkgl_create(const char *const *inst_ext, int n_ext) {
   logf_("B10G11R11 features 0x%x, A2B10G10R10 0x%x", (unsigned)fmt_props(VK_FORMAT_B10G11R11_UFLOAT_PACK32).optimalTilingFeatures,
         (unsigned)fmt_props(VK_FORMAT_A2B10G10R10_UNORM_PACK32).optimalTilingFeatures);
   logf_("%s; ASTC %s, anisotropy %s (%.0f), MSAA up to %d, 4444 %d, 5551 %d, R11G11B10 %s, D24S8 %s, lazy memory %s",
-        D.renderer, D.astc ? "yes" : "no", D.aniso ? "yes" : "no", D.max_aniso, D.max_samples, D.f4444, D.f5551,
+        device_label, D.astc ? "yes" : "no", D.aniso ? "yes" : "no", D.max_aniso, D.max_samples, D.f4444, D.f5551,
         D.f11 == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? "yes" : "no", D.fd24 == VK_FORMAT_D24_UNORM_S8_UINT ? "yes" : "no",
         D.lazy_type != ~0u ? "yes" : "no");
   return 0;
+native_instance_fail:
+  logf_("native device/extension enumeration unavailable");
+  if (D.inst) vkDestroyInstance(D.inst, NULL);
+  D.inst = VK_NULL_HANDLE; D.pd = VK_NULL_HANDLE;
+  return -1;
 }
+
+int vkgl_create(const char *const *inst_ext, int n_ext) { return backend_create(inst_ext, n_ext, compat_platform_init); }
+
+#include "native_vk_platform.inc"

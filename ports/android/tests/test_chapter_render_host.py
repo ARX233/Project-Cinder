@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-WORK = Path(tempfile.gettempdir())
+WORK = Path("/Volumes/CodexWork")
 
 def block(text, marker):
     start = text.index(marker)
@@ -23,7 +23,7 @@ class ChapterRenderHost(unittest.TestCase):
     def test_render_and_click(self):
         cc = shutil.which("clang") or shutil.which("cc")
         if not cc or not WORK.is_dir():
-            self.skipTest("host compiler or temporary directory unavailable")
+            self.skipTest("host compiler or /Volumes/CodexWork unavailable")
         text = (SRC / "menu.c").read_text()
         start = text.index("static const float CH_KEY[4]")
         constants = text[start:text.index("static int ch_hit(", start)]

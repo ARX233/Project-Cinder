@@ -15,8 +15,8 @@ class FinishTest(unittest.TestCase):
     def test_production_decision(self):
         text = (ROOT/'src/hud.c').read_text()
         fn = re.search(r'int hud_finish_result\(.*?\n\}', text, re.S).group()
-        program = '''#include <math.h>\n#include <assert.h>\n#include "car.h"\n'''+fn+'''\nstatic int legacy(const car_race *r,int s,int n,int t,int v) { int behind; int m=hud_finish_result(r,s,n,0,t,v,&behind); return m<0 ? -1 : behind ? -2 : m; }
-static int masked(const car_race *r,int n,unsigned mask) { int behind; int m=hud_finish_result(r,1,n,mask,0,0,&behind); return m<0 ? -1 : behind ? -2 : m; }
+        program = '''#include <math.h>\n#include <assert.h>\n#include "car.h"\n'''+fn+'''\nstatic int legacy(const car_race *r,int s,int n,int t,int v) { int behind; int m=hud_finish_result(r,s,n,0,t,v,0,&behind); return m<0 ? -1 : behind ? -2 : m; }
+static int masked(const car_race *r,int n,unsigned mask) { int behind; int m=hud_finish_result(r,1,n,mask,0,0,0,&behind); return m<0 ? -1 : behind ? -2 : m; }
 int main(void) {
           car_race r={0}; r.play_state=2; r.remain_valid=1; r.remain=600;
           assert(hud_finish_result(&r,0,0,0,0)==600);
@@ -91,6 +91,7 @@ int main(void) {
         program='''#include <math.h>\n#include <assert.h>\n#include <string.h>\n#include "car.h"
 typedef struct { int from,to; } anm_swap;
 static int ta_story,story_n,story_sel=-1,story_series=-1,story_ranking_slots_valid=1,story_chara[3],ten_level=-1,vs_n,live=1,prompt,number,label,available=1,last_digits;
+static struct { int bound; float gap_mm; } ghost_rival;
 int car_link_observation_fresh(int pcb,double observed) { return live; }
 int anm_find(const char *s) { if(!available)return -1; return strstr(s,"tonikaku")?3:strstr(s,"000m")?1:2; }
 int anm_frames(int a) { return a==1?200:60; }
@@ -146,6 +147,15 @@ void anm_draw_ex(int a,int f,float x,float y,float z,const anm_swap *sw,int n) {
  story_series=61; draw_finish_remaining(&r); assert(number==21);
  ta_story=0; ten_level=0; r.remain=720; r.ten_gap_valid=1; r.ten_gap=-120;
  draw_finish_remaining(&r); assert(prompt==7 && number==22 && last_digits==600);
+ ta_story=1; ten_level=-1; story_ranking_slots_valid=0; ghost_rival.bound=1;
+ ghost_rival.gap_mm=-120000.0f;
+ draw_finish_remaining(&r); assert(prompt==8 && number==23 && last_digits==600);
+ ghost_rival.gap_mm=1000.0f;
+ draw_finish_remaining(&r); assert(number==23);
+ r.remain=599.0f;
+ draw_finish_remaining(&r); assert(label==16 && number==24 && last_digits==599);
+ ghost_rival.gap_mm=NAN;
+ draw_finish_remaining(&r); assert(number==24);
  return 0; }
 '''
         with tempfile.TemporaryDirectory() as d:

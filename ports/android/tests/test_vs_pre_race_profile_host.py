@@ -4,7 +4,10 @@ from pathlib import Path
 import os, subprocess, tempfile
 src=Path(__file__).resolve().parents[1]/"src"
 s=(src/"app.c").read_text()
-profile=s[s.index("static void vs_profile("):s.index("static int vs_same_build(")]
+profile_start=s.index("static void vs_profile(")
+profile=s[profile_start:s.index("#ifdef __ANDROID__\n/* Optional WV1 profile extension.",profile_start)]
+own_start=s.index("static int vs_own_profile_matches(")
+profile+=s[own_start:s.index("#endif",own_start)]
 start=s.index("    const cardb_color *col = chosen_color();", s.index("  if (go) {"))
 end=s.index("    /* a race chosen before the course finished loading",start)
 race=s[start:end]

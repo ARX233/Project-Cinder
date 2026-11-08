@@ -36,11 +36,15 @@ int main(void){
  header(0,0);assert(parse()<0);header(4097,0);assert(parse()<0);header(1,4097);assert(parse()<0);
  { char body[260]; memset(body,'x',253); body[253]=0; char car[260]; snprintf(car,sizeof car,"%s|0",body); one_nozzle(car,"MUFFLER1",slots[0],".",1); assert(parse()==0); body[253]='x';body[254]=0;snprintf(car,sizeof car,"%s|0",body);one_nozzle(car,"MUFFLER1",slots[0],".",1);assert(parse()<0); }
  { bfx_asset t={0}; assert(bfx_parse(&t,b,32u*1024u*1024u+1u)<0); }
- header(1,3);mesh(1,2,3,"SAMLL_A",".",1);nozzle("car1|37","MUFFLER1",slots[0],"1",1);nozzle("car1|37","MUFFLER1",slots[2],"2",1);nozzle("car2|1","MUFFLER1",slots[0],"3",1);
+ header(1,4);mesh(1,2,3,"SAMLL_A",".",1);nozzle("car1|37","MUFFLER1",slots[0],"1",1);nozzle("car1|37","MUFFLER1",slots[2],"2",1);nozzle("car2|1","MUFFLER1",slots[0],"3",1);nozzle("car1|37","MUFFLER2",slots[0],"4",1);
  for(size_t i=0;i<n;i++){bfx_asset t={0};assert(bfx_parse(&t,b,i)<0);bfx_free(&t);} bfx_asset a={0};assert(bfx_parse(&a,b,n)==0);
  bfx_playback *p=malloc(sizeof *p);assert(p);bfx_reset(p);assert(bfx_car_id("car1|37","car1")==37&&bfx_variant_b(37));assert(bfx_car_id("|1","")<0);
- bfx_step(p,&a,0,"car1",1,0);assert(p->frame[0][0]==0&&p->frame[0][1]==0&&p->frame[0][2]==-1);bfx_step(p,&a,1,"car2",1,1);assert(p->frame[1][2]==0);
- for(int i=1;i<17;i++){bfx_step(p,&a,0,"car1",1,1);assert(p->frame[0][0]==i&&p->type[0][0]==0);} bfx_step(p,&a,0,"car1",0,0);assert(p->frame[0][0]==-1);bfx_reset(p);assert(p->frame[1][2]==-1);
- bfx_step(p,&a,0,"car1",1,1);p->frame[0][1]=8;bfx_step(p,&a,0,"car1",1,0);assert(p->frame[0][0]==1&&p->frame[0][1]==9);bfx_step(p,&a,0,"other",0,0);assert(p->frame[0][0]==-1);
+ bfx_step(p,&a,0,"car1",0,1,0);assert(p->frame[0][0]==0&&p->frame[0][1]==0&&p->frame[0][2]==-1);bfx_step(p,&a,1,"car2",0,1,1);assert(p->frame[1][2]==0);
+ for(int i=1;i<17;i++){bfx_step(p,&a,0,"car1",0,1,1);assert(p->frame[0][0]==i&&p->type[0][0]==0);} bfx_step(p,&a,0,"car1",0,0,0);assert(p->frame[0][0]==-1);bfx_reset(p);assert(p->frame[1][2]==-1);
+ bfx_step(p,&a,0,"car1",0,1,1);p->frame[0][1]=8;bfx_step(p,&a,0,"car1",0,1,0);assert(p->frame[0][0]==1&&p->frame[0][1]==9);bfx_step(p,&a,0,"other",0,0,0);assert(p->frame[0][0]==-1);
+ bfx_step(p,&a,0,"car1",0,1,0); assert(p->frame[0][0]==0&&p->frame[0][3]==-1);
+ bfx_step(p,&a,0,"car1",1,1,1); assert(p->frame[0][0]==-1&&p->frame[0][1]==-1&&p->frame[0][3]==0&&p->type[0][3]==1);
+ bfx_step(p,&a,0,"car1",1,0,0); assert(p->frame[0][3]==1);
+ bfx_step(p,&a,0,"car2",1,1,1); assert(p->frame[0][2]==-1&&p->frame[0][3]==-1); /* no tuned outlet on car2 */
  bfx_free(&a); free(p);b[n++]=0;assert(parse()<0);puts("BFX synthetic tests passed");return 0;
 }

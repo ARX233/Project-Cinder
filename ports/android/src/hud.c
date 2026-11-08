@@ -8,7 +8,11 @@
 #include "racing_lamp_data.h"
 
 #include "anm.h"
+#include "ghost_original_ui.h"
 #include "gl.h"
+#ifdef WMMT_NATIVE_VK
+#include "ui_native_vk_resources.inc"
+#endif
 #include "mathx.h"
 #include "meterdb.h"
 #include "meterdb_v2.h"
@@ -32,11 +36,10 @@ static const rect SHIFT_DOWN = { 706, 686, 96, 68 };
 /* the top keys, either side of the back mirror's place (app.c draw_backmirror: 352..672
  * across the layout); a screen wider than 4:3 (the iPhone's, without the mirror) keeps them
  * in a row in the middle (hud_wide) */
-/* the view and AT/MT left of pause (a story's three rival boxes take the top right) */
+/* The view control is left of pause; a story's three rival boxes take the top right. */
 static rect PAUSE = { 236, 12, 48, 48 }; /* the pause menu */
 static rect RESET = { 296, 12, 48, 48 };
 static rect CAMERA = { 116, 12, 48, 48 };
-static rect TRANS = { 176, 12, 48, 48 }; /* AT/MT */
 #define WHEEL_CX 141.0f
 #define WHEEL_CY 640.0f
 #define WHEEL_R 112.0f
@@ -66,8 +69,27 @@ static const rect MENU_HIDDEN = { 328, 652, 368, 56 }; /* between the left and r
  * screen's sides and grow by KEY_K about their corner there (a phone's are small). */
 static float EDGE, KEY_K = 1;
 enum { KEY_TOP, KEY_LEFT, KEY_RIGHT };
+/* Menu buttons keep their authored size and do not inherit race key scaling or
+ * saved user transforms. Draw geometry and hit testing share these side anchors. */
+static rect menu_place(rect r, int side) {
+  r.x += side == KEY_LEFT ? -EDGE : side == KEY_RIGHT ? EDGE : 0;
+  return r;
+}
 static float USER_K[3] = {1,1,1}, USER_DX[3], USER_DY[3];
 static int shift_separate;
+static struct { int separate; float k, dx, dy; } button_layout[HUD_EDIT_GROUPS - HUD_EDIT_SHIFT_UP];
+static float button_opacity = 1;
+void hud_button_layout_set(int group, int separate, float k, float dx, float dy) {
+  if (group < HUD_EDIT_SHIFT_UP || group >= HUD_EDIT_GROUPS) return;
+  const int i = group - HUD_EDIT_SHIFT_UP;
+  button_layout[i].separate = !!separate;
+  button_layout[i].k = fmaxf(HUD_KEY_K_MIN, fminf(HUD_KEY_K_MAX, k));
+  button_layout[i].dx = dx;
+  button_layout[i].dy = dy;
+}
+void hud_set_button_opacity_percent(int percent) {
+  button_opacity = fmaxf(0, fminf(100, percent)) * 0.01f;
+}
 static float shift_k = 1, shift_dx, shift_dy;
 void hud_shift_layout_set(int separate, float k, float dx, float dy) {
   shift_separate = !!separate;
@@ -87,6 +109,16 @@ static rect shift_key(rect r) {
   return shift_separate ? place(r, KEY_RIGHT, shift_k, shift_dx, shift_dy) : key(r, KEY_RIGHT);
 }
 
+static int control_anchor(int group) {
+  return group <= HUD_EDIT_SHIFT_DOWN ? KEY_RIGHT : KEY_TOP;
+}
+static rect control_key(rect r, int group) {
+  const int i = group - HUD_EDIT_SHIFT_UP, side = control_anchor(group);
+  if (button_layout[i].separate)
+    return place(r, side, button_layout[i].k, button_layout[i].dx, button_layout[i].dy);
+  return side == KEY_RIGHT ? shift_key(r) : key(r, side);
+}
+
 static void unkey(int side, float x, float y, float *lx, float *ly) {
   rect o = key((rect){0, 0, 1, 1}, side);
   *lx = (x - o.x) / o.w; *ly = (y - o.y) / o.h;
@@ -101,6 +133,14 @@ static mat4 key_ortho(float w, float h, int side) {
   mat4 m = mat4_identity();
   m.m[0] = m.m[5] = KEY_K * USER_K[side];
   m.m[12] = r.x, m.m[13] = r.y;
+  return mat4_mul(screen_ortho(w, h), m);
+}
+
+static mat4 control_ortho(float w, float h, int group) {
+  rect origin = control_key((rect){0, 0, 1, 1}, group);
+  mat4 m = mat4_identity();
+  m.m[0] = m.m[5] = origin.w;
+  m.m[12] = origin.x; m.m[13] = origin.y;
   return mat4_mul(screen_ortho(w, h), m);
 }
 
@@ -204,19 +244,20 @@ static int steer_touch(hud_state *h, void *id, int phase, float x, float y) {
 
 void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
   rect brake = h->gyro ? key(G_BRAKE, KEY_LEFT) : key(BRAKE, KEY_RIGHT);
-  rect up = shift_key(h->gyro ? G_SHIFT_UP : SHIFT_UP), down = shift_key(h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN);
+  rect up = control_key(h->gyro ? G_SHIFT_UP : SHIFT_UP, HUD_EDIT_SHIFT_UP);
+  rect down = control_key(h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN, HUD_EDIT_SHIFT_DOWN);
   rect throttle = key(THROTTLE, KEY_RIGHT), left = key(LEFT, KEY_LEFT), right = key(RIGHT, KEY_LEFT);
   if (phase == TOUCH_BEGAN && keys_pause_only()) {
-    if (inside(key(PAUSE, KEY_TOP), x, y)) h->pause_pressed++;
+    if (!h->pause_disabled && inside(control_key(PAUSE, HUD_EDIT_PAUSE), x, y)) h->pause_pressed++;
   } else if (phase == TOUCH_BEGAN) {
     if (inside(throttle, x, y)) h->throttle_touch = id;
     else if (inside(brake, x, y)) h->brake_touch = id;
     else if (inside(up, x, y)) h->shift_up++;
     else if (inside(down, x, y)) h->shift_down++;
-    else if (inside(key(CAMERA, KEY_TOP), x, y)) h->camera_pressed++;
-    else if (inside(key(TRANS, KEY_TOP), x, y)) h->trans_pressed++;
+    else if (inside(control_key(CAMERA, HUD_EDIT_CAMERA), x, y)) h->camera_pressed++;
     else if (inside(key(RESET, KEY_TOP), x, y)) h->reset_pressed++;
-    else if (inside(key(PAUSE, KEY_TOP), x, y)) h->pause_pressed++;
+    else if (!h->pause_disabled && inside(control_key(PAUSE, HUD_EDIT_PAUSE), x, y)) h->pause_pressed++;
+    else if (h->passing_available && inside(key(PAUSE, KEY_TOP), x, y)) h->passing_pressed=1;
     else if (steer_touch(h, id, phase, x, y)) {}
     else if (!h->gyro && h->steer_mode == HUD_STEER_KEYS && inside(left, x, y)) h->left_touch = id;
     else if (!h->gyro && h->steer_mode == HUD_STEER_KEYS && inside(right, x, y)) h->right_touch = id;
@@ -264,6 +305,8 @@ void hud_input_dt(hud_state *h, car_input *in, float dt) {
   in->shift_up = h->shift_up > 0;
   in->shift_down = h->shift_down > 0;
   h->shift_up = h->shift_down = 0;
+  in->passing = h->passing_available && h->passing_pressed;
+  h->passing_pressed = 0;
 }
 
 void hud_input(hud_state *h, car_input *in) { hud_input_dt(h, in, 1.0f / 60.0f); }
@@ -278,7 +321,12 @@ static char navi_dir[1024];
 static int navi_city = -1, navi_requested = -1;
 
 static GLuint prog, tex_prog;
+#ifdef WMMT_NATIVE_VK
+static void hud_native_draw_layout_mode(float screen_w, float screen_h, int mode, int sel);
+#endif
+#ifndef WMMT_NATIVE_VK
 static GLint u_proj, u_color, u_tproj, u_tex, u_mul, u_add;
+#endif
 
 int hud_gl_init(void) {
   static const char *vs =
@@ -288,10 +336,16 @@ int hud_gl_init(void) {
     "precision mediump float; uniform vec4 uColor;\n"
     "void main() { gl_FragColor = uColor; }\n";
   const char *attribs[] = { "aPos" };
+#ifdef WMMT_NATIVE_VK
+  prog = cinder_vk_program_create(vs, fs, attribs, 1);
+#else
   prog = gl_compile_program(vs, fs, attribs, 1);
+#endif
   if (!prog) return -1;
+#ifndef WMMT_NATIVE_VK
   u_proj = glGetUniformLocation(prog, "uProj");
   u_color = glGetUniformLocation(prog, "uColor");
+#endif
   static const char *tvs =
     "attribute vec2 aPos; attribute vec2 aUV; uniform mat4 uProj; varying vec2 vUV;\n"
     "void main() { vUV = aUV; gl_Position = uProj * vec4(aPos, 0.0, 1.0); }\n";
@@ -299,19 +353,32 @@ int hud_gl_init(void) {
     "precision mediump float; uniform sampler2D uTex; uniform vec4 uMul, uAdd; varying vec2 vUV;\n"
     "void main() { gl_FragColor = clamp(texture2D(uTex, vUV) * uMul + uAdd, 0.0, 1.0); }\n";
   const char *tattribs[] = { "aPos", "aUV" };
+#ifdef WMMT_NATIVE_VK
+  tex_prog = cinder_vk_program_create(tvs, tfs, tattribs, 2);
+#else
   tex_prog = gl_compile_program(tvs, tfs, tattribs, 2);
+#endif
   if (!tex_prog) return -1;
+#ifndef WMMT_NATIVE_VK
   u_tproj = glGetUniformLocation(tex_prog, "uProj");
   u_tex = glGetUniformLocation(tex_prog, "uTex");
   u_mul = glGetUniformLocation(tex_prog, "uMul");
   u_add = glGetUniformLocation(tex_prog, "uAdd");
+#endif
   return navi_gl_init();
 }
 
-static void color(float r, float g, float b, float a) { glUniform4f(u_color, r, g, b, a); }
+#ifndef WMMT_NATIVE_VK
+static float control_alpha = 1;
+static void color(float r, float g, float b, float a) { glUniform4f(u_color, r, g, b, a * control_alpha); }
+#endif
 /* the sprites' colour, as the arcade's anm records give it: texel * mul + add */
+#ifndef WMMT_NATIVE_VK
 static void tint(float r, float g, float b, float a) { glUniform4f(u_mul, r, g, b, a); }
+#endif
+#ifndef WMMT_NATIVE_VK
 static void tint_add(float r, float g, float b) { glUniform4f(u_add, r, g, b, 0); }
+#endif
 
 /* ---- the arcade race HUD (sprites from data/sprite, packed by tools/hudpack.py) ---- */
 enum {
@@ -344,6 +411,9 @@ static float CLUSTER_X = 948; /* (+ EDGE: hud_wide) */
 static float CLUSTER_Y = 286; /* where the arcade's (560, 228) goes (hud_lift moves it) */
 
 static GLuint upload(const unsigned char *px, unsigned w, unsigned h) {
+#ifdef WMMT_NATIVE_VK
+  return ui_native_texture_rgba8(w, h, px);
+#else
   GLuint tex = 0;
   glGenTextures(1, &tex);
   glBindTexture(GL_TEXTURE_2D, tex);
@@ -353,6 +423,7 @@ static GLuint upload(const unsigned char *px, unsigned w, unsigned h) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
   return tex;
+#endif
 }
 
 /* ---- each car's own meters (src/meterdb.h; the art in meters.bin) ----
@@ -385,6 +456,11 @@ static void lamp_prepare(const unsigned char *off, unsigned w, unsigned h, int z
   if (w != 64 || h != 64 || !METER[slot].tex ||
       !lamp_inflate(expected, o, os) || memcmp(expected, off, sizeof expected) ||
       !lamp_inflate(on, a, as)) return;
+#ifdef WMMT_NATIVE_VK
+  /* Native creation reports its own failure; leave the loaded off sprite intact. */
+  GLuint tex = upload(on, 64, 64);
+  if (!tex) return;
+#else
   /* Isolate upload errors: a failed replacement leaves the already loaded off sprite intact. */
   for (int j = 0; j < 16 && glGetError() != GL_NO_ERROR; ++j) {}
   GLuint tex = upload(on, 64, 64);
@@ -392,12 +468,17 @@ static void lamp_prepare(const unsigned char *off, unsigned w, unsigned h, int z
     if (tex) glDeleteTextures(1, &tex);
     return;
   }
+#endif
   racing_lamp_on = (hud_sprite){tex, 64, 64};
   racing_lamp_slot = slot;
 }
 static meter_pack meter_extra;
 static char meter_extra_path[1024], meter_extra_directory[1024];
+#ifdef __ANDROID__
+static int meter_extra_directory_invalid = 1; /* No unverified data_dir fallback. */
+#else
 static int meter_extra_directory_invalid;
+#endif
 /* Preview owns its textures and key, never the race's METER or availability. */
 static hud_sprite preview_meter[METERDB_MAX_PARTS];
 /* Pixel-edge bounds of nonzero alpha, empty when visible is zero. */
@@ -406,14 +487,24 @@ static preview_alpha_bounds preview_alpha[METERDB_MAX_PARTS];
 static int preview_pack = -1, preview_style = -1, preview_ok;
 static void preview_clear(void) {
   for (int i = 0; i < METERDB_MAX_PARTS; ++i)
+#ifdef WMMT_NATIVE_VK
+    if (preview_meter[i].tex) cinder_vk_texture_destroy(preview_meter[i].tex);
+#else
     if (preview_meter[i].tex) glDeleteTextures(1, &preview_meter[i].tex);
+#endif
   memset(preview_meter, 0, sizeof preview_meter);
   memset(preview_alpha, 0, sizeof preview_alpha);
   preview_pack = preview_style = -1; preview_ok = 0;
 }
 void hud_set_extra_directory(const char *dir) {
   meter_extra_directory_invalid = 0;
-  if (!dir) { meter_extra_directory[0] = 0; return; }
+  if (!dir || !dir[0]) {
+    meter_extra_directory[0] = 0;
+#ifdef __ANDROID__
+    meter_extra_directory_invalid = 1;
+#endif
+    return;
+  }
   int n = snprintf(meter_extra_directory, sizeof meter_extra_directory, "%s", dir);
   if (n < 0 || n >= (int)sizeof meter_extra_directory) {
     meter_extra_directory[0] = 0;
@@ -449,7 +540,7 @@ static void meters_index(const char *data_dir) {
   for (int c=0;c<MP_CARS;c++) for (int z=0;z<MP_ZONES;z++) counts[c][z]=z<2?(unsigned char)METERDB[c].n[z]:0;
   mp_read(meter_path, 0, counts, &meter_legacy);
   for (int c=0;c<MP_CARS;c++) for (int z=0;z<MP_ZONES;z++) counts[c][z]=(unsigned char)METERDB_V2[c].n[z];
-  mp_read(meter_extra_path, 1, counts, &meter_extra);
+  if (meter_extra_path[0]) mp_read(meter_extra_path, 1, counts, &meter_extra);
 }
 
 static unsigned char spr_warm[SPR_COUNT], meter_warm[METERDB_MAX_PARTS], navi_warm[2];
@@ -459,10 +550,18 @@ void hud_set_car(int pack, int night) {
   int zone = v2 ? 2 * meter_style + (night != 0) : (night != 0);
   if (meter_car && pack >= 0 && pack < METER_CARS && meter_car == &METERDB[pack] && meter_night == zone && meter_v2_active == v2) return;
   memset(meter_warm, 0, sizeof meter_warm);
+#ifdef WMMT_NATIVE_VK
+  if (racing_lamp_on.tex) cinder_vk_texture_destroy(racing_lamp_on.tex);
+#else
   if (racing_lamp_on.tex) glDeleteTextures(1, &racing_lamp_on.tex);
+#endif
   memset(&racing_lamp_on, 0, sizeof racing_lamp_on);
   racing_lamp_slot = -1;
+#ifdef WMMT_NATIVE_VK
+  for (int i = 0; i < METERDB_MAX_PARTS; ++i) if (METER[i].tex) cinder_vk_texture_destroy(METER[i].tex);
+#else
   for (int i = 0; i < METERDB_MAX_PARTS; ++i) if (METER[i].tex) glDeleteTextures(1, &METER[i].tex);
+#endif
   memset(METER, 0, sizeof METER);
   meter_car = pack >= 0 && pack < METER_CARS ? &METERDB[pack] : NULL;
   meter_night = zone; meter_v2_active = v2;
@@ -480,7 +579,12 @@ void hud_set_car(int pack, int night) {
     size_t size = (size_t)w * h * 4;
     unsigned char *px = malloc(size);
     if (px && fseek(f, (long)off, SEEK_SET) == 0 && fread(px, 1, size, f) == size) {
+#ifdef WMMT_NATIVE_VK
+      GLuint tex = upload(px, w, h);
+      if (tex) METER[i] = (hud_sprite){tex, (float)w, (float)h};
+#else
       METER[i].tex = upload(px, w, h); METER[i].w = (float)w; METER[i].h = (float)h;
+#endif
       if (v2 && !METER[i].tex) {
         free(px); fclose(f); meter_extra.sprites = 0; hud_set_car(pack, night); return;
       }
@@ -522,16 +626,24 @@ int hud_load(const char *data_dir) {
     size_t size = (size_t)wh[0] * wh[1] * 4;
     unsigned char *px = malloc(size);
     if (!px || fread(px, 1, size, f) != size) { free(px); break; }
+#ifdef WMMT_NATIVE_VK
+    GLuint tex = upload(px, wh[0], wh[1]);
+    free(px);
+    if (!tex) continue;
+    SPR[i] = (hud_sprite){tex, (float)wh[0], (float)wh[1]};
+#else
     SPR[i].tex = upload(px, wh[0], wh[1]);
     free(px);
     SPR[i].w = (float)wh[0];
     SPR[i].h = (float)wh[1];
+#endif
   }
   fclose(f);
   return 0;
 }
 
 /* Sprite centred on (cx, cy), scaled by k and turned `deg` clockwise. */
+#ifndef WMMT_NATIVE_VK
 static void draw_k(const hud_sprite *sp, float cx, float cy, float deg, float k) {
   if (!sp->tex) return;
   float a = deg * (float)M_PI / 180.0f, c = cosf(a), s = sinf(a);
@@ -550,13 +662,18 @@ static void draw_k(const hud_sprite *sp, float cx, float cy, float deg, float k)
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, v + 2);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void sprite_k(int id, float cx, float cy, float deg, float k) { draw_k(&SPR[id], cx, cy, deg, k); }
+#endif
 
 /* Unrotated sprite by its top-left corner, in HUD_K-scaled points. */
+#ifndef WMMT_NATIVE_VK
 static void blit(int id, float x, float y) {
   sprite_k(id, x + SPR[id].w * HUD_K * 0.5f, y + SPR[id].h * HUD_K * 0.5f, 0, HUD_K);
 }
+#endif
 
 /* The needles' inputs, as yt::CSeq::Get2DInfoMeter hands them to the meters: km/h over
  * the 320 the dials were probed at; CEngine::GetRevRate shaped so idle sits off the
@@ -571,6 +688,7 @@ static float meter_input(const meterdb_part *p, const car_state *car) {
   }
 }
 
+#ifndef WMMT_NATIVE_VK
 static void draw_meters(const car_state *car) {
   if (!meter_car) return;
   glEnableVertexAttribArray(1);
@@ -590,6 +708,7 @@ static void draw_meters(const car_state *car) {
   }
   glDisableVertexAttribArray(1);
 }
+#endif
 
 /* Preview uses the same day-zone part definitions as the race, but owns all
  * textures and never changes race selection or sidecar availability. Failed keys
@@ -638,7 +757,7 @@ static int preview_load(int pack, int style) {
   return preview_ok = 1;
 }
 
-#ifndef WMMT_VK
+#if !defined(WMMT_NATIVE_VK) && !defined(WMMT_VK)
 typedef struct { GLint enabled, size, type, normalized, stride, buffer; void *pointer; } preview_attrib;
 static void preview_get_attrib(int i, preview_attrib *a) {
   glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a->enabled);
@@ -654,10 +773,11 @@ static void preview_restore_attrib(int i, const preview_attrib *a) {
   glVertexAttribPointer(i, a->size, (GLenum)a->type, (GLboolean)a->normalized, a->stride, a->pointer);
   if (a->enabled) glEnableVertexAttribArray(i); else glDisableVertexAttribArray(i);
 }
-#else
+#elif !defined(WMMT_NATIVE_VK)
 extern void *vkgl_preview_save(GLuint program);
 extern void vkgl_preview_restore(void *snapshot);
 #endif
+#ifndef WMMT_NATIVE_VK
 int hud_meter_preview(int pack, int style, float x, float y, float w, float h, float alpha) {
   if (!tex_prog || w <= 0 || h <= 0 || alpha <= 0) return 0;
 #ifdef WMMT_VK
@@ -734,6 +854,7 @@ int hud_meter_preview(int pack, int style, float x, float y, float w, float h, f
 #endif
   return ok;
 }
+#endif
 
 /* The arcade's corner shift indicator (cons_g_mission.anm, clShiftConsole::setMission):
  * the car's 4, 5 or 6-speed H-pattern with the current gear as a numbered ball over its
@@ -745,6 +866,7 @@ static float SHIFT_X = 62, SHIFT_Y = 530; /* pattern centre, above ◀ ▶ (hud_
 static const float KNOB[7][2] = { { 28, 33 }, { 17, 10 }, { 9, 61 }, { 34, 10 }, { 25, 61 }, { 50, 10 }, { 42, 61 } };
 static const float TAG[2] = { 75, 63 };
 
+#ifndef WMMT_NATIVE_VK
 static void draw_shifter(const car_state *car) {
   int gears = meter_car ? meter_car->gears : 6;
   gears = gears < 4 ? 4 : gears > 6 ? 6 : gears;
@@ -758,6 +880,7 @@ static void draw_shifter(const car_state *car) {
   sprite_k(car->manual ? SPR_TAG_MT : SPR_TAG_AT, ox + TAG[0] * SHIFT_K, oy + TAG[1] * SHIFT_K, 0, SHIFT_K);
   glDisableVertexAttribArray(1);
 }
+#endif
 
 /* The player's own plate under the meters (cons_g_speed.anm): class pill, title, name,
  * speed in big digits over their shadows, km/h, power and handling. Offsets are from the
@@ -843,6 +966,7 @@ static int class_glyphs(int cls, char g[3]) {
   return g[0] = g[1] = g[2] = 'S', 1;
 }
 
+#ifndef WMMT_NATIVE_VK
 static void blit_rank(char c, float x, float y) {
   const char *l = strchr("NABCS", c);
   int s = c >= '0' && c <= '9' ? SPR_RANK_DIGIT + c - '0' : l && c ? SPR_RANK + (int)(l - "NABCS") : -1;
@@ -850,12 +974,14 @@ static void blit_rank(char c, float x, float y) {
   if (SPR[s].tex) blit(s, x, y);
   else if (c == 'N') blit(SPR_CLASS_N, x, y); /* a hud.bin from before the classes */
 }
+#endif
 
 void hud_set_tune(int hp, int grade) {
   plate_hp = hp < 0 ? 0 : hp > 999 ? 999 : hp;
   plate_grade = grade < CAR_GRADE_DG ? CAR_GRADE_DG : grade > CAR_GRADE_HG ? CAR_GRADE_HG : grade;
 }
 
+#ifndef WMMT_NATIVE_VK
 static void draw_plate(const car_state *car) {
   if (!SPR[SPR_PLATE].tex) return;
   glEnableVertexAttribArray(1);
@@ -886,6 +1012,7 @@ static void draw_plate(const car_state *car) {
   blit(SPR_GRADE + plate_grade, x0 + 166 * k, y0 + 40 * k);
   glDisableVertexAttribArray(1);
 }
+#endif
 
 /* ---- the time attack's console, the column on the left above the shifter: till goal
  * (cons_g_finish), TOTAL TIME (cons_g_totaltime_ta), SECTION TIME (cons_g_sectiontime),
@@ -895,14 +1022,21 @@ static float TA_X = 0; /* (- EDGE: hud_wide) */
 static const float TA_Y = 26;
 static float tx(float ax) { return TA_X + ax * HUD_K; }
 static float ty(float ay) { return TA_Y + ay * HUD_K; }
+#ifndef WMMT_NATIVE_VK
 static void ta_blit(int id, float ax, float ay) { blit(id, tx(ax), ty(ay)); }
+#endif
+#ifndef WMMT_NATIVE_VK
 static void map_blit(int id, float ax, float ay) { blit(id, tx(ax), ty(ay) - MAP_UP); }
+#endif
 
 static int ta_course;
 static float extend_at = -1; /* the race's total when TIME EXTEND popped up, or < 0 */
+static int ta_pb_count, ta_seen_section, ta_delta_sign, ta_delta_ms;
+static float ta_pb_at[CAR_SECTIONS + 1];
 
 /* m to the goal (setAnime by its digits): metres up to 999, then km with one decimal,
  * rounded (+50 m) */
+#ifndef WMMT_NATIVE_VK
 static void draw_till_goal(float remain) {
   ta_blit(SPR_TILL_GOAL, 9, 12);
   int d = (int)remain;
@@ -928,8 +1062,10 @@ static void draw_till_goal(float remain) {
     ta_blit(SPR_GOAL_KM, 155, 30);
   }
 }
+#endif
 
 /* m'ss"mmm in the 20x20 digits: x of the minute, ', the seconds, " and the ms */
+#ifndef WMMT_NATIVE_VK
 static void draw_laptime(float t, float y, const float *x) {
   int ms = (int)(t * 1000.0f + 0.5f);
   if (ms < 0) ms = 0;
@@ -944,7 +1080,9 @@ static void draw_laptime(float t, float y, const float *x) {
   ta_blit(SPR_TA_DIGIT + f / 10 % 10, x[6], y);
   ta_blit(SPR_TA_DIGIT + f % 10, x[7], y);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void draw_times(const car_race *r) {
   static const float TOTAL_X[8] = { 14, 27, 37, 51, 65, 75, 89, 103 };
   static const float SECTION_X[8] = { 14, 26, 36, 49, 62, 72, 85, 98 };
@@ -959,24 +1097,44 @@ static void draw_times(const car_race *r) {
     draw_laptime(t, 136 + 18 * k, SECTION_X);
   }
 }
+#endif
 
 /* The seconds left: shadows, the label, then the faces; red for the last 9 */
+#ifndef WMMT_NATIVE_VK
 static void draw_time_left(float left) {
-  int v = (int)left;
-  v = v < 0 ? 0 : v > 999 ? 999 : v;
-  static const float X[3] = { 53, 68, 83 };
-  for (int i = 0, div = 100; i < 3; ++i, div /= 10) map_blit(SPR_LTIME_SHADOW + v / div % 10, X[i], 364);
+  int v = left>0 ? (int)fminf(left,9999.0f) : 0;
+  int digits=v>=1000?4:3, first=v>=1000?1000:100;
+  for (int i = 0, div = first; i < digits; ++i, div /= 10) map_blit(SPR_LTIME_SHADOW + v / div % 10, 53.0f + 15.0f * (float)i, 364);
   if (v <= 9) tint(1, 0.30f, 0.30f, 1);
   map_blit(SPR_TIME, 15, 366);
-  for (int i = 0, div = 100; i < 3; ++i, div /= 10) map_blit(SPR_LTIME + v / div % 10, X[i], 364);
+  for (int i = 0, div = first; i < digits; ++i, div /= 10) map_blit(SPR_LTIME + v / div % 10, 53.0f + 15.0f * (float)i, 364);
   tint(1, 1, 1, 1);
 }
+#endif
 
 /* TIME EXTEND (cons_g_ta_time_extend) in the middle of the screen: it zooms in (frames
  * 81-90), glows in its loop (1-59) for two rounds, and zooms away (61-69) */
 #define EXTEND_IN 10
 #define EXTEND_HOLD 120
 #define EXTEND_OUT 9
+/* cons_g_ta_time_extend keeps the split digits fixed under the moving banner.
+ * These are the original 13-pixel slots, anchored to this HUD's banner. */
+static void time_extend_digits(int id[9]) {
+  int ms = ta_delta_ms;
+  id[0] = SPR_REC_DASH;
+  id[1] = SPR_TA_DIGIT + ms / 60000;
+  id[2] = SPR_TA_QUOTE1;
+  id[3] = SPR_TA_DIGIT + ms / 10000 % 6;
+  id[4] = SPR_TA_DIGIT + ms / 1000 % 10;
+  id[5] = SPR_TA_QUOTE2;
+  id[6] = SPR_TA_DIGIT + ms / 100 % 10;
+  id[7] = SPR_TA_DIGIT + ms / 10 % 10;
+  id[8] = SPR_TA_DIGIT + ms % 10;
+}
+static float time_extend_digit_x(int i) { return 512 + (-52 + 13 * i) * HUD_K; }
+static float time_extend_digit_y(void) { return 250 + 21 * HUD_K; }
+
+#ifndef WMMT_NATIVE_VK
 static void draw_time_extend(float total) {
   if (extend_at < 0) return;
   float t = (total - extend_at) * 60.0f;
@@ -997,11 +1155,49 @@ static void draw_time_extend(float total) {
   tint(1, 1, 1, a);
   tint_add(glow, glow, glow);
   sprite_k(SPR_TIME_EXTEND, 512, 250, 0, HUD_K * k); /* the arcade's (320, 156) */
-  tint(1, 1, 1, 1);
   tint_add(0, 0, 0);
+  if (ta_delta_sign) {
+    int ids[9];
+    time_extend_digits(ids);
+    for (int i = 0; i < 9; ++i)
+      sprite_k(ids[i], time_extend_digit_x(i), time_extend_digit_y(), 0, HUD_K);
+    if (ta_delta_sign > 0)
+      sprite_k(ids[0], time_extend_digit_x(0), time_extend_digit_y(), 90, HUD_K);
+  }
+  tint(1, 1, 1, 1);
+}
+#endif
+
+void hud_time_extend(float total) {
+  extend_at = total;
+  ta_delta_sign = 0;
 }
 
-void hud_time_extend(float total) { extend_at = total; }
+void hud_set_record_splits(int count, const float *at) {
+  ta_pb_count = at && count >= 2 && count <= CAR_SECTIONS ? count : 0;
+  if (ta_pb_count) memcpy(ta_pb_at, at, (ta_pb_count + 1u) * sizeof *at);
+}
+
+int hud_ta_checkpoint(const car_race *r) {
+  int section = r->section;
+  if (r->play_state != 2 || r->state != CAR_RACE_RUN || section <= ta_seen_section ||
+      section >= r->sections || section >= CAR_SECTIONS) return 0;
+  ta_seen_section = section;
+  hud_time_extend(r->total);
+  if (ta_pb_count == r->sections) {
+    float actual = r->split[section] - r->split[section - 1];
+    float best = ta_pb_at[section] - ta_pb_at[section - 1];
+    if (isfinite(actual) && isfinite(best) && actual > 0 && best > 0) {
+      /* Original getCourseRecordSection decodes each recorded section from
+       * integer ms. Use that precision with the selected player's PB. */
+      best = truncf(best * 1000.0f) * 0.001f;
+      float delta = actual - best;
+      ta_delta_sign = delta > 0.0f ? 1 : -1;
+      ta_delta_ms = (int)fminf(fabsf(delta * 1000.0f), 599999.0f);
+    }
+  }
+  return 1;
+}
 
 /* ---- top right, over the meters: RECORD TIME and YOUR RECORD (cons_g_ta_recordtime and
  * cons_g_ta_yourrecord, clTimeAttackConsoleInfos::setRecord) and the challenger pill
@@ -1018,6 +1214,7 @@ void hud_set_records(float record, float yours) {
 static float rx(float ax) { return 1024 + EDGE - (640 - ax) * HUD_K; }
 
 /* m'ss"mmm in the 20x20 digits at the template's places; a dash in each without a record */
+#ifndef WMMT_NATIVE_VK
 static void draw_record(int label, float label_y, float y, float t) {
   static const float X[8] = { 522, 534, 544, 557, 570, 580, 593, 606 };
   int ms = (int)(t * 1000.0f);
@@ -1030,6 +1227,7 @@ static void draw_record(int label, float label_y, float y, float t) {
   blit(SPR_TA_QUOTE2, rx(X[4]), ty(y + 1));
   blit(label, rx(522), ty(label_y));
 }
+#endif
 
 /* ---- the route sign over the car (clSignConsole, cons_g_caution): the sign SAreaData::GetSign
  * gives for the road ahead, at the arcade's (289, 81) 64x64, as big against the screen as
@@ -1038,12 +1236,9 @@ static int sign_shown, sign_t;
 
 int hud_sign_blinks(int sign) { return (sign >= 1 && sign <= 4) || sign == 11; }
 
+#ifndef WMMT_NATIVE_VK
 static void draw_sign(const car_race *r) {
   int sign = r->state == CAR_RACE_RUN && r->sign >= 1 && r->sign <= HUD_SIGNS ? r->sign : 0;
-  if (sign != sign_shown) {
-    sign_shown = sign;
-    sign_t = 0;
-  }
   if (!sign) return;
   /* the blink loop's alpha (of 256): each 15 frames it comes back in over 5 or 6 */
   static const unsigned char BLINK[60] = {
@@ -1051,20 +1246,22 @@ static void draw_sign(const car_race *r) {
     0, 51, 102, 154, 205, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     0, 51, 102, 154, 205, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     0, 43, 85, 128, 171, 213, 255, 255, 255, 255, 255, 255, 255, 255, 255 };
-  float a = hud_sign_blinks(sign) ? BLINK[sign_t % 60] / 255.0f : 1.0f;
-  sign_t++;
+  float a = hud_sign_blinks(sign) ? BLINK[(sign_t + 59) % 60] / 255.0f : 1.0f;
   const float k = 1.6f; /* the arcade's 640x480 to the 1024x768 screen */
   tint(1, 1, 1, a);
   sprite_k(SPR_SIGN + sign - 1, (289 + 32) * k, (81 + 32) * k, 0, k);
   tint(1, 1, 1, 1);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void draw_records(void) {
   if (!SPR[SPR_BUYIN].tex) return;
   draw_record(SPR_REC_TIME, 15, 29, rec_time);
   draw_record(SPR_REC_YOUR, 55, 69, rec_yours);
   blit(SPR_BUYIN, rx(536), ty(130) - PILL_UP);
 }
+#endif
 
 /* ---- the route map (clMiniMap): data/minimap/SkNavi.igb from above, turned with the car,
  * in a window of the console (packed by tools/navipack.py into navi.bin). Each area's road
@@ -1093,17 +1290,29 @@ static int navi_gl_init(void) {
     "precision mediump float; uniform sampler2D uTex; varying vec2 vUV; varying vec4 vColor;\n"
     "void main() { gl_FragColor = texture2D(uTex, vUV) * vColor; }\n";
   const char *attribs[] = { "aPos", "aUV", "aColor" };
+#ifdef WMMT_NATIVE_VK
+  NAVI.prog = cinder_vk_program_create(vs, fs, attribs, 3);
+#else
   NAVI.prog = gl_compile_program(vs, fs, attribs, 3);
+#endif
   if (!NAVI.prog) return -1;
+#ifndef WMMT_NATIVE_VK
   NAVI.u_mvp = glGetUniformLocation(NAVI.prog, "uMVP");
   NAVI.u_tex = glGetUniformLocation(NAVI.prog, "uTex");
+#endif
   return 0;
 }
 
 static void navi_clear(void) {
+#ifdef WMMT_NATIVE_VK
+  if (NAVI.vbo) cinder_vk_buffer_destroy(NAVI.vbo);
+  if (NAVI.ibo) cinder_vk_buffer_destroy(NAVI.ibo);
+  for (int i = 0; i < 2; ++i) if (NAVI.tex[i]) cinder_vk_texture_destroy(NAVI.tex[i]);
+#else
   if (NAVI.vbo) glDeleteBuffers(1, &NAVI.vbo);
   if (NAVI.ibo) glDeleteBuffers(1, &NAVI.ibo);
   glDeleteTextures(2, NAVI.tex);
+#endif
   NAVI.vbo = NAVI.ibo = NAVI.tex[0] = NAVI.tex[1] = 0;
   free(NAVI.mesh); NAVI.mesh = NULL; NAVI.n = 0;
   navi_warm[0] = navi_warm[1] = 0;
@@ -1122,6 +1331,20 @@ static int navi_load(const char *path) {
   fclose(f);
   unsigned h[5] = { 0 };
   if (ok) memcpy(h, d + 4, sizeof h);
+#ifdef WMMT_NATIVE_VK
+  /* Each immutable upload must fit the actual file span, without sum overflow. */
+  if (ok) {
+    size_t available = (size_t)size - 24;
+    for (int i = 0; i < 2; ++i) {
+      unsigned w = h[i * 2], height = h[i * 2 + 1];
+      if (!w || !height || w > INT_MAX || height > INT_MAX || (size_t)w > available / 4 / height) {
+        ok = 0;
+        break;
+      }
+      available -= (size_t)w * height * 4;
+    }
+  }
+#endif
   size_t o = 24 + 4 * ((size_t)h[0] * h[1] + (size_t)h[2] * h[3]);
   if (!ok || o > (size_t)size || !h[4] || !(NAVI.mesh = calloc(h[4], sizeof *NAVI.mesh))) {
     fprintf(stderr, "minimap: invalid data or allocation failure: %s\n", path);
@@ -1149,8 +1372,10 @@ static int navi_load(const char *path) {
   unsigned char *vb = malloc(verts * NAVI_VERT), *ib = malloc(indices * 2);
   ok = n > 0 && (unsigned)n == h[4] && vb && ib;
   if (ok) {
+#ifndef WMMT_NATIVE_VK
     /* Do not confuse earlier renderer errors with this upload. */
     for (int j = 0; j < 16 && glGetError() != GL_NO_ERROR; ++j) {}
+#endif
     p = o;
     for (int i = 0; i < n; ++i) {
       unsigned nv, ni;
@@ -1160,6 +1385,10 @@ static int navi_load(const char *path) {
       memcpy(ib + (size_t)NAVI.mesh[i].index * 2, d + p + 12 + (size_t)nv * NAVI_VERT, (size_t)ni * 2);
       p += 12 + (size_t)nv * NAVI_VERT + (size_t)ni * 2;
     }
+#ifdef WMMT_NATIVE_VK
+    NAVI.vbo = cinder_vk_buffer_create(verts * NAVI_VERT, vb);
+    NAVI.ibo = cinder_vk_buffer_create(indices * 2, ib);
+#else
     glGenBuffers(1, &NAVI.vbo);
     glBindBuffer(GL_ARRAY_BUFFER, NAVI.vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts * NAVI_VERT), vb, GL_STATIC_DRAW);
@@ -1168,9 +1397,14 @@ static int navi_load(const char *path) {
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(indices * 2), ib, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+#endif
     NAVI.tex[0] = upload(d + 24, h[0], h[1]);
     NAVI.tex[1] = upload(d + 24 + 4 * (size_t)h[0] * h[1], h[2], h[3]);
+#ifdef WMMT_NATIVE_VK
+    ok = NAVI.vbo && NAVI.ibo && NAVI.tex[0] && NAVI.tex[1];
+#else
     ok = NAVI.vbo && NAVI.ibo && NAVI.tex[0] && NAVI.tex[1] && glGetError() == GL_NO_ERROR;
+#endif
     if (ok) NAVI.n = n;
   }
   free(vb);
@@ -1183,6 +1417,7 @@ static int navi_load(const char *path) {
 /* PowerVR leaves a texture's real upload to its first draw: the race's first frame drew every
  * HUD sprite for the first time and took some 100 ms on the iPad. The race title page draws
  * them first instead, n a frame, each into one pixel unseen. */
+#ifndef WMMT_NATIVE_VK
 static int warm_one(GLuint tex, unsigned char *done, int *n) {
   if (!tex || *done) return 0;
   if (*n <= 0) return 1;
@@ -1195,7 +1430,9 @@ static int warm_one(GLuint tex, unsigned char *done, int *n) {
   --*n;
   return 0;
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 int hud_warm(float screen_w, float screen_h, int n) {
   if (!tex_prog) return 0;
   glUseProgram(tex_prog);
@@ -1220,10 +1457,12 @@ int hud_warm(float screen_w, float screen_h, int n) {
   glDisableVertexAttribArray(1);
   return left;
 }
+#endif
 
 void hud_set_course(int course) {
   ta_course = course;
   extend_at = -1;
+  ta_seen_section = ta_pb_count = ta_delta_sign = 0;
   NAVI.next = NAVI_UNSET;
 }
 
@@ -1273,6 +1512,7 @@ void hud_set_city(int city) { navi_select(city, 0); }
 static void race_map_rect(float *x, float *y, float *w, float *h);
 static void race_rank_anm(float *x, float *y, float *zoom);
 static void race_time_anm(float *x, float *y, float *zoom);
+#ifndef WMMT_NATIVE_VK
 static void draw_navi(const hud_state *h, const car_race *r) {
   if (!NAVI.n || navi_city < 0 || navi_city != navi_requested) return;
   if (NAVI.next != r->next_area) { /* clMiniMap::update */
@@ -1378,6 +1618,7 @@ static void draw_navi(const hud_state *h, const car_race *r) {
   if (old_sc_on) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
   glViewport(vp[0], vp[1], vp[2], vp[3]);
 }
+#endif
 
 /* a story race (hud_set_story): no time attack records or course name */
 static int ta_story;
@@ -1400,7 +1641,21 @@ void hud_set_story_rivals(const int *chara, const unsigned char *shown, int n, i
   }
 }
 
+static struct { hud_vs_box card; float gap_mm; int bound; const ghost_crown_art *crown; } ghost_rival;
+
+void hud_set_ghost_card(const hud_vs_box *box, int crown_area) {
+  ghost_rival.bound = box != NULL;
+  ghost_rival.gap_mm = NAN;
+  ghost_rival.crown = box ? ghost_original_crown((unsigned)crown_area) : NULL;
+  if (box) ghost_rival.card = *box;
+}
+
+void hud_set_ghost_gap(float gap_mm) {
+  ghost_rival.gap_mm = gap_mm;
+}
+
 void hud_set_story(int story) {
+  hud_set_ghost_card(NULL, -1);
   ta_story = story != 0;
   memset(mark_state, 0, sizeof mark_state);
 }
@@ -1608,17 +1863,17 @@ static void vs_text(int anim, int frame, int tmpl, int base, const unsigned shor
   }
 }
 
-static void draw_vs_box(int i, float gap) {
+static void draw_rival_card(const hud_vs_box *b, int x, float gap_mm) {
   static int anim[2] = { -2, -2 };
   if (anim[0] == -2) {
     anim[0] = anm_find("cons_g_rival");
     anim[1] = anm_find("cons_g_rival_ph");
   }
-  const hud_vs_box *b = &vs_box[i];
   int a = anim[b->steps != 0];
-  if (a < 0) return;
-  int adv = (int)(gap * 1000.0f), m = abs(adv / 1000), neg = adv < 0;
-  if (m > 99999) m = 99999;
+  if (a < 0 || !isfinite(gap_mm)) return;
+  /* Original converts mm to whole meters, retaining the sign below 1 m. */
+  int adv = (int)fminf(99999000.0f, fmaxf(-99999000.0f, gap_mm));
+  int m = abs(adv / 1000), neg = adv < 0;
   int digits = m > 9999 ? 5 : m > 999 ? 4 : m > 99 ? 3 : m > 9 ? 2 : 1;
   anm_swap sw[24];
   int n = 0;
@@ -1648,7 +1903,7 @@ static void draw_vs_box(int i, float gap) {
   for (int k = 0; k < 5; ++k)
     sw[n++] = (anm_swap){ anm_sprite(T_CPU_DIGIT0 + k), text[k] == ' ' ? -1 : uv(UV_CPU_DIGIT0 + text[k] - '0') };
   int frame = neg ? 5 - digits : 4 + digits;
-  float zoom = HUD_K / 1.6f, dx = (1024 + EDGE - (640 - VS_BOX_X[i]) * HUD_K) / 1.6f, dy = (TA_Y + 60 * HUD_K) / 1.6f;
+  float zoom = HUD_K / 1.6f, dx = (1024 + EDGE - (640 - x) * HUD_K) / 1.6f, dy = (TA_Y + 60 * HUD_K) / 1.6f;
   anm_draw_xf(a, frame, 1, dx, dy, zoom, sw, n);
   /* the name (font 1: the menus' font 5 glyphs down to its 20-pixel cells, advances 8 and 16)
    * and the title (font 0: font 1's down to 15, advances 7 and 11), as the plate has them */
@@ -1672,7 +1927,15 @@ static void draw_vs(const car_state *car) {
   if (!vs_n || (r->play_state != 1 && r->play_state != 2)) return;
   draw_vs_place(r);
   for (int i = 0; i < vs_n; ++i)
-    if (r->vs_on[i]) draw_vs_box(i, r->vs_gap[i]);
+    if (r->vs_on[i]) draw_rival_card(&vs_box[i], VS_BOX_X[i], r->vs_gap[i] * 1000.0f);
+}
+
+/* clTargetConsole::draw (0x85be840) draws box 0 in play states 1 and 2
+ * independently of the rival's current visibility on the road. GetPlayState
+ * (0x8982320) supplies Disp2D as true for these native races. */
+static void draw_ghost_card(const car_race *r) {
+  if (ghost_rival.bound && (r->play_state == 1 || r->play_state == 2))
+    draw_rival_card(&ghost_rival.card, VS_BOX_X[0], ghost_rival.gap_mm);
 }
 
 /* ---- the rivals' marks (clRivalMarkConsole: ctor 0x85cc9f8, update 0x85cdc90, draw 0x85ce998;
@@ -1747,9 +2010,40 @@ static void mark_name(int anim, int frame, const short *name, float dx, float dy
   }
 }
 
-typedef struct { int mark, slot, tg; float adv; const short *name; } rival_mark;
+typedef struct {
+  int mark, slot, tg;
+  float adv;
+  const short *name;
+  const ghost_crown_art *crown;
+} rival_mark;
 
-static void draw_mark(const car_state *car, const rival_mark *m, int lead) {
+static void draw_mark_frame(int anim, int frame, const rival_mark *mark, float x, float y, float scale) {
+  int crown_slot = anm_sprite(T_R_CROWN);
+  int crown = mark->crown ? anm_sprite(mark->crown->console) : -1;
+  anm_swap sw[4] = {
+    { anm_sprite(T_R_TEMPLATE), mark->tg ? -1 : anm_sprite(MARK_R[mark->mark]) },
+    { crown_slot, crown },
+    { anm_sprite(T_R_FONT), -1 },
+    { anm_sprite(T_R_FONT2), -1 },
+  };
+  anm_draw_xf(anim, frame, 1, x, y, scale, sw, mark->tg ? 4 : 1);
+  if (mark->crown && crown < 0) {
+    /* Older packs have all eight menu crowns, but only the console template.
+     * Take the crown above the menu glow and use the console's authored slot. */
+    int sprite = anm_sprite(mark->crown->menu);
+    float xf[6], mul[4], add[4];
+    if (sprite >= 0 && anm_sprite_xf(anim, frame, crown_slot, xf, mul, add)) {
+      const float src[4] = {0, 0, 128, (float)mark->crown->ink_height};
+      const float dst[4] = {x + scale * xf[0], y + scale * xf[1],
+                          x + scale * (xf[0] + xf[2] * src[2]),
+                          y + scale * (xf[1] + xf[5] * src[3])};
+      anm_draw_part_col(sprite, src, dst, mul, add);
+    }
+  }
+  if (mark->name) mark_name(anim, frame, mark->name, x, y, scale);
+}
+
+static void draw_mark(const car_state *car, const rival_mark *m, int lead, int advance) {
   static int anim[2] = { -2, -2 };
   if (anim[0] == -2) {
     anim[0] = anm_find("cons_g_R");
@@ -1772,70 +2066,60 @@ static void draw_mark(const car_state *car, const rival_mark *m, int lead) {
   int band = (int)(fabsf(adv) * 5e-5f);
   if (band < 0) band = 0;
   if (band > 2) band = 2;
-  anm_swap sw[4];
-  int nsw;
-  if (m->tg) {
-    sw[0] = (anm_swap){ anm_sprite(T_R_TEMPLATE), -1 };
-    sw[1] = (anm_swap){ anm_sprite(T_R_CROWN), -1 };
-    sw[2] = (anm_swap){ anm_sprite(T_R_FONT), -1 };
-    sw[3] = (anm_swap){ anm_sprite(T_R_FONT2), -1 };
-    nsw = 4;
-  } else {
-    sw[0] = (anm_swap){ anm_sprite(T_R_TEMPLATE), anm_sprite(MARK_R[m->mark]) };
-    nsw = 1;
-  }
   typeof(mark_state[0]) *st = &mark_state[m->mark];
   if (x > -1 && x < 1 && y > -1 && y < 1 && z > -1 && z < 1) {
     float scale = (q[2][0] - q[0][0]) * 100.0f * (half_w / 320.0f);
     scale = scale < 0 ? 0 : scale > 1.8f ? 1.8f : scale;
     int f;
     if (!m->tg) {
-      if (st->pop < 60) ++st->pop;
+      if (advance && st->pop < 60) ++st->pop;
       f = st->pop;
     } else if (m->name && lead) {
       f = MARK_TG[m->mark] + (int)st->phase;
-      st->phase += MARK_SPEED[band];
-      if (st->phase >= 120.0f) st->phase = 0;
+      if (advance) {
+        st->phase += MARK_SPEED[band];
+        if (st->phase >= 120.0f) st->phase = 0;
+      }
       sy += 15.0f * scale;
     } else {
       f = MARK_TG[m->mark] + 60;
       sy += (m->name ? 15.0f : 20.0f) * scale;
     }
-    if (adv > -200000.0f && adv < 3000.0f) {
-      anm_draw_xf(a, f, 1, sx, sy, scale, sw, nsw);
-      if (m->name) mark_name(a, f, m->name, sx, sy, scale);
-    }
+    if (advance) return;
+    if (adv > -200000.0f && adv < 3000.0f) draw_mark_frame(a, f, m, sx, sy, scale);
   } else {
     float mx = 640.0f - sx, lo = 320.0f - half_w + R_HALF_W, hi = 320.0f + half_w - R_HALF_W;
     mx = mx < lo ? lo : mx > hi ? hi : mx;
     float scale = (1.5f + 1.0f - fabsf(adv) / 150000.0f) * 0.4f;
-    int f = st->loop[band]++ % (int)MARK_LOOP[band];
+    int f = st->loop[band] % (int)MARK_LOOP[band];
+    if (advance) { ++st->loop[band]; return; }
     if (m->tg) f += MARK_TG[m->mark];
-    if (adv > 6000.0f && adv < 150000.0f) {
-      anm_draw_xf(a, f, 1, mx, m->tg ? 470.0f : 450.0f, scale, sw, nsw);
-      if (m->name) mark_name(a, f, m->name, mx, 470.0f, scale);
-    }
+    if (adv > 6000.0f && adv < 150000.0f)
+      draw_mark_frame(a, f, m, mx, m->tg ? 470.0f : 450.0f, scale);
   }
 }
 
-static void draw_rival_marks(const car_state *car) {
+static void draw_rival_marks(const car_state *car, int advance) {
   if (!mark_on || (!ta_story && ten_level < 0)) return;
   const car_race *r = &car->race;
   rival_mark m[4];
   int n = 0;
   if (ten_level >= 0) {
-    if (car->rival_shown[0]) m[n++] = (rival_mark){ 1, 0, 0, r->ten_gap * 1000.0f, NULL };
+    if (car->rival_shown[0]) m[n++] = (rival_mark){ 1, 0, 0, r->ten_gap * 1000.0f, NULL, NULL };
   } else if (vs_n) {
     for (int i = 0; i < vs_n && i < CAR_RIVALS && n < 4; ++i)
       if (car->rival_shown[i] && r->vs_on[i])
-        m[n++] = (rival_mark){ vs_box[i].seat & 3, i, 1, r->vs_gap[i] * 1000.0f, vs_box[i].name };
+        m[n++] = (rival_mark){ vs_box[i].seat & 3, i, 1, r->vs_gap[i] * 1000.0f, vs_box[i].name, NULL };
+  } else if (ghost_rival.bound) {
+    if (car->rival_shown[0] && ghost_rival.card.name[0] >= 0 && isfinite(ghost_rival.gap_mm))
+      m[n++] = (rival_mark){ 1, 0, 1, ghost_rival.gap_mm, ghost_rival.card.name, ghost_rival.crown };
   } else {
     int count = story_n ? story_n : 1;
     for (int i = 0; i < count && i < CAR_RIVALS && n < 4; ++i) {
       if (!car->rival_shown[i]) continue;
       int irregular = 0;
       for (int k = 0; k < 11; ++k) irregular |= STORY_IRREGULAR[k][0] == story_sel && STORY_IRREGULAR[k][1] == i + 1;
-      m[n++] = (rival_mark){ i + 1, i, irregular, (story_n ? r->story_gap[i] : r->gap) * 1000.0f, NULL };
+      m[n++] = (rival_mark){ i + 1, i, irregular, (story_n ? r->story_gap[i] : r->gap) * 1000.0f, NULL, NULL };
     }
   }
   int lead = -1; /* the console's first on its sort by advantage */
@@ -1849,7 +2133,7 @@ static void draw_rival_marks(const car_state *car) {
       order[j] = order[j - 1];
       order[j - 1] = t;
     }
-  for (int i = 0; i < n; ++i) draw_mark(car, &m[order[i]], order[i] == lead);
+  for (int i = 0; i < n; ++i) draw_mark(car, &m[order[i]], order[i] == lead, advance);
 }
 
 /* ---- the banner as each rival comes on (clTenStartRivalNameDisp: ctor 0x85e7a2c, update
@@ -1869,21 +2153,10 @@ enum { TEN_BANNER_TEXT = 101700, T_BANNER_ROUND = 0x59f, T_BANNER_NAME = 0x5a0, 
 static void draw_ten_banner(const car_state *car) {
   static int anim = -2;
   if (anim == -2) anim = anm_find("menu_layout_or_demo_0705b");
-  const car_race *r = &car->race;
+  (void)car;
   if (anim < 0 || ten_level < 0) return;
-  int extend = ten_level >= 10, max = extend ? 31 : 9;
-  if (r->ten_rival != banner_rival) { /* reset(false) */
-    banner_rival = r->ten_rival;
-    banner_round = r->ten_beaten < 0 ? 0 : r->ten_beaten > max ? max : r->ten_beaten;
-    int lv = ten_level > 9 ? 9 : ten_level;
-    banner_chara = extend ? banner_round : TEN_CHARA[lv][banner_round > 9 ? 9 : banner_round];
-    banner_frame = 0;
-    banner_on = 0;
-  }
-  if (r->ten_sw_name) banner_on = 1;
   if (banner_frame >= BANNER_FRAMES) return;
-  int f = banner_frame;
-  if (banner_on) ++banner_frame;
+  int f = banner_frame > 0 ? banner_frame - 1 : 0;
   int round = anm_sprite(TEN_BANNER_TEXT + banner_round), name = anm_sprite(TEN_BANNER_TEXT + 32 + banner_chara);
   int t_round = anm_sprite(T_BANNER_ROUND), t_name = anm_sprite(T_BANNER_NAME), t_car = anm_sprite(T_BANNER_CAR);
   anm_swap sw[3] = { { t_round, -1 }, { t_name, -1 }, { t_car, anm_sprite(TEN_FACE[banner_chara][2]) } };
@@ -2373,14 +2646,7 @@ static void draw_ten(const car_state *car) {
   if (!ten_disp) return;
   float zoom = HUD_K / 1.6f, dx = TA_X / 1.6f, dy = TA_Y / 1.6f;
   int extend = ten_level >= 10, max = extend ? 31 : 9;
-  int round = r->ten_beaten < 0 ? 0 : r->ten_beaten > max ? max : r->ten_beaten;
-  if (round != ten_round) {
-    if (ten_round < 0 || ++ten_round_wait > 5) {
-      if (ten_round >= 0 && round > 0) extend_at = r->total; /* clTimeExtendConsole::set */
-      ten_round = round;
-      ten_round_wait = 0;
-    }
-  }
+  (void)max;
   /* cons_g_or_men */
   anm_swap sw[9];
   int n = 0, lv = ten_level + 1, shown = ten_round + 1;
@@ -2574,6 +2840,7 @@ static void race_anm(int g, float *x, float *y, float *zoom) {
 static void race_rank_anm(float *x, float *y, float *zoom) { race_anm(HUD_RACE_RANK, x, y, zoom); }
 static void race_time_anm(float *x, float *y, float *zoom) { race_anm(HUD_RACE_TIME, x, y, zoom); }
 typedef struct { int active; mat4 original; } race_view;
+#ifndef WMMT_NATIVE_VK
 static race_view race_view_begin(int g, const hud_state *h) {
   race_view s = {0, screen_ortho(h->screen_w, h->screen_h)};
   float k = race_k[g];
@@ -2586,10 +2853,14 @@ static race_view race_view_begin(int g, const hud_state *h) {
   glUseProgram(tex_prog); glUniformMatrix4fv(u_tproj, 1, GL_FALSE, p.m);
   s.active = 1; return s;
 }
+#endif
+#ifndef WMMT_NATIVE_VK
 static void race_view_end(race_view s) {
   if (s.active) { glUseProgram(tex_prog); glUniformMatrix4fv(u_tproj, 1, GL_FALSE, s.original.m); }
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void draw_ta(const hud_state *h, const car_state *car, const mat4 *proj) {
   const car_race *r = &car->race;
   if (!SPR[SPR_TILL_GOAL].tex) return;
@@ -2621,20 +2892,26 @@ static void draw_ta(const hud_state *h, const car_state *car, const mat4 *proj) 
   if (r->state == CAR_RACE_RUN) draw_time_extend(r->total);
   glDisableVertexAttribArray(1);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void fill_rect(float x, float y, float w, float h) {
   float v[8] = { x, y, x + w, y, x, y + h, x + w, y + h };
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void frame_rect(rect r, float t) {
   fill_rect(r.x, r.y, r.w, t);
   fill_rect(r.x, r.y + r.h - t, r.w, t);
   fill_rect(r.x, r.y, t, r.h);
   fill_rect(r.x + r.w - t, r.y, t, r.h);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void ring(float cx, float cy, float r0, float r1) {
   float v[66 * 2];
   int n = 0;
@@ -2646,14 +2923,19 @@ static void ring(float cx, float cy, float r0, float r1) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, n / 2);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void disc(float cx, float cy, float r) { ring(cx, cy, 0, r); }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
   float v[6] = { x0, y0, x1, y1, x2, y2 };
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
+#endif
 
 /* Rounded rectangle outline, inset by `in`; 4 corners x 6 steps. */
 static int rrect_path(rect r, float rad, float in, float *v) {
@@ -2671,6 +2953,7 @@ static int rrect_path(rect r, float rad, float in, float *v) {
   return n / 2;
 }
 
+#ifndef WMMT_NATIVE_VK
 static void fill_rrect(rect r, float rad) {
   float v[2 + 28 * 2 + 2];
   v[0] = r.x + r.w / 2;
@@ -2681,7 +2964,9 @@ static void fill_rrect(rect r, float rad) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
   glDrawArrays(GL_TRIANGLE_FAN, 0, n + 2);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void stroke_rrect(rect r, float rad, float t) {
   float a[28 * 2], b[28 * 2], v[29 * 4];
   int n = rrect_path(r, rad, 0, a);
@@ -2694,8 +2979,10 @@ static void stroke_rrect(rect r, float rad, float t) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, (n + 1) * 2);
 }
+#endif
 
 /* One look for every control: smoked glass panel, thin silver rim, orange when held. */
+#ifndef WMMT_NATIVE_VK
 static void button(rect r, int held) {
   if (held) color(1.0f, 0.42f, 0.05f, 0.70f);
   else color(0.04f, 0.05f, 0.08f, 0.50f);
@@ -2705,8 +2992,10 @@ static void button(rect r, int held) {
   color(0.85f, 0.88f, 0.92f, held ? 0.95f : 0.60f);
   stroke_rrect(r, 12, 2);
 }
+#endif
 
 /* a slider pedal's travel v (0..1): a bar up the key's right edge, its foot to its top */
+#ifndef WMMT_NATIVE_VK
 static void pedal_bar(rect r, float v) {
   float x = r.x + r.w - 12, y0 = r.y + PEDAL_FOOT, y1 = r.y + r.h - PEDAL_FOOT;
   color(0, 0, 0, 0.5f);
@@ -2714,7 +3003,9 @@ static void pedal_bar(rect r, float v) {
   color(1.0f, 0.42f, 0.05f, 0.95f);
   fill_rect(x, y1 - v * (y1 - y0), 6, v * (y1 - y0));
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void chevron(float cx, float cy, float s, float dx, float dy) {
   /* thick arrow head pointing along (dx, dy) */
   float px = -dy, py = dx;
@@ -2725,8 +3016,10 @@ static void chevron(float cx, float cy, float s, float dx, float dy) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
+#endif
 
 /* Seven-segment digit; segments a..g as bits 0..6. */
+#ifndef WMMT_NATIVE_VK
 static void digit(int d, float x, float y, float w, float h) {
   static const unsigned char SEG[11] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F,
                                          0x50 /* 'r' */ };
@@ -2740,7 +3033,9 @@ static void digit(int d, float x, float y, float w, float h) {
   if (s & 32) fill_rect(x, y, t, hh);
   if (s & 64) fill_rect(x, y + hh - t * 0.5f, w, t);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void number(int v, int digits, float x, float y, float w, float h) {
   for (int i = digits - 1; i >= 0; --i) {
     int d = v % 10;
@@ -2749,6 +3044,7 @@ static void number(int v, int digits, float x, float y, float w, float h) {
     digit(d, x + (float)i * (w * 1.35f), y, w, h);
   }
 }
+#endif
 
 /* ---- the start's countdown, clCountDownConsole: cons_g_countdown at the top and, for the
  * manual gearbox, cons_g_count_mis_irero ("Put the gear in 2") in the middle, from the menu
@@ -2793,7 +3089,9 @@ static void draw_countdown(const car_state *car) {
   anm_draw(anim, (3 - n) * COUNT_LEN + 16 + (f < COUNT_LEN - 1 ? f : COUNT_LEN - 1), 1);
 }
 
+#ifndef WMMT_NATIVE_VK
 static void draw_keys(const hud_state *h, float steer, int all_keys) {
+  control_alpha = button_opacity;
   /* steering (the gyro's: none); each side's keys in its own projection (key_ortho) */
   if (all_keys) {
     rect brake = h->gyro ? G_BRAKE : BRAKE, up = h->gyro ? G_SHIFT_UP : SHIFT_UP, down = h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN;
@@ -2864,52 +3162,67 @@ static void draw_keys(const hud_state *h, float steer, int all_keys) {
       if (!h->gyro) pedal_bar(brake, h->brake_touch ? h->brake_v : 0);
     }
 
-    /* Shift uses the same right-side anchor, with an optional independent affine. */
-    if (shift_separate) {
-      rect origin = shift_key((rect){0, 0, 1, 1});
-      mat4 m = mat4_identity();
-      m.m[0] = m.m[5] = origin.w;
-      m.m[12] = origin.x; m.m[13] = origin.y;
-      side_proj = mat4_mul(screen_ortho(h->screen_w, h->screen_h), m);
-      glUniformMatrix4fv(u_proj, 1, GL_FALSE, side_proj.m);
-    }
-    /* shift up / down */
+    /* Each shifter shares one affine for its face, icon and touch region. */
+    side_proj = control_ortho(h->screen_w, h->screen_h, HUD_EDIT_SHIFT_UP);
+    glUniformMatrix4fv(u_proj, 1, GL_FALSE, side_proj.m);
     button(up, 0);
-    button(down, 0);
     color(1, 1, 1, 0.92f);
     chevron(up.x + up.w / 2, up.y + up.h / 2 - 4, 22, 0, -1);
+    side_proj = control_ortho(h->screen_w, h->screen_h, HUD_EDIT_SHIFT_DOWN);
+    glUniformMatrix4fv(u_proj, 1, GL_FALSE, side_proj.m);
+    button(down, 0);
+    color(1, 1, 1, 0.92f);
     chevron(down.x + down.w / 2, down.y + down.h / 2 + 4, 22, 0, 1);
   }
 
-  /* pause, reset and camera, small, top centre */
-  mat4 top_proj = key_ortho(h->screen_w, h->screen_h, KEY_TOP);
-  glUniformMatrix4fv(u_proj, 1, GL_FALSE, top_proj.m);
-  button(PAUSE, 0);
   if (all_keys) {
+    mat4 top_proj = key_ortho(h->screen_w, h->screen_h, KEY_TOP);
+    glUniformMatrix4fv(u_proj, 1, GL_FALSE, top_proj.m);
     button(RESET, 0);
-    button(CAMERA, 0);
-    button(TRANS, 0);
     color(1, 1, 1, 0.9f);
     ring(RESET.x + 24, RESET.y + 24, 10, 14);
     triangle(RESET.x + 32, RESET.y + 6, RESET.x + 42, RESET.y + 17, RESET.x + 29, RESET.y + 19);
+    mat4 camera_proj = control_ortho(h->screen_w, h->screen_h, HUD_EDIT_CAMERA);
+    glUniformMatrix4fv(u_proj, 1, GL_FALSE, camera_proj.m);
+    button(CAMERA, 0);
+    color(1, 1, 1, 0.9f);
     ring(CAMERA.x + 24, CAMERA.y + 24, 7, 12);
   }
-  color(1, 1, 1, 0.9f);
-  fill_rect(PAUSE.x + 15, PAUSE.y + 13, 6, 22);
-  fill_rect(PAUSE.x + 27, PAUSE.y + 13, 6, 22);
+  if (!h->pause_disabled) {
+    mat4 pause_proj = control_ortho(h->screen_w, h->screen_h, HUD_EDIT_PAUSE);
+    glUniformMatrix4fv(u_proj, 1, GL_FALSE, pause_proj.m);
+    button(PAUSE, 0);
+    color(1, 1, 1, 0.9f);
+    fill_rect(PAUSE.x + 15, PAUSE.y + 13, 6, 22);
+    fill_rect(PAUSE.x + 27, PAUSE.y + 13, 6, 22);
+  }
+  if (all_keys && h->passing_available) {
+    mat4 top_proj = key_ortho(h->screen_w, h->screen_h, KEY_TOP);
+    glUniformMatrix4fv(u_proj, 1, GL_FALSE, top_proj.m);
+    button(PAUSE, h->passing_pressed);
+    color(1, 1, 1, 0.9f);
+    ring(PAUSE.x + 27, PAUSE.y + 24, 8, 11);
+    for (int ray = 0; ray < 3; ++ray) fill_rect(PAUSE.x + 7, PAUSE.y + 16 + 7 * ray, 12, 2);
+  }
+  control_alpha = 1;
 }
+#endif
 
 /* -1 unknown/hidden; otherwise the leader's metres and independent rank flag.
  * Non-ranking story slots are excluded explicitly; an unavailable competing
  * opponent is unknown, never assumed behind. */
 int hud_finish_result(const car_race *r, int story, int count, unsigned story_excluded,
-                      int ten, int versus, int *trailing) {
+                      int ten, int versus, const float *ghost_gap_mm, int *trailing) {
   if (!trailing) return -1;
   *trailing = 0;
   if (!r || r->play_state != 2 || !r->remain_valid || !isfinite(r->remain) || r->remain < 0) return -1;
   float lead = r->remain;
   int behind = 0;
-  if (ten) {
+  if (ghost_gap_mm) {
+    float gap = *ghost_gap_mm * 0.001f;
+    if (!isfinite(gap)) return -1;
+    if (gap < 0) { lead += gap; behind = 1; }
+  } else if (ten) {
     if (!r->ten_gap_valid || !isfinite(r->ten_gap)) return -1;
     if (r->ten_gap < 0) { lead += r->ten_gap; behind = 1; }
   } else if (versus) {
@@ -2943,7 +3256,7 @@ static void draw_finish_remaining(const car_race *r) {
     if (!car_link_observation_fresh(r->vs_pcb[i], r->vs_observed[i])) return;
   /* Failed model selection can compress physics slots; do not rank them using
    * the uncompressed story-character mapping. Other HUD elements are unchanged. */
-  if (ta_story && !vs_n && ten_level < 0 && !story_ranking_slots_valid) return;
+  if (ta_story && !vs_n && ten_level < 0 && !ghost_rival.bound && !story_ranking_slots_valid) return;
   /* clInfoMessage treats these original irregular characters as non-ranking:
    * their candidate is player distance +100m. Exclusion from the minimum is
    * equivalent. This character-based check is distinct from the rival-mark table. */
@@ -2959,8 +3272,9 @@ static void draw_finish_remaining(const car_race *r) {
       story_excluded |= 1u << slot;
   }
   int trailing;
+  const float *ghost_gap = ghost_rival.bound ? &ghost_rival.gap_mm : NULL;
   int metres = hud_finish_result(r, ta_story, vs_n ? vs_n : story_n, story_excluded,
-                                 ten_level >= 0, vs_n > 0, &trailing);
+                                 ten_level >= 0, vs_n > 0, ghost_gap, &trailing);
   if (metres < 0) return;
   int number = anm_find("cons_g_last_000m");
   int label = anm_find(trailing ? "cons_g_last_tonikaku" : "cons_g_last_saigo");
@@ -2977,6 +3291,39 @@ static void draw_finish_remaining(const car_race *r) {
   anm_draw_ex(number, 150, 1, 0, 0, sw, 4);
 }
 
+/* Explicit 60 Hz visual update; repeated presentations cannot consume dialogue,
+ * advance signs/banners/marks, or change TenDisp2D at the display refresh rate. */
+void hud_visual_tick(const car_state *car) {
+  const car_race *r = &car->race;
+  int sign = r->state == CAR_RACE_RUN && r->sign >= 1 && r->sign <= HUD_SIGNS ? r->sign : 0;
+  if (sign != sign_shown) { sign_shown = sign; sign_t = 0; }
+  if (sign) sign_t = (sign_t + 1) % 60;
+  ten_disp_update(r);
+  if (ten_level < 0 || ten_disp) draw_rival_marks(car, 1);
+  if (ten_level >= 0) {
+    int extend = ten_level >= 10, max = extend ? 31 : 9;
+    if (r->ten_rival != banner_rival) { /* reset(false) */
+      banner_rival = r->ten_rival;
+      banner_round = r->ten_beaten < 0 ? 0 : r->ten_beaten > max ? max : r->ten_beaten;
+      int lv = ten_level > 9 ? 9 : ten_level;
+      banner_chara = extend ? banner_round : TEN_CHARA[lv][banner_round > 9 ? 9 : banner_round];
+      banner_frame = 0;
+      banner_on = 0;
+    }
+    if (r->ten_sw_name) banner_on = 1;
+    if (banner_frame < BANNER_FRAMES && banner_on) ++banner_frame;
+    if (ten_disp) {
+      int round = r->ten_beaten < 0 ? 0 : r->ten_beaten > max ? max : r->ten_beaten;
+      if (round != ten_round && (ten_round < 0 || ++ten_round_wait > 5)) {
+        if (ten_round >= 0 && round > 0) extend_at = r->total;
+        ten_round = round;
+        ten_round_wait = 0;
+      }
+    }
+  }
+}
+
+#ifndef WMMT_NATIVE_VK
 void hud_draw(const hud_state *h, const car_state *car, const car_input *in, float fps) {
   glUseProgram(prog);
   mat4 proj = screen_ortho(h->screen_w, h->screen_h);
@@ -2991,7 +3338,6 @@ void hud_draw(const hud_state *h, const car_state *car, const car_input *in, flo
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
   /* the 10-in-a-row's consoles only while TenDisp2D is set, its keys but pause too */
-  ten_disp_update(&car->race);
   int consoles = ten_level < 0 || ten_disp, all_keys = !keys_pause_only();
 
   draw_keys(h, car->steer, all_keys);
@@ -3020,32 +3366,22 @@ void hud_draw(const hud_state *h, const car_state *car, const car_input *in, flo
     draw_ta(h, car, &proj);
     draw_plate_text();
   }
-  /* the AT/MT switch (a touch key of the port, not a console: shown while the 10-in-a-row
-   * hides the consoles too) shows the gearbox in use with the shifter's own tag */
-  int tag = car->manual ? SPR_TAG_MT : SPR_TAG_AT;
-  if (tex_prog && SPR[tag].tex && all_keys) {
-    glUseProgram(tex_prog);
-    mat4 top = key_ortho(h->screen_w, h->screen_h, KEY_TOP);
-    glUniformMatrix4fv(u_tproj, 1, GL_FALSE, top.m);
-    tint(1, 1, 1, 1);
-    tint_add(0, 0, 0);
-    glEnableVertexAttribArray(1);
-    float k = fminf(36.0f / SPR[tag].w, 30.0f / SPR[tag].h);
-    sprite_k(tag, TRANS.x + TRANS.w / 2, TRANS.y + TRANS.h / 2, 0, k);
-    glUniformMatrix4fv(u_tproj, 1, GL_FALSE, proj.m);
-    glDisableVertexAttribArray(1);
-  }
-  if (consoles) draw_rival_marks(car);
+  if (consoles) draw_rival_marks(car, 0);
   draw_ten(car);
   if (consoles && ta_story && ten_level < 0) draw_story_info(car);
-  if (consoles) draw_vs(car);
+  if (consoles) {
+    draw_vs(car);
+    draw_ghost_card(&car->race);
+  }
   draw_ten_banner(car);
   draw_finish_remaining(&car->race);
   draw_countdown(car);
   draw_cutin();
   glDisable(GL_BLEND);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_negate(const hud_state *h) {
   glUseProgram(prog);
   mat4 proj = screen_ortho(h->screen_w, h->screen_h);
@@ -3066,9 +3402,11 @@ void hud_negate(const hud_state *h) {
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glDisable(GL_BLEND);
 }
+#endif
 
 void hud_white(const hud_state *h, float alpha) { hud_fade(h, 1.0f, alpha); }
 
+#ifndef WMMT_NATIVE_VK
 void hud_fade(const hud_state *h, float grey, float alpha) {
   if (alpha <= 0.0f) return;
   glUseProgram(prog);
@@ -3087,18 +3425,22 @@ void hud_fade(const hud_state *h, float grey, float alpha) {
   fill_rect(-EDGE, 0, h->screen_w + 2 * EDGE, h->screen_h);
   glDisable(GL_BLEND);
 }
+#endif
 
 int hud_menu_key(float x, float y) {
   const float k = MENU_KEY_SLOP;
-  if (inside((rect){ MENU_LEFT.x - k, MENU_LEFT.y - k, MENU_LEFT.w + 2 * k, MENU_LEFT.h + 2 * k }, x, y)) return -1;
-  if (inside((rect){ MENU_RIGHT.x - k, MENU_RIGHT.y - k, MENU_RIGHT.w + 2 * k, MENU_RIGHT.h + 2 * k }, x, y)) return 1;
-  if (inside(MENU_BACK, x, y)) return HUD_MENU_BACK;
-  if (inside(MENU_OPTION, x, y)) return HUD_MENU_OPTION;
-  if (inside(MENU_HIDDEN, x, y)) return HUD_MENU_HIDDEN;
+  rect left = menu_place(MENU_LEFT, KEY_LEFT), right = menu_place(MENU_RIGHT, KEY_RIGHT);
+  if (inside((rect){ left.x - k, left.y - k, left.w + 2 * k, left.h + 2 * k }, x, y)) return -1;
+  if (inside((rect){ right.x - k, right.y - k, right.w + 2 * k, right.h + 2 * k }, x, y)) return 1;
+  if (inside(menu_place(MENU_BACK, KEY_RIGHT), x, y)) return HUD_MENU_BACK;
+  if (inside(menu_place(MENU_OPTION, KEY_RIGHT), x, y)) return HUD_MENU_OPTION;
+  if (inside(menu_place(MENU_HIDDEN, KEY_TOP), x, y)) return HUD_MENU_HIDDEN;
   return 0;
 }
 
+#ifndef WMMT_NATIVE_VK
 void hud_draw_menu_option(float screen_w, float screen_h, int held) {
+  rect r = menu_place(MENU_OPTION, KEY_RIGHT);
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
@@ -3110,10 +3452,10 @@ void hud_draw_menu_option(float screen_w, float screen_h, int held) {
   glDisableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
-  button(MENU_OPTION, held);
+  button(r, held);
   /* a gear: eight teeth round a ring */
   color(1, 1, 1, 0.92f);
-  float cx = MENU_OPTION.x + MENU_OPTION.w / 2, cy = MENU_OPTION.y + MENU_OPTION.h / 2;
+  float cx = r.x + r.w / 2, cy = r.y + r.h / 2;
   ring(cx, cy, 5, 13);
   for (int k = 0; k < 8; ++k) {
     float a = (float)k * 0.785398f, c = cosf(a), s = sinf(a), w = 4.0f;
@@ -3123,8 +3465,11 @@ void hud_draw_menu_option(float screen_w, float screen_h, int held) {
   }
   glDisable(GL_BLEND);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_draw_menu_dress(float screen_w, float screen_h, int held) {
+  rect r = menu_place(MENU_OPTION, KEY_RIGHT);
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
@@ -3136,10 +3481,10 @@ void hud_draw_menu_dress(float screen_w, float screen_h, int held) {
   glDisableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
-  button(MENU_OPTION, held);
+  button(r, held);
   /* a wheel: the rim, the hub and five spokes */
   color(1, 1, 1, 0.92f);
-  float cx = MENU_OPTION.x + MENU_OPTION.w / 2, cy = MENU_OPTION.y + MENU_OPTION.h / 2;
+  float cx = r.x + r.w / 2, cy = r.y + r.h / 2;
   ring(cx, cy, 15, 19);
   ring(cx, cy, 2, 5);
   for (int k = 0; k < 5; ++k) {
@@ -3150,7 +3495,9 @@ void hud_draw_menu_dress(float screen_w, float screen_h, int held) {
   }
   glDisable(GL_BLEND);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_draw_menu_hidden(float screen_w, float screen_h, int held) {
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
@@ -3163,11 +3510,14 @@ void hud_draw_menu_hidden(float screen_w, float screen_h, int held) {
   glDisableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
-  button(MENU_HIDDEN, held);
+  button(menu_place(MENU_HIDDEN, KEY_TOP), held);
   glDisable(GL_BLEND);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_draw_menu_erase(float screen_w, float screen_h, int held, int armed) {
+  rect r = menu_place(MENU_OPTION, KEY_RIGHT);
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
@@ -3179,11 +3529,11 @@ void hud_draw_menu_erase(float screen_w, float screen_h, int held, int armed) {
   glDisableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
-  button(MENU_OPTION, held);
+  button(r, held);
   /* a bin: the lid and its handle, the body with three slots (red once armed) */
   if (armed) color(1, 0.25f, 0.2f, 0.95f);
   else color(1, 1, 1, 0.92f);
-  float cx = MENU_OPTION.x + MENU_OPTION.w / 2, cy = MENU_OPTION.y + MENU_OPTION.h / 2;
+  float cx = r.x + r.w / 2, cy = r.y + r.h / 2;
   fill_rect(cx - 6, cy - 21, 12, 3);
   fill_rect(cx - 17, cy - 18, 34, 4);
   fill_rect(cx - 13, cy - 11, 3, 29);
@@ -3192,8 +3542,12 @@ void hud_draw_menu_erase(float screen_w, float screen_h, int held, int armed) {
   for (int k = -1; k <= 1; ++k) fill_rect(cx + (float)k * 6 - 1, cy - 7, 2.5f, 19);
   glDisable(GL_BLEND);
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int back) {
+  rect left = menu_place(MENU_LEFT, KEY_LEFT), right = menu_place(MENU_RIGHT, KEY_RIGHT);
+  rect ret = menu_place(MENU_BACK, KEY_RIGHT);
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
@@ -3206,17 +3560,17 @@ void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int 
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
   if (keys) {
-    button(MENU_LEFT, held < 0);
-    button(MENU_RIGHT, held == 1);
+    button(left, held < 0);
+    button(right, held == 1);
     color(1, 1, 1, 0.92f);
-    chevron(MENU_LEFT.x + MENU_LEFT.w / 2 - 6, MENU_LEFT.y + MENU_LEFT.h / 2, 22, -1, 0);
-    chevron(MENU_RIGHT.x + MENU_RIGHT.w / 2 + 6, MENU_RIGHT.y + MENU_RIGHT.h / 2, 22, 1, 0);
+    chevron(left.x + left.w / 2 - 6, left.y + left.h / 2, 22, -1, 0);
+    chevron(right.x + right.w / 2 + 6, right.y + right.h / 2, 22, 1, 0);
   }
   if (back) {
     /* a return arrow: shaft and hook, with a chevron head pointing left */
-    button(MENU_BACK, held == HUD_MENU_BACK);
+    button(ret, held == HUD_MENU_BACK);
     color(1, 1, 1, 0.92f);
-    float cx = MENU_BACK.x + MENU_BACK.w / 2, cy = MENU_BACK.y + MENU_BACK.h / 2;
+    float cx = ret.x + ret.w / 2, cy = ret.y + ret.h / 2;
     chevron(cx - 12, cy + 6, 16, -1, 0);
     fill_rect(cx - 14, cy + 4, 26, 4);
     fill_rect(cx + 10, cy - 12, 4, 20);
@@ -3224,6 +3578,7 @@ void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int 
   }
   glDisable(GL_BLEND);
 }
+#endif
 
 /* 5x7 glyphs, a row a byte (bit 4 the left column), for ' ' .. '_' */
 static const unsigned char FONT5X7[64][7] = {
@@ -3250,7 +3605,12 @@ enum { UI_QUADS = 2048 };
 static float ui_v[UI_QUADS * 12];
 static int ui_n;
 static float ui_rgba[4];
+#ifdef WMMT_NATIVE_VK
+static void ui_color(float r, float g, float b, float a);
+static void ui_quad(float x, float y, float w, float h);
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void ui_flush(void) {
   if (!ui_n) return;
   color(ui_rgba[0], ui_rgba[1], ui_rgba[2], ui_rgba[3]);
@@ -3258,19 +3618,25 @@ static void ui_flush(void) {
   glDrawArrays(GL_TRIANGLES, 0, ui_n * 6);
   ui_n = 0;
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void ui_color(float r, float g, float b, float a) {
   if (ui_n && (ui_rgba[0] != r || ui_rgba[1] != g || ui_rgba[2] != b || ui_rgba[3] != a)) ui_flush();
   ui_rgba[0] = r, ui_rgba[1] = g, ui_rgba[2] = b, ui_rgba[3] = a;
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 static void ui_quad(float x, float y, float w, float h) {
   if (ui_n == UI_QUADS) ui_flush();
   float *v = ui_v + ui_n++ * 12;
   v[0] = x, v[1] = y, v[2] = x + w, v[3] = y, v[4] = x, v[5] = y + h;
   v[6] = x + w, v[7] = y, v[8] = x + w, v[9] = y + h, v[10] = x, v[11] = y + h;
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_ui_begin(float screen_w, float screen_h) {
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
@@ -3285,21 +3651,26 @@ void hud_ui_begin(float screen_w, float screen_h) {
   glEnableVertexAttribArray(0);
   ui_n = 0;
 }
+#endif
 
+#ifndef WMMT_NATIVE_VK
 void hud_ui_end(void) {
   ui_flush();
   glDisable(GL_BLEND);
 }
+#endif
 
 void hud_ui_rect(float x, float y, float w, float h, float r, float g, float b, float a) {
   ui_color(r, g, b, a);
   ui_quad(x, y, w, h);
 }
 
+#ifndef WMMT_NATIVE_VK
 void hud_ui_button(float x, float y, float w, float h, int held) {
   ui_flush();
   button((rect){ x, y, w, h }, held);
 }
+#endif
 
 static int glyph(char c) {
   if (c >= 'a' && c <= 'z') c = (char)(c - 32);
@@ -3339,7 +3710,7 @@ void hud_lift_parts(float cluster, float plate, float pill, float map, float gat
 void hud_lift(float dy, float left) {
   hud_lift_parts(dy, dy, dy, left, left);
   /* the back mirror is on here: the top keys either side of it again, as on the iPad */
-  PAUSE.x = 236, RESET.x = 296, CAMERA.x = 116, TRANS.x = 176;
+  PAUSE.x = 236, RESET.x = 296, CAMERA.x = 116;
 }
 
 /* ---- the player's own key layout (hud.h hud_layout_set) ---- */
@@ -3360,29 +3731,55 @@ void hud_layout_set(int group, float k, float dx, float dy) {
 }
 
 static rect group_rect_mode(int group, int mode) {
-  if (group == HUD_EDIT_SHIFT) {
-    rect up = mode == HUD_STEER_GYRO ? G_SHIFT_UP : SHIFT_UP;
-    rect down = mode == HUD_STEER_GYRO ? G_SHIFT_DOWN : SHIFT_DOWN;
+  const int gyro = mode == HUD_STEER_GYRO;
+  switch (group) {
+  case HUD_EDIT_SHIFT_UP: return gyro ? G_SHIFT_UP : SHIFT_UP;
+  case HUD_EDIT_SHIFT_DOWN: return gyro ? G_SHIFT_DOWN : SHIFT_DOWN;
+  case HUD_EDIT_PAUSE: return PAUSE;
+  case HUD_EDIT_CAMERA: return CAMERA;
+  case HUD_EDIT_SHIFT: {
+    rect up = gyro ? G_SHIFT_UP : SHIFT_UP;
+    rect down = gyro ? G_SHIFT_DOWN : SHIFT_DOWN;
     return (rect){up.x, up.y, up.w, down.y + down.h - up.y};
   }
-  if (group == KEY_RIGHT && shift_separate) {
-    float x = mode == HUD_STEER_GYRO ? THROTTLE.x : BRAKE.x;
-    return (rect){x, THROTTLE.y, THROTTLE.x + THROTTLE.w - x, THROTTLE.h};
+  case KEY_RIGHT:
+    if (shift_separate || (button_layout[0].separate && button_layout[1].separate)) {
+      float x = gyro ? THROTTLE.x : BRAKE.x;
+      return (rect){x, THROTTLE.y, THROTTLE.x + THROTTLE.w - x, THROTTLE.h};
+    }
+    break;
+  case KEY_LEFT:
+    if (mode == HUD_STEER_WHEEL)
+      return (rect){WHEEL_CX-128, WHEEL_CY-128, 256, 256};
+    if (mode == HUD_STEER_STICK)
+      return (rect){STICK_ZONE.x, STICK_ZONE.y-14, STICK_ZONE.w, STICK_ZONE.h+14};
+    break;
+  case KEY_TOP: {
+    rect r = RESET;
+    if (!button_layout[HUD_EDIT_PAUSE-HUD_EDIT_SHIFT_UP].separate) {
+      r.w += r.x - PAUSE.x; r.x = PAUSE.x;
+    }
+    if (!button_layout[HUD_EDIT_CAMERA-HUD_EDIT_SHIFT_UP].separate) {
+      r.w += r.x - CAMERA.x; r.x = CAMERA.x;
+    }
+    return r;
   }
-  if (group == KEY_LEFT && mode == HUD_STEER_WHEEL)
-    /* Include the slightly larger circular touch capture radius. */
-    return (rect){WHEEL_CX-128, WHEEL_CY-128, 256, 256};
-  if (group == KEY_LEFT && mode == HUD_STEER_STICK)
-    return (rect){STICK_ZONE.x, STICK_ZONE.y-14, STICK_ZONE.w, STICK_ZONE.h+14};
-  return group_rect(group, mode == HUD_STEER_GYRO);
+  }
+  return group_rect(group, gyro);
+}
+
+static rect placed_group(int group, int mode) {
+  rect r = group_rect_mode(group, mode);
+  if (group >= HUD_EDIT_SHIFT_UP) return control_key(r, group);
+  return group == HUD_EDIT_SHIFT ? shift_key(r) : key(r, group);
 }
 
 int hud_layout_hit_mode(int mode, float x, float y) {
-  rect s = shift_key(group_rect_mode(HUD_EDIT_SHIFT, mode));
-  if (x >= s.x - 10 && x <= s.x + s.w + 10 && y >= s.y - 10 && y <= s.y + s.h + 10) return HUD_EDIT_SHIFT;
-  for (int g = 0; g < HUD_KEY_GROUPS; ++g) {
-    rect r = key(group_rect_mode(g, mode), g);
-    if (x >= r.x - 10 && x <= r.x + r.w + 10 && y >= r.y - 10 && y <= r.y + r.h + 10) return g;
+  for (int g = HUD_EDIT_SHIFT_UP; g < HUD_EDIT_GROUPS; ++g)
+    if (inside(placed_group(g, mode), x, y)) return g;
+  for (int g = HUD_EDIT_SHIFT; g >= 0; --g) {
+    rect r = placed_group(g, mode);
+    if (inside((rect){r.x-10, r.y-10, r.w+20, r.h+20}, x, y)) return g;
   }
   return -1;
 }
@@ -3390,9 +3787,10 @@ int hud_layout_hit_mode(int mode, float x, float y) {
 int hud_layout_hit(int gyro, float x, float y) { return hud_layout_hit_mode(gyro ? HUD_STEER_GYRO : HUD_STEER_KEYS, x, y); }
 
 void hud_layout_clamp_mode(int group, int mode, float k, float *dx, float *dy) {
-  if (group < 0 || group > HUD_EDIT_SHIFT) return;
+  if (group < 0 || group >= HUD_EDIT_GROUPS) return;
   k = k < HUD_KEY_K_MIN ? HUD_KEY_K_MIN : k > HUD_KEY_K_MAX ? HUD_KEY_K_MAX : k;
-  rect r = place(group_rect_mode(group, mode), group == HUD_EDIT_SHIFT ? KEY_RIGHT : group, k, *dx, *dy);
+  int side = group >= HUD_EDIT_SHIFT ? control_anchor(group) : group;
+  rect r = place(group_rect_mode(group, mode), side, k, *dx, *dy);
   if (r.x + r.w > 1024 + EDGE) *dx -= r.x + r.w - (1024 + EDGE);
   if (r.x < -EDGE) *dx += -EDGE - r.x;
   if (r.y + r.h > 768) *dy -= r.y + r.h - 768;
@@ -3404,6 +3802,9 @@ void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy) {
 }
 
 void hud_draw_layout_mode(float screen_w, float screen_h, int mode, int sel) {
+#ifdef WMMT_NATIVE_VK
+  hud_native_draw_layout_mode(screen_w, screen_h, mode, sel);
+#else
   hud_state h;
   hud_init(&h, screen_w, screen_h);
   hud_set_steer_mode(&h, mode);
@@ -3422,14 +3823,16 @@ void hud_draw_layout_mode(float screen_w, float screen_h, int mode, int sel) {
   draw_keys(&h, 0, 1);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
   /* each group's box, the chosen one's orange */
-  for (int g = 0; g <= HUD_EDIT_SHIFT; ++g) {
-    rect r = g == HUD_EDIT_SHIFT ? shift_key(group_rect_mode(g, mode)) : key(group_rect_mode(g, mode), g);
+  for (int g = 0; g < HUD_EDIT_GROUPS; ++g) {
+    if (g >= HUD_EDIT_SHIFT && g != sel) continue;
+    rect r = placed_group(g, mode);
     r = (rect){ r.x - 6, r.y - 6, r.w + 12, r.h + 12 };
     if (g == sel) color(1.0f, 0.42f, 0.05f, 0.95f);
     else color(1, 1, 1, 0.35f);
     frame_rect(r, g == sel ? 4 : 2);
   }
   glDisable(GL_BLEND);
+#endif
 }
 
 void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
@@ -3439,11 +3842,23 @@ void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
 void hud_wide(float edge, float key_k) {
   EDGE = edge;
   KEY_K = key_k;
+  /* Width changes rebuild only automatic placement. app_wide reapplies its lift
+   * afterwards; never accumulate that lift or overwrite saved player transforms. */
   CLUSTER_X = 948 + edge;
+  CLUSTER_Y = 286;
+  INFO_Y = 505;
+  PILL_UP = MAP_UP = 0;
   SHIFT_X = 62 - edge;
   SHIFT_Y = 530 - 0.5f * (768 - 604) * (key_k - 1); /* between the map and the bigger ◀ ▶ */
   TA_X = -edge;
+  PAUSE = (rect){ 236, 12, 48, 48 };
+  RESET = (rect){ 296, 12, 48, 48 };
+  CAMERA = (rect){ 116, 12, 48, 48 };
   if (edge > 0) {
-    PAUSE.x = 386, RESET.x = 454, CAMERA.x = 250, TRANS.x = 318;
+    PAUSE.x = 386, RESET.x = 454, CAMERA.x = 250;
   }
 }
+
+#ifdef WMMT_NATIVE_VK
+#include "hud_native_vk.inc"
+#endif

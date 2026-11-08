@@ -5,7 +5,7 @@
  * -ffunction-sections -fdata-sections -Iports/android/src -Iports/android/test \
  * -I<generated-header-directory> ports/android/test/net_car_hud_loopback_host_test.c \
  * src/net.c ports/android/src/hud.c -Wl,-dead_strip -lm -lz \
- * -o "$TMPDIR/net_car_hud_loopback_host_test"
+ * -o /Volumes/CodexWork/net_car_hud_loopback_host_test
  * Generated racing_lamp_data.h and other asset headers are build prerequisites.
  */
 #include <time.h>
@@ -57,16 +57,16 @@ int main(void) {
   /* Constructed snapshot: does not claim physics consumed the packet. */
   car_race r={0}; r.play_state=2; r.remain_valid=1; r.remain=600;
   r.vs_fresh[0]=car_link_time_fresh(fake_now,P.vs_received[1]); r.vs_gap[0]=0;
-  int trailing=-1; assert(hud_finish_result(&r,0,1,0,0,1,&trailing)==600 && !trailing);
-  r.remain=600.01f; assert(hud_finish_result(&r,0,1,0,0,1,&trailing)==-1);
+  int trailing=-1; assert(hud_finish_result(&r,0,1,0,0,1,NULL,&trailing)==600 && !trailing);
+  r.remain=600.01f; assert(hud_finish_result(&r,0,1,0,0,1,NULL,&trailing)==-1);
   fake_now=100.75; send_packet(fd,&client,race,sizeof race); net_race_receive();
   assert(P.vs_received[1]==100);
   fake_now=101.01; assert(!car_link_observation_fresh(1,100));
   r.remain=600; r.vs_fresh[0]=car_link_time_fresh(fake_now,P.vs_received[1]);
-  assert(hud_finish_result(&r,0,1,0,0,1,&trailing)==-1);
+  assert(hud_finish_result(&r,0,1,0,0,1,NULL,&trailing)==-1);
   put32(race+9+0x34,2); send_packet(fd,&client,race,sizeof race); net_race_receive();
   assert(P.vs_received[1]>101 && car_link_observation_fresh(1,P.vs_received[1]));
   r.vs_fresh[0]=car_link_time_fresh(fake_now,P.vs_received[1]);
-  assert(hud_finish_result(&r,0,1,0,0,1,&trailing)==600);
+  assert(hud_finish_result(&r,0,1,0,0,1,NULL,&trailing)==600);
   net_close(); close(fd); free(rc_mem); puts("partial loopback net/car + constructed HUD snapshot: PASS"); return 0;
 }

@@ -9,8 +9,11 @@ import java.util.*;
  * non-cooperating writers must not mutate data. Directory fsync is not guaranteed. */
 public final class DataCoordinator {
  private static final String ID="re3dxplus-data-v1", MARKER=".re3dxplus-install-v1";
- private final Path base,state; private final DataManifest.Limits limits; private final DirectorySync sync;
+ private final Path base,state; private final DataManifest.Limits limits; private final DirectorySync sync; private final Baselines baselines;
  public interface Fault { void at(String stage) throws IOException; }
+ /** Only inventories authenticated by the signed package may be supplied here.
+  * A completion marker is a lookup key, never proof of resource ownership. */
+ public interface Baselines { DataManifest find(String zipSha256) throws IOException; }
  private static final Set<String> HELD_LOCKS=new HashSet<>();
  public static final class ProcessLock implements Closeable {
   private final RandomAccessFile file; private final FileLock lock; private final String path;
@@ -28,8 +31,10 @@ public final class DataCoordinator {
   }
  }
  public interface DirectorySync { void sync(Path path) throws IOException; }
- public DataCoordinator(Path b,Path s,DataManifest.Limits l){this(b,s,l,DataCoordinator::nativeSyncDir);}
- public DataCoordinator(Path b,Path s,DataManifest.Limits l,DirectorySync d){base=b.toAbsolutePath().normalize();state=s.toAbsolutePath().normalize();limits=l;sync=Objects.requireNonNull(d);}
+ public DataCoordinator(Path b,Path s,DataManifest.Limits l){this(b,s,l,DataCoordinator::nativeSyncDir,null);}
+ public DataCoordinator(Path b,Path s,DataManifest.Limits l,DirectorySync d){this(b,s,l,d,null);}
+ public DataCoordinator(Path b,Path s,DataManifest.Limits l,DirectorySync d,Baselines history){base=b.toAbsolutePath().normalize();state=s.toAbsolutePath().normalize();limits=l;sync=Objects.requireNonNull(d);baselines=history;}
+ public static DataCoordinator withBaselines(Path b,Path s,DataManifest.Limits l,Baselines history){return new DataCoordinator(b,s,l,DataCoordinator::nativeSyncDir,Objects.requireNonNull(history));}
  private Path p(String s){return state.resolve(s);} private static boolean exists(Path p){return Files.exists(p,LinkOption.NOFOLLOW_LINKS);}
  private static void hit(Fault f,String s)throws IOException{if(f!=null)f.at(s);}
  private static void nativeSyncDir(Path p)throws IOException{try(FileChannel c=FileChannel.open(p,StandardOpenOption.READ)){c.force(true);}catch(UnsupportedOperationException | SecurityException e){throw new IOException("Cannot sync directory: "+p,e);}}
@@ -128,11 +133,72 @@ public final class DataCoordinator {
   try{hit(f,"after-pending-delete");cleanup(tx,journal[2],journal[3],f);}catch(IOException|RuntimeException ignored){/* Cleanup never revokes readiness. */}
   return root;
  }
+ private Path prepareActive(DataManifest.ZipSource src,Fault f,String zip,DataManifest active)throws IOException{
+  Path root=root(active);
+  if(!Files.isDirectory(root,LinkOption.NOFOLLOW_LINKS))throw new IOException("Registered data missing");
+  if(active.zipSha256.equals(zip))return root;
+  DataManifest next=DataManifest.fromZip(src,limits,active.resourceDirectory,ID);
+  if(next.files().isEmpty()||!next.zipSha256.equals(zip))throw new IOException("Empty or changed ZIP");
+  Path marker=root.resolve(MARKER);boolean marked=exists(marker);
+  if(marked&&!text(marker).equals(ID+":"+active.zipSha256))throw new IOException("Registered marker changed; cannot safely update");
+  pending(marked?"update-marked":"update-unmarked",active,next);hit(f,"after-pending");return resume(src,f);
+ }
+ private void requireCleanBootstrap()throws IOException{
+  for(String name:new String[]{"overlay.journal","old.manifest","new.manifest"})
+   if(exists(p(name)))throw new IOException("Unbound update state; existing files preserved for review");
+  try(DirectoryStream<Path> dirs=Files.newDirectoryStream(state,"txn-*")){
+   if(dirs.iterator().hasNext())throw new IOException("Unbound update transaction; existing files preserved for review");
+  }
+ }
+ private static final class Candidate{
+  final Path path;final String marker;final DataManifest baseline;
+  Candidate(Path p,String m,DataManifest b){path=p;marker=m;baseline=b;}
+ }
  public Path prepare(DataManifest.ZipSource src,Fault f)throws IOException{
-  Files.createDirectories(base);Files.createDirectories(state);if(Files.isSymbolicLink(base)||Files.isSymbolicLink(state))throw new IOException("Unsafe storage");if(exists(p("pending")))resume(src,f);String zip;try(InputStream in=src.open()){zip=hash(in);}DataManifest active=exists(p("active.manifest"))?read(p("active.manifest")):null;
-  if(active!=null){Path root=root(active);if(!Files.isDirectory(root,LinkOption.NOFOLLOW_LINKS))throw new IOException("Registered data missing");if(active.zipSha256.equals(zip))return root;DataManifest next=DataManifest.fromZip(src,limits,active.resourceDirectory,ID);if(next.files().isEmpty()||!next.zipSha256.equals(zip))throw new IOException("Empty or changed ZIP");Path marker=root.resolve(MARKER);boolean marked=exists(marker);if(marked&&!text(marker).equals(ID+":"+active.zipSha256))throw new IOException("Registered marker changed; cannot safely update");pending(marked?"update-marked":"update-unmarked",active,next);hit(f,"after-pending");return resume(src,f);}
-  List<Path> matches=new ArrayList<>();boolean unknown=false;try(DirectoryStream<Path> ds=Files.newDirectoryStream(base)){for(Path d:ds){unknown=true;String name=d.getFileName().toString();if(name.matches("[0-9a-f]{64}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")&&!Files.isSymbolicLink(d)&&Files.isDirectory(d,LinkOption.NOFOLLOW_LINKS)&&exists(d.resolve(MARKER))&&text(d.resolve(MARKER)).equals(ID+":"+zip))matches.add(d);}}
-  if(matches.size()>1)throw new IOException("Multiple matching installations");if(matches.size()==1){Path r=matches.get(0);DataManifest m=DataManifest.fromZip(src,limits,r.getFileName().toString(),ID);if(m.files().isEmpty()||!m.zipSha256.equals(zip))throw new IOException("Empty or changed ZIP");verify(r,m);syncDir(state.getParent());m.writeAtomic(p("active.manifest"),null,limits);syncDir(state);return r;}
-  if(unknown)throw new IOException("Existing data lacks trusted baseline or matching ZIP; cannot safely update");String name=zip+"-"+UUID.randomUUID();DataManifest next=DataManifest.fromZip(src,limits,name,ID);if(next.files().isEmpty()||!next.zipSha256.equals(zip))throw new IOException("Empty or changed ZIP");pending("init",null,next);hit(f,"after-pending");return resume(src,f);
+  Files.createDirectories(base);Files.createDirectories(state);
+  if(Files.isSymbolicLink(base)||Files.isSymbolicLink(state))throw new IOException("Unsafe storage");
+  // A registered or interrupted update is never replaced by legacy discovery.
+  if(exists(p("pending")))resume(src,f);
+  String zip;try(InputStream in=src.open()){zip=hash(in);}
+  DataManifest active=exists(p("active.manifest"))?read(p("active.manifest")):null;
+  if(active!=null)return prepareActive(src,f,zip,active);
+  requireCleanBootstrap();
+  List<Candidate> matches=new ArrayList<>();boolean unknown=false,sawInterrupted=false;
+  try(DirectoryStream<Path> ds=Files.newDirectoryStream(base)){
+   for(Path d:ds){
+    unknown=true;String name=d.getFileName().toString();
+    if(!name.matches("[0-9a-f]{64}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")||Files.isSymbolicLink(d)||!Files.isDirectory(d,LinkOption.NOFOLLOW_LINKS)||!exists(d.resolve(MARKER)))continue;
+    String marked=text(d.resolve(MARKER));
+    if(marked.startsWith(ID+":in-progress:")){sawInterrupted=true;continue;} // Never adopt a partial root.
+    if(!marked.startsWith(ID+":"))continue;
+    String prior=marked.substring(ID.length()+1);
+    if(!prior.matches("[0-9a-f]{64}"))continue;
+    if(prior.equals(zip)){matches.add(new Candidate(d,marked,null));continue;}
+    DataManifest baseline=baselines==null?null:baselines.find(prior);
+    if(baseline==null)continue; // Unknown siblings remain unowned and untouched.
+    if(!prior.equals(baseline.zipSha256)||!ID.equals(baseline.canonicalId)||baseline.files().isEmpty())throw new IOException("Invalid packaged historical baseline");
+    matches.add(new Candidate(d,marked,baseline.rebindDirectory(name)));
+   }
+  }
+  // Count before verifying: a damaged recognized root cannot make another root
+  // appear uniquely authoritative. No timestamps or directory order select it.
+  if(matches.size()>1)throw new IOException("Multiple recognized installations; existing data preserved");
+  if(matches.size()==1){
+   Candidate selected=matches.get(0);Path r=selected.path;
+   DataManifest m=selected.baseline==null?DataManifest.fromZip(src,limits,r.getFileName().toString(),ID):selected.baseline;
+   if(m.files().isEmpty()||(selected.baseline==null&&!m.zipSha256.equals(zip)))throw new IOException("Empty or changed ZIP");
+   hit(f,"before-legacy-verify");verify(r,m);hit(f,"after-legacy-verify");
+   if(!root(m).equals(r)||!text(r.resolve(MARKER)).equals(selected.marker))throw new IOException("Installation changed during baseline verification");
+   syncDir(base);syncDir(state.getParent());hit(f,"before-legacy-publish");
+   if(!text(r.resolve(MARKER)).equals(selected.marker))throw new IOException("Installation marker changed before registration");
+   m.writeAtomic(p("active.manifest"),null,limits);syncDir(state);hit(f,"after-legacy-publish");
+   // Publish the durable old inventory first, then reuse the existing updater.
+   return prepareActive(src,f,zip,m);
+  }
+  if(sawInterrupted)throw new IOException("Interrupted installation has no registered transaction; preserve data for review");
+  if(unknown)throw new IOException("Existing data lacks a supported verified baseline; existing files preserved");
+  String name=zip+"-"+UUID.randomUUID();DataManifest next=DataManifest.fromZip(src,limits,name,ID);
+  if(next.files().isEmpty()||!next.zipSha256.equals(zip))throw new IOException("Empty or changed ZIP");
+  pending("init",null,next);hit(f,"after-pending");return resume(src,f);
  }
 }

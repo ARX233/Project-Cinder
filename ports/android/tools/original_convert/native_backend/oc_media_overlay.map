@@ -1,0 +1,7 @@
+OC_MEDIA_1 {
+  global: oc_media_convert_fd; oc_media_build_info;
+};
+OC_MEDIA_OVERLAY_2 {
+  global: oc_media_convert_overlay_fd; oc_media_overlay_apply_rgb24; oc_media_overlay_build_info;
+  local: *;
+} OC_MEDIA_1;

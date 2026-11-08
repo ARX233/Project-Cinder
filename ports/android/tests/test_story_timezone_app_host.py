@@ -6,11 +6,12 @@ Run: python3 ports/android/tests/test_story_timezone_app_host.py
 """
 from pathlib import Path
 import shutil
+import os
 import subprocess
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(os.environ.get('CINDER_TEST_SOURCE_ROOT', str(Path(__file__).resolve().parents[1]))).resolve()
 
 
 def block(src, start):
@@ -101,8 +102,12 @@ class AppStoryTimezone(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='wmmt-story-app-') as tmp:
             for port in ('android','ipad'):
                 with self.subTest(port=port):
-                    source = ROOT / 'ports' / port / 'src' / 'app.c'
-                    header = ROOT / 'ports' / port / 'src' / 'menu.h'
+                    # This workspace has one shared source tree, not two old
+                    # ports/<name> checkouts. Explicit overrides still permit
+                    # testing independently supplied platform trees.
+                    port_src = Path(os.environ.get('CINDER_TEST_' + port.upper() + '_SRC', str(ROOT / 'src'))).resolve()
+                    source = port_src / 'app.c'
+                    header = port_src / 'menu.h'
                     cfile = Path(tmp) / (port + '.c')
                     binary = Path(tmp) / port
                     data = Path(tmp) / (port + '-data'); data.mkdir()

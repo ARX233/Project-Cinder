@@ -1,6 +1,9 @@
 #include "junction_barrier.h"
 #include "anm.h"
 #include "gl.h"
+#ifdef WMMT_NATIVE_VK
+#include "native_vk.h"
+#endif
 #include <math.h>
 #include <string.h>
 
@@ -80,18 +83,37 @@ int junction_barrier_draw(const junction_barrier *b, const mat4 *world_vp,
   if (frame_distance2(&b->right,eye,h)>frame_distance2(&b->left,eye,h)) {
     render_vertex tmp[4]; memcpy(tmp,verts,sizeof tmp); memcpy(verts,verts+4,sizeof tmp); memcpy(verts+4,tmp,sizeof tmp);
   }
+#ifdef WMMT_NATIVE_VK
+  /* Basic device availability only: this metadata query never acquires/claims
+   * a frame. The caller already admitted the frame outside Android's mutex;
+   * the typed sprite recorder still validates its explicit target/program. */
+  if (!cinder_vk_device_api_version()) return 0;
+#else
   if (!glGetString(GL_VERSION)) return 0;
+#endif
   int sprite=anm_sprite(0x569);
   if (sprite<0) return 0;
+#ifndef WMMT_NATIVE_VK
   /* texture() uploads/binds on the active unit; the scene shader samples unit 0. */
   glActiveTexture(GL_TEXTURE0);
+#endif
   unsigned int tex=anm_sprite_texture(sprite);
   if (!tex) return 0;
+#ifdef WMMT_NATIVE_VK
+  /* The legacy path explicitly enables depth even for a caller's overlay
+   * parameters. Author that choice without mutating caller state or GL bits.
+   * This sprite wrapper only writes draws; all other parameters stay borrowed. */
+  render_params native_params=*p;
+  native_params.no_depth_test=0;
+  render_sprites_by_colour(world_vp,verts,2,tex,&native_params);
+  p->draws=native_params.draws;
+#else
   glBlendEquation(GL_FUNC_ADD);
   glEnable(GL_DEPTH_TEST);
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glEnableVertexAttribArray(2);
   render_sprites_by_colour(world_vp,verts,2,tex,p);
+#endif
   return 2;
 }

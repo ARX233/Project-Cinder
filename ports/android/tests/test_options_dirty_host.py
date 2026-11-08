@@ -16,8 +16,9 @@ class OptionsDirtyHost(unittest.TestCase):
         app = (SRC / 'app.c').read_text()
         menu = (SRC / 'menu.c').read_text()
         start = app.index('  if (G.menu.garage_changed) {', app.index('  story_new_card_commit();'))
-        end = app.index('  if (go) {', start)
+        end = app.index('  if (go && app_ghost_mode()', start)
         dispatch = app[start:end]
+        fps = menu[menu.index('#define OPT_FPS_Y'):menu.index('static void draw_option_fps(')]
         code = r'''
 #include <assert.h>
 #include <errno.h>
@@ -34,7 +35,7 @@ typedef struct { int lv; } st_states;
 static void snd_menu(int x) { (void)x; }
 static void st_states_of(menu_state *m, st_states *s) { (void)m; s->lv=0; }
 static const float CH_KEY[4]={205,407.5f,230,35}, CH_PREV[4]={143,407.5f,52,35}, CH_NEXT[4]={445,407.5f,52,35};
-''' + '\n'.join(function(menu, m) for m in ('static int ch_hit(', 'static void chapters_page(', 'static int chapters_tap(', 'static int traffic_tap(')) + '\n' + function(app, 'static int options_save(void) {') + r'''
+''' + '\n'.join(function(menu, m) for m in ('static int ch_hit(', 'static void chapters_page(', 'static int chapters_tap(', 'static int traffic_tap(')) + '\n' + fps + function(app, 'static int options_save(void) {') + r'''
 static int garages;
 static void hq_apply(void) {}
 static void garage_save(void) { garages++; }
@@ -62,6 +63,18 @@ int main(int argc,char **argv) {
   memset(buf,0,sizeof buf); f=fopen(path,"rb"); assert(f); assert(fread(buf,1,sizeof buf-1,f)>0); fclose(f);
   int v[16]; assert(sscanf(buf,"option %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],&v[8],&v[9],&v[10],&v[11],&v[12],&v[13],&v[14],&v[15])==16);
   assert(v[14]==2 && v[15]==1 && strstr(buf,"\nunknown tail\nkey_layout arbitrary\n"));
+  const int caps[] = {60, 90, 120, 0};
+  for (int i=0; i<4; ++i) {
+    G.menu.tap_x=OPT_FPS_X+((i+1)%4)*OPT_FPS_STEP+2;
+    G.menu.tap_y=OPT_FPS_Y;
+    option_fps_step(&G.menu);
+    assert(G.menu.frame_rate_limit==caps[i] && G.menu.options_dirty && !G.menu.garage_changed);
+    dispatch(); assert(!G.menu.options_dirty && !garages);
+    option_fps_step(&G.menu); assert(!G.menu.options_dirty);
+  }
+  G.menu.tap_x=OPT_FPS_X+OPT_FPS_STEP+2; G.menu.tap_y=OPT_FPS_Y-11;
+  option_fps_step(&G.menu); assert(!G.menu.frame_rate_limit && !G.menu.options_dirty);
+  G.menu.tap_x=250; G.menu.tap_y=410;
   assert(chapters_tap(&G.menu) && !G.menu.story_test); dispatch(); assert(!garages);
   assert(traffic_tap(&G.menu) && !G.menu.ta_traffic); dispatch(); assert(!garages);
   G.menu.garage_changed=1; dispatch(); assert(garages==1 && !G.menu.garage_changed);

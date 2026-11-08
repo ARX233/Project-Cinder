@@ -40,21 +40,31 @@ class SteeringOptionsHost(unittest.TestCase):
 #include <errno.h>
 #include <unistd.h>
 #include "menu.h"
+#include "timing60.h"
 static struct { menu_state menu; char save_dir[1024]; int options_global; } G;
 ''' + load + '\n' + save + r'''
 int main(int argc, char **argv) {
   assert(argc == 2); snprintf(G.save_dir, sizeof G.save_dir, "%s", argv[1]);
   G.menu.gyro_sens=5;
+  const int caps[] = {0, 60, 90, 120};
   for (int mode=0; mode<4; mode++) {
-    G.menu.gyro=mode; options_save(); G.menu.gyro=-1;
-    assert(options_load() && G.menu.gyro==mode);
+    G.menu.gyro=mode; G.menu.frame_rate_limit=caps[mode];
+    assert(options_save()); G.menu.gyro=-1; G.menu.frame_rate_limit=-1;
+    assert(options_load() && G.menu.gyro==mode && G.menu.frame_rate_limit==caps[mode]);
   }
   char path[1100]; snprintf(path,sizeof path,"%s/option",argv[1]);
   const int bad[] = {-1,4,99};
   for (int i=0;i<3;i++) {
     FILE *f=fopen(path,"w"); assert(f); fprintf(f,"option %d 5 1\n",bad[i]); fclose(f);
-    G.menu.gyro=3; assert(options_load() && G.menu.gyro==0);
+    G.menu.gyro=3; G.menu.frame_rate_limit=120;
+    assert(options_load() && G.menu.gyro==0 && G.menu.frame_rate_limit==0);
   }
+  FILE *old=fopen(path,"w"); assert(old);
+  fputs("option 0 5 1 1 0 1 1 1 1 0 1 1 1 0 0 0\n90\n",old); fclose(old);
+  assert(options_load() && G.menu.frame_rate_limit==0);
+  FILE *invalid=fopen(path,"w"); assert(invalid);
+  fputs("option 0 5 1 1 0 1 1 1 1 0 1 1 1 0 0 0 240\n",invalid); fclose(invalid);
+  assert(options_load() && G.menu.frame_rate_limit==0);
   for (int i=0;i<4;i++) {
     assert(menu_steer_hit(300+i*84,152)==i);
     assert(menu_steer_hit(383.99f+i*84,152)==i);

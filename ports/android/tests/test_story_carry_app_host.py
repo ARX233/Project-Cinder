@@ -18,16 +18,26 @@ funcs = '\n'.join(function(x) for x in (
     'static void story_race_start_failed(', 'static int movie_open(',
     'static void movie_close('))
 menu_start = src.index('static void menu_frame(float dt, double frame_start) {')
-menu_guard = src[menu_start:src.index('  glViewport(', menu_start)]
-funcs += '\n' + menu_guard.replace('static void menu_frame(float dt, double frame_start) {', 'static void check_menu_context(void) {') + '\n}'
+# The renderer is now menu_present(), so the next glViewport is no longer the
+# end of the menu's context guard. Compile the exact production statement this
+# fixture exercises, without importing unrelated load/VS/Ghost/renderer state.
+guard_start = src.index('  if (G.story_carry_token &&', menu_start)
+guard_end = src.index('story_carry_cancel();', guard_start) + len('story_carry_cancel();')
+menu_guard = src[guard_start:guard_end]
+funcs += '\nstatic void check_menu_context(void) {\n' + menu_guard + '\n}'
 # The initial Init must arm only after the actual loaded-rival array is set,
 # and cannot carry across an unrelated or failed start.
-startup = src[src.index('    load_sync(NULL);\n    car_set_rivals(rv,'):src.index('      spark_reset(); backfire_reset();', src.index('    load_sync(NULL);\n    car_set_rivals(rv,'))]
+rivals_at = src.index('    if (!ghost) car_set_rivals(rv,')
+startup_start = src.rfind('    load_sync(NULL);', menu_start, rivals_at)
+assert startup_start >= 0
+startup = src[startup_start:src.index('      spark_reset(); backfire_reset();', rivals_at)]
 assert startup.index('car_set_rivals(rv,') < startup.index('story_carry_arm(rv,') < startup.index('car_start(&G.car,')
 assert 'ten || vs || !story_slots_valid' in startup and 'story_carry_cancel();' in startup
 assert 'G.story_old_ended = 0;' in startup and 'story_race_start_failed();' in startup
 rows_start = src.index('    for (int i = 0; i < n_rival; ++i) {\n      int k = G.n_rival, pack = rival_look(')
-rows_loop = src[rows_start:src.index('    load_sync(NULL);', rows_start)]
+# Preserve the whole original rival-loading for-block; the newly adjacent
+# Ghost model setup is a separate branch, not part of this Story fixture.
+rows_loop = function('    for (int i = 0; i < n_rival; ++i) {\n      int k = G.n_rival, pack = rival_look(')
 funcs += '\nstatic int check_loaded_rows(int *rows, int n_rival) { car_rival rv[CAR_RIVALS]; int story_slots_valid=1; G.n_rival=0;\n' + rows_loop + '\nreturn story_slots_valid; }\n'
 pre = r'''
 #include <stdint.h>

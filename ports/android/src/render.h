@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "mathx.h"
+#include "tail_trail.h"
 
 typedef struct {
   uint16_t tex, flags;
@@ -110,6 +111,9 @@ typedef struct {
   uint32_t stride; /* vertex bytes: 24, 32 lit */
   int two_sided; /* draw back faces too (the cars: their models mix both windings) */
   int solid;     /* opaque batches ignore the textures' alpha (the sky box's leave it empty) */
+#ifdef __ANDROID__
+  int course_arrows; /* legacy component-order repair is scoped to route arrow scenes */
+#endif
   unsigned char *warm; /* by chunk: drawn before (the driver finishes a texture's upload on first use) */
   int warm_chunk;       /* wpk_prewarm's chunk under way (-1 none) and its next batch */
   uint32_t warm_batch;
@@ -190,6 +194,14 @@ typedef struct {
   float over;
   int draws, triangles, new_chunks; /* stats of the last frame */
   int night; /* enhanced lighting's explicit time zone: 0 day, nonzero night; unrelated to wet */
+  /* Explicit scene pass exception: menu miniature gradation/runlight overlays.
+   * Zero preserves normal depth testing, without inheriting any GL enable bit. */
+  int no_depth_test;
+  /* Scoped body-root story presentation; caller sets/restores all three.
+   * Zero preserves world/object and all pre-existing car draw behavior. */
+  uint32_t story_assembly_flags;
+  int story_assembly_enabled;
+  float story_body_y;
 } render_params;
 
 /* Textures loaded from now on at half their size (power-of-two ones 64 or more a side):
@@ -203,7 +215,23 @@ void render_aniso(float degree);
  * Independent of HQ options and their performance governor; no targets are allocated. */
 void render_enhance(int on);
 int render_init(void);
+/* Begin one presentation with an explicit default target/extent. GLES no-op;
+ * native passes may override it until their matching end. */
+void render_display_begin(int width, int height);
+#ifdef WMMT_NATIVE_VK
+/* Main scene's explicitly authored background/clear, retained for final composite.
+ * Reflection, loader and self-test target clears do not change this definition. */
+void render_scene_clear(float r, float g, float b, float a);
+/* Clear only actual depth on the current explicit scene target. No background,
+ * stencil, target selection or viewport change; missing metadata fails closed. */
+void render_scene_depth_clear(void);
+/* Menu/display clear: explicit target 0, actual color/depth only (not stencil). */
+void render_display_clear(float r, float g, float b, float a);
+#endif
 int wpk_load(wpk_scene *s, const char *path);
+#ifdef __ANDROID__
+int wpk_load_course_arrows(wpk_scene *s, const char *path);
+#endif
 /* wpk_load in steps: wpk_open reads the tables, then each wpk_upload call hands about
  * `budget` bytes of textures and buffers to GL and returns 1 once all are up. Draw a scene
  * only after that. */
@@ -360,6 +388,30 @@ typedef struct {
 void render_sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p);
 /* the same added by their own colour (glBlendFunc(GL_SRC_COLOR, GL_ONE): clCarSpotLight's) */
 void render_sprites_by_colour(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p);
+/* A bounded world-space triangle list from tail_trail_triangles (up to both
+ * lamps), with float RGBA retained through attribute upload. Additive SRC_ALPHA/
+ * ONE, depth-tested LEQUAL, no depth writes/culling/fog/grade; the internal white
+ * texture is equivalent to untextured colour. All caller GL state is restored,
+ * including a non-default VAO. The current target, viewport and scissor are kept.
+ * Call on the rendering thread, after render_init, inside the 3D effect pass
+ * (before render_blur_end). Returns 1 when a draw is submitted, 0 for no data,
+ * invalid inputs or an unavailable renderer; this is not GPU/visual validation.
+ * Coordinates must be finite and within +/-1e12, colours finite in [0,1]. */
+int render_tail_triangles(const mat4 *vp, const TailTrailVertex *v, size_t n_vertices, render_params *p);
+/* Own-car smoke: camera-space quads, original float alpha, nonadditive blend.
+ * quads is a QUAD count (4 vertices each); main camera only. CPU submission is
+ * not a claim of device/GPU validation. Dedicated resources, no shared cache. */
+#include "tire_smoke.h"
+int render_tire_smoke(const mat4 *projection, const TireSmokeVertex *vertices, size_t quads,
+                      uint32_t texture, render_params *params);
+void render_tire_smoke_release(void);
+void render_tire_smoke_context_lost(void);
+/* Only on the owning rendering context/device: release before its teardown.
+ * Surface replacement/pause is NOT context loss; keep these resources then.
+ * Once the context/device is already lost, forget IDs WITHOUT deleting them.
+ * render_init also forgets them for a newly initialized renderer context. */
+void render_tail_release(void);
+void render_tail_context_lost(void);
 #ifdef __ANDROID__
 /* Original tire-track blend/depth/colour-mask state; vertices are world-space,
  * vp is the view-projection matrix, and tex is the dedicated tirepattern image.

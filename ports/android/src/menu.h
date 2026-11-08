@@ -5,6 +5,71 @@
 #ifndef MENU_H
 #define MENU_H
 
+#include "ghost_original_ui.h"
+#include "ta_rank.h"
+#include <stdint.h>
+
+enum { MENU_TA_RANK_UNAVAILABLE=0, MENU_TA_RANK_LOCAL=1, MENU_TA_RANK_STORE_ERROR=2, MENU_TA_RANK_COMMUNITY=3 };
+
+/* APP-owned immutable catalogue presentation, never a file/world capability.
+ * Areas are original clEffAreaType slots 0..7, NOT visual menu order. A native
+ * binding alone supplies level/ramp/route and appearance (raw_model is not a
+ * physics/model index). History/revenge flags must describe THIS player's real
+ * races, not archive metadata. Unknown level/appearance use -1.
+ * DEFAULT rows are native-getter metadata, never missing-record fallbacks:
+ * native_available requires APP's manager-eligible + live bridge capability;
+ * their directory areas keep ramp=route=-1 until an action7 is actually taken.
+ * RECORDED areas still require ordinary native ERamp/route for action6. */
+#define MENU_GHOST_DIRECTORY_RECORDS 196u /* recorded raw collection, unchanged */
+#define MENU_GHOST_DEFAULT_RECORDS 120u /* raw compiled rows; eleven GUESTs are not selectable */
+#define MENU_GHOST_CLOUD_RECORDS 16u
+#define MENU_GHOST_LOCAL_RECORDS 32u
+#define MENU_GHOST_DIRECTORY_MAX_RECORDS (324u + MENU_GHOST_CLOUD_RECORDS + MENU_GHOST_LOCAL_RECORDS)
+#define MENU_GHOST_DIRECTORY_AREAS 8u
+enum { MENU_GHOST_SOURCE_RECORDED=0, MENU_GHOST_SOURCE_DEFAULT=1, MENU_GHOST_SOURCE_LOCAL_CROWN=2, MENU_GHOST_SOURCE_CLOUD=3 };
+typedef struct {
+  uint16_t year;
+  uint8_t month, day, hour, minute;
+} menu_ghost_record_date;
+typedef struct {
+  int level, native_available, ramp, route;
+  int pack, paint; uint32_t raw_model;
+  int power, handling; uint32_t title;
+  int history_available, revenge_available;
+  int default_crown; /* original compiled holder for this area */
+  int native_type, base_paint, custom_color;
+  int aero, mirror, wing, bonnet, wheel, neon, vinyl;
+  menu_ghost_record_date recorded; /* year 0 means no known timestamp */
+} menu_ghost_directory_area;
+typedef struct {
+  uint32_t record_index, id_devel, id1, id2;
+  uint16_t name[5];
+  menu_ghost_directory_area areas[MENU_GHOST_DIRECTORY_AREAS];
+  uint32_t source_kind; /* appended; zero-initialized legacy rows remain RECORDED */
+} menu_ghost_directory_row;
+typedef struct {
+  const menu_ghost_directory_row *rows;
+  unsigned count;
+  uint64_t epoch; /* nonzero source catalogue generation; never a score */
+  int player_level; /* -1 unknown; authoritative native 0..9 otherwise */
+  int player_history_available, player_revenge_available;
+} menu_ghost_directory_view;
+
+#define MENU_CARD_GHOST_RECENT 8u
+typedef struct {
+  menu_ghost_record_date date;
+  uint32_t raw_model;
+  short glyphs[5]; /* namedb indices, -1 past the end */
+  int area, hp;
+  int gap_m, has_gap; /* positive when the defending ghost was ahead */
+} menu_card_ghost_match;
+typedef struct {
+  unsigned races, wins, coins;
+  unsigned crown_mask; /* bit per original clEffAreaType */
+  unsigned defense_races, defense_wins, defense_recent_count;
+  menu_card_ghost_match defense_recent[MENU_CARD_GHOST_RECENT];
+} menu_card_ghost_stats;
+
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
 #include "pre_race_tune.h"
 #endif
@@ -12,7 +77,8 @@
 #include "hud_custom_store.h"
 enum { CUSTOM_DIRTY_DEADZONE=1u<<0, CUSTOM_DIRTY_SHIFT=1u<<1,
        CUSTOM_DIRTY_MAP=1u<<2, CUSTOM_DIRTY_RANK=1u<<3,
-       CUSTOM_DIRTY_TIME=1u<<4, CUSTOM_DIRTY_METER=1u<<5 };
+       CUSTOM_DIRTY_TIME=1u<<4, CUSTOM_DIRTY_METER=1u<<5,
+       CUSTOM_DIRTY_OPACITY=1u<<6, CUSTOM_DIRTY_BUTTON_0=1u<<7 };
 #endif
 
 /* Stable option-file values: 0/1 retain the old buttons/gyro meaning. */
@@ -74,6 +140,23 @@ typedef struct {
 } menu_own;
 #define MENU_GARAGE_CARS 12  /* CARDB_MAX_CARS */
 
+#include "story_body_view.h"
+typedef struct {
+  int kind,context,peer,maker,car,color,save_slot,save_skip,own_index;
+  long long born;
+  story_body_view view;
+} menu_story_body_stamp;
+
+typedef struct {
+  int raw_model, pack, paint, type, custom_color;
+  int aero, vinyl, bonnet;
+} menu_body_color_view;
+
+typedef struct {
+  int ms, plate; /* legacy score and uniquely matched car-logo sprite ID, 0 if unknown */
+  short name[5]; /* the name of its save slot, -1 for an empty glyph */
+} menu_ta_saved_pb;
+
 typedef struct {
   int screen;      /* MENU_MOVIE ... MENU_PRE */
   int t;           /* 60 Hz frames since the screen (or its current move) started */
@@ -88,7 +171,7 @@ typedef struct {
   int key_held;    /* key under the finger, for drawing */
   void *key_touch; /* finger holding a left/right menu key */
   void *back_touch; /* the finger on the back key: it goes back when let go on the key */
-  int game;        /* the game mode select's choice: MENU_GAME_STORY, _TEN, _TA, _VS */
+  int game;        /* stable mode identity: STORY0, TEN1, TA2, VS3, GHOST4 */
   /* the 10-in-a-row (mseqTen): the course select's choice (its card, the course in menu
    * order: src/tendb.h), the level select's (0..9, 10 the 32-man extend) and the levels it
    * offers (11 once every level has gold); the medal of each course (clEffTenCourseType)
@@ -106,11 +189,26 @@ typedef struct {
   int st_div, st_bits;
   int story_test, ta_traffic; /* testing chapter page (1..10), TA traffic option */
   int card_color_pending; /* defer owned-car colour until card confirmation */
+  /* Repaint is not factory m.color. Registered values are APP-persisted per
+   * maker/car in the current slot; guests keep only a session value. */
+  unsigned char custom_color[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS];
+  int body_tab_focus;
+  struct { int raw_model, maker, car, factory, aero, save_slot, save_skip; unsigned mask; } body_pages;
+  struct {
+    int active, own, maker, car, factory, raw_model, before, save_slot, save_skip, aero, confirm;
+    long long born;
+  } body_edit; /* transaction/coverage transient, NEVER serialize */
   int st_level;    /* the level select's choice */
   int story_pick;  /* the rival select's choice: its story index (src/rivaldb.h's select), -1 none */
   int story_n;     /* and its place in the loop, 20 * division + 5 * level + episode */
   int course, official; /* the choice, once a race is ready */
-  int demo;        /* rounds of the attract loop so far: picks the movie and the ranked course */
+  int demo;        /* rounds of the attract loop so far: picks the movie and automatic ranking course */
+  int ta_rank_offset, ta_rank_touch_inside; /* manual browsing shares the 12-course rotation */
+  void *ta_rank_touch;
+  /* APP game-thread snapshot only. No borrowed lifetime, network authority or draw-time I/O. */
+  ta_rank_view ta_rank_snapshot;
+  int ta_rank_valid, ta_rank_status;
+  menu_ta_saved_pb ta_rank_saved_pb[TA_RANK_COURSES]; /* keyed by native course ID */
   int flash;       /* frames left of the white flash over the mode select */
   int bars;        /* the top and bottom bars slide in while t < 11 */
   int lock;        /* frames the arcade ignores input after a move */
@@ -143,6 +241,7 @@ typedef struct {
   int finish;      /* frames since the race ended (menu_finish_open), 0 = none */
   int finish_wait; /* frames the race runs on before FINISH or TIME UP shows */
   int finish_goal; /* it was the goal (FINISH), not the time running out (TIME UP) */
+  int finish_ghost; /* an original Ghost battle result over the race */
   int finish_out;  /* frames since the result was left (the fade to black), 0 = still up */
   int pre_quiet; /* MENU_PRE between a story select's races: no title page (back_from_race) */
   int finish_story; /* a story race's end (menu_finish_story): 1 WIN, 2 LOSE, 3 on to the next race,
@@ -174,6 +273,7 @@ typedef struct {
    * occlusion, the wet road, the paint's reflection and the anti-aliasing (4x 1, 2x 0, from
    * the next start) */
   int hq_rows, hd_tex, bloom_on, ssao_on, wet_on, paint_on, aa4;
+  int frame_rate_limit; /* Android presentation cap: 0 auto, 60, 90 or 120 */
   /* and on an iPad (res_row, set by the app), the screen's resolution: 1024x768 (0) or the
    * Retina iPads' 2048x1536 (1), from the next start (main.m reads it from the options) */
   int res_row, hires;
@@ -187,7 +287,7 @@ typedef struct {
 #if defined(__ANDROID__) || defined(WMMT_HUD_CUSTOM_TEST)
   HudCustomLayout custom_layout, custom_layout_base;
   unsigned custom_layout_dirty; /* CUSTOM_DIRTY_* fields explicitly edited by the user */
-  int custom_layout_status, custom_retry_frames, lay_page, lay_shift_old_separate;
+  int custom_layout_status, custom_retry_frames, lay_page, lay_old_separate;
   int stick_center_mode, stick_center_dirty, stick_center_status, stick_center_retries, stick_center_retry_frames;
 #endif
   int lay_sel, lay_drag, lay_tap, lay_button_down, lay_old_dx, lay_old_dy;
@@ -200,7 +300,7 @@ typedef struct {
   int dress, dress_free, dress_kind;
   /* the save's car view's delete key pressed (erase), once to arm it, again to delete */
   int erase, erase_armed;
-  int garage_changed, options_dirty; /* options_dirty: chapter testing / TA traffic only */
+  int garage_changed, options_dirty; /* options_dirty: global settings that need no garage write */
   /* The port's SAVE DATA screen (MENU_SAVE, between START and the maker select; the
    * arcade's card check stands there): NEW GAME or LOAD GAME lit, the save of a NEW GAME
    * tapped once (it must be tapped again to start over in it, 0 none). The app keeps the
@@ -222,6 +322,7 @@ typedef struct {
   menu_own own[MENU_OWN_MAX];
   int n_own, own_sel, own_view, have_sel, card_back;
   int card_page; /* card confirmation page, 1..9; never saved */
+  menu_card_ghost_stats card_ghost_stats; /* app snapshot for the selected card */
   void *card_touch; /* one captured finger; page buttons commit on release */
   int card_touch_action, card_action, card_save_failed;
   signed char meter_car[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS], sound_car[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS];
@@ -248,6 +349,7 @@ typedef struct {
   /* dress-up (the arcade's ghost battle parts, get_tb_level_parts): each car's dress-up level
    * (0..63, the parts it has won) and the aero set it wears (0 stock, 1..3 A, B, C) */
   signed char dress_lv[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS], aero[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS];
+  unsigned short dress_points[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS]; /* card+0x17a, 0..999 */
   /* and the parts it wears, as the card keeps them for clCarConstructParam: the aero mirror
    * (card+0xc: 0 stock, 1), the wing (card+7: 0 stock, 1..3, 4 none) and the bonnet (card+6:
    * 0 stock, 1..3); render_params' mirror, wing, bonnet */
@@ -314,6 +416,7 @@ typedef struct {
    * from the race shows them: MENU_TG_GET each, MENU_TG_AERO after an aero set's,
    * MENU_TG_PART after a bonnet's, wing's or mirror's, MENU_TG_WEAR after either) */
   int dress_due[MENU_DRESS_DUE], n_dress_due;
+  int dress_due_maker, dress_due_car; /* transient queue owner, never saved */
   /* the GET screen (clSeqTgPartsGetAeroThread) and the aero set's change
    * (clSeqTgChangePartsAeroThread): the level and part shown, the car turning on the GET
    * screen (degrees), the change screen's choices (the aero set of each, -1 Refuse to
@@ -360,21 +463,25 @@ typedef struct {
     unsigned char state[2][24];
     int since[2][24];
   } tune;
-  /* The versus (MENU_VS, the port's own screen, from the game mode select's versus disc and
-   * the versus select's three, MENU_VS_SEL): over Bluetooth or the Wi-Fi's LAN, a device
-   * hosts and the others join the one they find; over a server, the screen types its address.
-   * The screen asks the app to connect, host, join, start (the host) and which ramp and
-   * distance; the app fills in what it found and the lobby each frame. */
+  /* LAN discovery and managed online rooms. The app owns connections and
+   * fills in room membership. The menu queues requests and selection input. */
   struct {
-    int kind;            /* MENU_VS_BT, MENU_VS_LAN, MENU_VS_NET */
-    char ip[16];
-    int connect;         /* the screen's ask: 1 connect (the server's: to ip; else host), -1 disconnect (the app clears it) */
+    int kind;            /* MENU_VS_LAN, MENU_VS_NET */
+    int connect;         /* connect/host (1), MENU_VS_DISCONNECT or MENU_VS_LEAVE */
     int join;            /* the screen's ask: join found game join - 1 (the app clears it) */
     int hosting;         /* the app's: this device hosts the lobby */
-    int n_found;         /* the app's: the games nearby (Bluetooth, LAN) */
+    int n_found;         /* the app's: the games nearby (LAN) */
     char found[MENU_VS_FOUND][24];
     int start;           /* the host's START (the app clears it) */
     int state;           /* the app's: MENU_VS_OFF .. MENU_VS_RACE */
+    /* Session-only UI round. APP supplies a validated nonzero generation;
+     * it freezes the roster and owns protocol/selection authority. Never saved. */
+    uint64_t round;
+    int flow_stage, round_cancel;
+    int tune_base_power, tune_base_handling, tune_maker, tune_car, tune_slot, tune_skip;
+    int tune_timer; /* remaining time in 60 Hz display ticks */
+    uint32_t omakase_sample[3];
+    int omakase_sample_valid;
     int n, me, host;
     char name[MENU_VS_PLAYERS][17], car[MENU_VS_PLAYERS][32];
     short glyph[MENU_VS_PLAYERS][5]; /* the names' own characters (namedb.h's, -1 past the end; none from an older build) */
@@ -421,11 +528,39 @@ typedef struct {
       short glyph[5];
       int title; /* (0 not sent) */
       int aero, mirror, wing, bonnet, wheel, neon, vinyl; /* its dress-up (menu_car's) */
+      int base_power,base_handling,base_valid; /* immutable JOIN earned budget, not TUNE_READY */
     } match[MENU_VS_PLAYERS];
   } vs;
+  /* Independent local/cloud ghost requests. Never a WV1 lobby or persisted score.
+   * The app owns file/network/race execution; this menu only queues one action. */
+  struct {
+    int local_available, cloud_configured, king_available;
+    int ramp, route; /* raw ERamp 1..22, zero-based native route; NOT a TA course or VS packed index */
+    int request_ramp, request_route; /* immutable selection snapshot until this request completes */
+    int status, pending_action, inflight_action;
+    unsigned request_serial, active_request, completed_request, prepared_request;
+    int completed_action, pre_go; /* once-only loading handoff, not race authority */
+    int choose_race_options, previous_zone, previous_zones;
+    int result, claim_eligible, claim_pending; /* display only; never a granted crown */
+    void *touch;
+    int touch_action, held;
+    ghost_original_ui ui; /* Original search presentation; separate port-only local settings. */
+    menu_ghost_directory_view directory; /* borrowed until set_directory(NULL) */
+    int directory_row, area_slot, level, search_kind, rival_back;
+    short query[5]; /* NAMEDB glyphs, -1 past end; never the player's name */
+    int query_page, query_key, query_pop, query_char_pop, query_waiting;
+    short previous_query[5]; int previous_query_valid; /* actual session search, not archive history */
+    uint32_t request_record_index;
+    int request_area_slot;
+    uint64_t request_catalog_epoch;
+    uint32_t request_id_devel, request_id1, request_id2;
+    char note[96];
+    uint32_t request_source_kind; /* appended immutable row discriminator; not a server field */
+  } ghost;
 } menu_state;
 enum { MENU_VS_OFF, MENU_VS_CONNECTING, MENU_VS_LOBBY, MENU_VS_LOADING, MENU_VS_RACE };
-enum { MENU_VS_BT, MENU_VS_LAN, MENU_VS_NET, MENU_VS_KINDS };
+enum { MENU_VS_LAN, MENU_VS_NET, MENU_VS_KINDS };
+enum { MENU_VS_LEAVE = -2, MENU_VS_DISCONNECT = -1 };
 #define MENU_VS_RAMPS 22
 
 /* The attract loop (mseqDemo) runs MOVIE, TITLE, RANKING, LOGO, PROLOGUE and round again; a tap
@@ -444,9 +579,81 @@ enum { MENU_MOVIE, MENU_TITLE, MENU_RANKING, MENU_LOGO, MENU_PROLOGUE, MENU_STAR
        MENU_ST_LEVEL, MENU_ST_RIVAL, MENU_PRE, MENU_ST_TUNE, MENU_TEN_COURSE, MENU_TEN_LEVEL,
        MENU_TG_GET, MENU_TG_AERO, MENU_TG_PART, MENU_TG_WEAR, MENU_OPTION, MENU_SAVE, MENU_HAVE, MENU_GARAGE,
        MENU_CARD, MENU_LVUP, MENU_ST_EFF, MENU_TG_WHEEL, MENU_TG_SELECT, MENU_TG_MAKER, MENU_NAME,
-       MENU_TG_VINYL, MENU_VS, MENU_VS_SEL, MENU_VS_AREA, MENU_VS_MATCH, MENU_SHOGO, MENU_VS_STAR, MENU_INFO, MENU_LAYOUT
+       MENU_TG_VINYL, MENU_VS, MENU_VS_SEL, MENU_VS_AREA, MENU_VS_MATCH, MENU_SHOGO, MENU_VS_STAR, MENU_INFO, MENU_LAYOUT,
+       MENU_GHOST, /* appended: independent hub, never routed through MENU_VS */
+       MENU_GHOST_PRE, /* independently prepared loading screen; no TA/VS fallback */
+       MENU_BODY_COLOR /* appended: original repaint UI; stable prior IDs unchanged */
 };
-enum { MENU_GAME_STORY, MENU_GAME_TEN, MENU_GAME_TA, MENU_GAME_VS };
+/* Exact factory identity and committed/transient repaint view for APP materials.
+ * get returns committed style before page preparation outside the edit screen;
+ * edit previews additionally require frozen owner and live exact page coverage.
+ * set_pages publishes resource availability, NOT historical unlock/renewal state.
+ * Clear before context/catalog/car/save teardown. No file IO or model remapping. */
+int menu_body_color_get(const menu_state *m, menu_body_color_view *out);
+/* Hydrate after the matching owned row exists; rejects unsupported saved values
+ * unchanged, independent of runtime pages and without a garage_changed edge. */
+int menu_body_color_restore(menu_state *m, int maker, int car, int custom);
+int menu_body_color_set_pages(menu_state *m, int raw_model, unsigned mask);
+void menu_body_color_clear_pages(menu_state *m);
+/* Stable identities, deliberately not the home screen's visual order. */
+enum { MENU_GAME_STORY = 0, MENU_GAME_TEN = 1, MENU_GAME_TA = 2, MENU_GAME_VS = 3, MENU_GAME_GHOST = 4 };
+enum { MENU_GHOST_IDLE, MENU_GHOST_BUSY, MENU_GHOST_READY, MENU_GHOST_ERROR };
+enum { MENU_GHOST_ACTION_NONE, MENU_GHOST_RECORD_LOCAL, MENU_GHOST_CHALLENGE_LOCAL,
+       MENU_GHOST_FETCH_KING, MENU_GHOST_CHALLENGE_KING, MENU_GHOST_SUBMIT_CLAIM,
+       MENU_GHOST_CHALLENGE_ARCADE, /* 6: genuine recorded CTarget/race/trail */
+       MENU_GHOST_CHALLENGE_DEFAULT, /* 7: explicitly selected original compiled target AI */
+       MENU_GHOST_CHALLENGE_LOCAL_CROWN, /* 8: validated per-area champion recording */
+       MENU_GHOST_CHALLENGE_CLOUD }; /* 9: downloaded compatible recording */
+enum { MENU_GHOST_RESULT_NONE, MENU_GHOST_RESULT_FINISHED, MENU_GHOST_RESULT_WIN,
+       MENU_GHOST_RESULT_LOSE, MENU_GHOST_RESULT_INVALID };
+
+/* Author-space (640x480) hub; no network, file IO, physics or persisted ranking.
+ * Each queued action has one nonzero request ID and can be taken once. Returning
+ * to home invalidates old completions. The app starts ghost races itself, never
+ * via menu_update's legacy race-return path. */
+void menu_ghost_open(menu_state *m);
+/* Bind a borrowed immutable view; validate before retaining it. APP keeps all row
+ * storage alive/unchanged until unbound. NULL always invalidates before APP frees
+ * storage. A changed pointer/count/epoch invalidates active/completed/PRE asks.
+ * A same-view refresh changes no selections or request serial. No catalogue IO. */
+int menu_ghost_set_directory(menu_state *m, const menu_ghost_directory_view *view);
+/* Exact original UTF16 scalar -> NAMEDB_WCHAR mapping; no ASCII transliteration,
+ * invented handles or replacement identity. Returns 0 if any glyph is absent. */
+int menu_ghost_name_glyphs(short glyph[5], const uint16_t name[5]);
+unsigned menu_ghost_search_query(const menu_state *m, uint16_t name[5]);
+void menu_ghost_search_complete(menu_state *m, int available);
+/* Original eight-card visual order -> original area slot (0..7). */
+int menu_ghost_course_area(int visual_slot);
+void menu_ghost_set_availability(menu_state *m, int local_available, int cloud_configured, int king_available);
+/* Metadata-fixed map, not a fabricated course/route carousel. Returns 0 while
+ * busy or for invalid raw ERamp/negative route. The app must validate actual
+ * native route count and rule/key compatibility before enabling a challenge.
+ * A changed selection invalidates local/king availability; refill only for the
+ * matching metadata. Every request copies these values into request_* fields. */
+int menu_ghost_set_map(menu_state *m, int raw_ramp, int route);
+int menu_ghost_action_available(const menu_state *m, int action);
+int menu_ghost_request(menu_state *m, int action);
+int menu_ghost_take_action(menu_state *m, unsigned *request_id);
+/* Action7 only: after taking the immutable DEFAULT request, APP selects the
+ * original native random map ONCE and attaches that frozen result here. No RNG
+ * or native/file work occurs in UI. Requires the same inflight BUSY request,
+ * source kind/index/id tuple/area/epoch and native-available metadata. Invalid
+ * input returns0 without clearing/changing anything. Repeating the SAME map is
+ * idempotent; a different second map is rejected. Complete(ok=1)/PRE require a
+ * bound ERamp1..22 and rawRoute>=0; failure completion may precede binding. */
+int menu_ghost_bind_default_request(menu_state *m, uint64_t request_id, int nativeERamp, int rawRoute);
+int menu_ghost_complete(menu_state *m, unsigned request_id, int ok, const char *note);
+/* Consume one successful current RECORD/CHALLENGE completion into its own PRE.
+ * Clears ready; the app loads the frozen request map/car and then sets ready.
+ * menu_update emits GO exactly once. The app must additionally require its
+ * prepared engine capability and GHOST identity before creating any race. */
+int menu_ghost_begin_pre(menu_state *m);
+int menu_ghost_preparing(const menu_state *m);
+int menu_ghost_choosing_options(const menu_state *m);
+/* claim_eligible is app-owned: only a cloud challenge with its fixed challenge
+ * snapshot may offer submission. A local win is never authority to take a crown.
+ * Even successful submission stays pending server validation; no crown is set. */
+void menu_ghost_race_finished(menu_state *m, int result, int claim_eligible);
 
 /* The cars the car select shows in 3D this frame (the carousel, or the colour turntable),
  * with the arcade's menu camera. Units and axes are the race's (0.1 m, +y up). */
@@ -470,6 +677,13 @@ typedef struct {
    * columns, render_params.wheels'), at its own place */
   int turned;
   float tyre[4][16];
+  /* Appended exact player identity, NEVER inferred from shared pack/paint.
+   * Valid only for explicit owned/guest player contexts, not purchase/rivals. */
+  int body_color_valid;
+  menu_body_color_view body_color;
+  int story_body_valid;
+  menu_story_body_stamp story_body;
+  int ghost_row; /* original Ghost directory index + 1, zero for other cars */
 } menu_car;
 typedef struct {
   int n;
@@ -485,6 +699,12 @@ typedef struct {
 
 /* Needs anm_load() first. Starts the attract loop. */
 void menu_init(menu_state *m);
+/* Pure game-thread TA presentation; metadata fills name/title/class ONLY.
+ * Parent MUST overwrite model/type/P/H from the actual frozen native binding. */
+int menu_ta_rank_metadata(const menu_state *m, ta_rank_metadata *out);
+int menu_ta_rank_model_plate(unsigned model_id); /* original ranking logo sprite ID, or 0 */
+int menu_ta_rank_course(const menu_state *m);
+void menu_set_ta_rank_view(menu_state *m, const ta_rank_view *view, int status);
 /* A phone's 16:9, edge layout px past the 4:3 on each side: the courses' photos behind the
  * screens go its full width; menu_photo_bg: one was drawn by the last menu_draw. */
 void menu_wide(float edge);
@@ -569,6 +789,7 @@ void menu_finish_ten(menu_state *m, int beaten, float time, int medal);
 /* after menu_finish_open, for an online versus: WIN or LOSE (the story's) with the place of
  * how many; back to MENU_VS after */
 void menu_finish_vs(menu_state *m, int place, int n);
+void menu_finish_ghost(menu_state *m, int result, int goal, float gap, int player_rank, int rival_rank);
 /* a versus' stars for the place (1 the first) of n machines (clRaceThread::finiJoin's table by
  * the stars held: none lost up to 2000); the car's stars and count updated, the change kept
  * for the stars screen (shown on the way back to the lobby when not 0); the change */
@@ -577,6 +798,7 @@ int menu_vs_stars(menu_state *m, int place, int n);
 void menu_vs_star_open(menu_state *m);
 /* the host closed the game under a versus race: back to MENU_VS, off, with `note` on it */
 void menu_vs_closed(menu_state *m, const char *note);
+void menu_vs_left(menu_state *m);
 /* Keep the existing connection/host while returning an aborted race to its lobby. */
 void menu_vs_aborted(menu_state *m, const char *note);
 /* The area vote's status byte (the lobby's HELLO, which the servers pass on unread): 0 the
@@ -590,6 +812,34 @@ enum { MENU_VS_DAY = 64, MENU_VS_DAY_VOTED = 66, MENU_VS_DAY_FINAL = 68, MENU_VS
 /* a status of the time zone vote's (the host's tells the others the vote is on) */
 #define MENU_VS_IN_DAY(st) (((st) >= MENU_VS_DAY && (st) < MENU_VS_LOADED) || ((st) >= MENU_VS_DAY_OMAKASE && (st) < MENU_VS_DAY_OMAKASE + 2))
 int menu_vs_status(const menu_state *m);
+/* Ordered room UI only, no transport or all-player authority. All clients update
+ * together. APP rejects stale round IDs and freezes participant identity.
+ * begin: existing room -> AREA; day_open: committed area/ramp -> DAY;
+ * tune_open: committed day -> per-player TUNE (<=20 earned points: unchanged
+ * READY). None of these writes permanent story/tune/AT/MT/customization data. */
+enum { MENU_VS_FLOW_ROOM, MENU_VS_FLOW_AREA, MENU_VS_FLOW_DAY,
+       MENU_VS_FLOW_TUNE, MENU_VS_FLOW_READY, MENU_VS_FLOW_LOADING };
+int menu_vs_round_active(const menu_state *m);
+int menu_vs_round_begin(menu_state *m, uint64_t round);
+/* map_vote area is -1 while hovering random, else original area0..7; omakase
+ * confirm resolves a concrete area and marker. It is NOT an abstention. */
+int menu_vs_map_vote(const menu_state *m, uint64_t round, int *area, int *confirmed, int *omakase);
+int menu_vs_map_commit(menu_state *m, uint64_t round, int area);
+/* Sampled local UI timer inputs, not native physics RNG or network authority.
+ * Original uses first&7; area6 + second&1 rerolls with (third>>2)&7.
+ * Without APP samples, this port uses its monotonically stepped UI frame. */
+int menu_vs_omakase_samples(menu_state *m, uint64_t round, uint32_t first, uint32_t second, uint32_t third);
+int menu_vs_time_open(menu_state *m, uint64_t round);
+int menu_vs_time_vote(const menu_state *m, uint64_t round, int *zone, int *confirmed);
+int menu_vs_time_commit(menu_state *m, uint64_t round, int zone);
+int menu_vs_tune_open(menu_state *m, uint64_t round);
+int menu_vs_tune_draft(const menu_state *m, uint64_t round, int *power, int *handling);
+int menu_vs_tune_accept(menu_state *m, uint64_t round, int power, int handling);
+int menu_vs_tune_ready(const menu_state *m, uint64_t round, int *power, int *handling);
+/* Back queues sticky whole-round cancellation, not a local-only rewind. APP
+ * keeps pumping the room, sends cancel and acknowledges the same generation. */
+int menu_vs_cancel_requested(const menu_state *m, uint64_t *round);
+int menu_vs_round_cancel(menu_state *m, uint64_t round, const char *note);
 /* the area's result in: the time zone vote (MENU_BGM, vs.day) */
 void menu_vs_day_open(menu_state *m);
 /* MENU_VS_MATCH: open it (from MENU_VS's loading, m->vs.match filled in), whether it is over,
@@ -647,6 +897,12 @@ const char *menu_bgm(const menu_state *m, int racing);
 int menu_update(menu_state *m, float dt);
 /* The 3D layer of the current screen; returns 0 when it has none. */
 int menu_scene3d(const menu_state *m, menu_scene *s);
+const menu_ghost_directory_area *menu_ghost_preview_profile(const menu_state *m,int ghost_row);
+int menu_story_body_for_profile(int maker,int car,int color,int power,int handling,int direct_full,story_body_view *out);
+int menu_story_body_get(const menu_state *m,menu_story_body_stamp *out);
+int menu_story_body_owner_same(const menu_state *m,const menu_story_body_stamp *old);
+int menu_story_body_same(const menu_state *m,const menu_story_body_stamp *old);
+int menu_story_body_scene_view(const menu_state *m,const menu_car *car,story_body_view *out);
 /* Draws the screen; draw3d (if set) is called where the 3D cars go, between the
  * backgrounds and the overlays. */
 /* mini3d (if set): the course selects' 3D map of Tokyo (clMiniatureCourse) over the

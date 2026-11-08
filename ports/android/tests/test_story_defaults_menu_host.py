@@ -9,8 +9,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 ANDROID = ROOT / "ports/android"
-GENERATED = Path(os.environ["HUD_GENERATED"]) if os.environ.get("HUD_GENERATED") else ANDROID / "src"
-WORK = Path(tempfile.gettempdir())
+GENERATED = Path(os.environ.get("WMMT_GENERATED_ROOT", ROOT.parent / "control-layout-v12")) / "android/project/src"
+WORK = Path("/Volumes/CodexWork")
 
 
 class StoryDefaultsMenuHost(unittest.TestCase):
@@ -20,7 +20,7 @@ class StoryDefaultsMenuHost(unittest.TestCase):
         if not (GENERATED / "cardb.h").is_file():
             self.skipTest("generated support headers unavailable")
         if not WORK.is_dir():
-            self.skipTest("temporary output directory unavailable")
+            self.skipTest("/Volumes/CodexWork unavailable for temporary output")
         with tempfile.TemporaryDirectory(prefix="wmmt-story-defaults-", dir=WORK) as tmp:
             tmp = Path(tmp)
             # Entirely invented values, different by row and music group.

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-out=$(mktemp -d "${TMPDIR:-/tmp}/anm-texture-test.XXXXXXXX")
+out=$(mktemp -d /Volumes/CodexWork/anm-texture-test.XXXXXXXX)
 export TMPDIR="$out"
 # The test never uses the proprietary replacement; provide a no-op test fixture.
 printf '%s\n' 'static void time_texture_fix(int i,int w,int h,unsigned char *p) {(void)i;(void)w;(void)h;(void)p;}' > "$out/time_texture.h"

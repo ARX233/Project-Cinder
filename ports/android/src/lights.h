@@ -10,6 +10,7 @@
 
 /* 0 when lights.wpk and lights.bin loaded; the race draws no lights without them */
 int lights_load(const char *data_dir);
+int lights_front_halo_load(const char *atlas, const char *anchors);
 /* The lights of another map: Tokyo's lights.bin or a city's lights_<city>.bin (none if it is
  * missing, then -1) */
 int lights_points(const char *path);
@@ -32,6 +33,12 @@ void lights_draw_ten_line(const mat4 *proj, const mat4 *view, const car_race *r,
 /* The headlights' pools on the road in front of n cars (their body matrices, GL column-major),
  * clCarSpotLight's, after the scene like the lights; morning or night colour */
 void lights_draw_spots(const mat4 *proj, const mat4 *view, const float *const *bodies, int n, int night, render_params *rp);
+
+/* Original clCarLampHalo for the main or mirror view. Spot/halo visibility
+ * shares the native lamp bit; callers supply only lit, visible cars. */
+void lights_draw_front_halo(const mat4 *proj, const mat4 *view, const float *eye,
+                            const float *body, const char *pack, int aero, int mirror,
+                            render_params *rp);
 
 /* The under neon (clNeon) of a car: neon 1..12 (car_neon_<colour>_race.igb, then the spot
  * neons' car_spotneon_*), its quad (x and z -29..29, flat) scaled and moved by the car's

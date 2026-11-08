@@ -159,6 +159,15 @@ uint32_t rc_feof(uint32_t f);
 uint32_t rc_fscanf(uint32_t f, uint32_t fmt, uint32_t args);
 uint32_t rc_sprintf(uint32_t buf, uint32_t fmt, uint32_t args);
 
+/* Private Ghost generation only: fixed capability tokens, bounded memory I/O.
+ * The original rc_fopen whitelist and its read-only semantics are unchanged. */
+uint32_t rc_ghost_fopen(uint32_t path, uint32_t mode);
+uint32_t rc_ghost_fread(uint32_t buf, uint32_t size, uint32_t n, uint32_t f);
+uint32_t rc_ghost_fwrite(uint32_t buf, uint32_t size, uint32_t n, uint32_t f);
+void rc_ghost_fclose(uint32_t f);
+uint32_t rc_ghost_feof(uint32_t f);
+int rc_ghost_recording_enabled(void);
+
 /* std::wstring::compare(const wchar_t *): the titles' name checks (youTitle) */
 uint32_t rc_wcompare(uint32_t str, uint32_t s);
 

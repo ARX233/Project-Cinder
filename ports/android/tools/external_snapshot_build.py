@@ -10,6 +10,150 @@ Races, malicious remounts, external system-cache writes and malicious code
 import argparse, hashlib, json, os, plistlib, re, shutil, stat, subprocess, sys, tempfile, zipfile
 from pathlib import Path, PurePosixPath
 
+# BEGIN TA_RANK_PINNED_INPUT_HELPERS
+TA_RANK_HEADER_SHA256 = '15a12c68b1bd40f3e8cdeaeccbf4d8dc0cd2cda4f7f9655c4ea73f59c0d68457'
+def ta_rank_stable_file(path, limit):
+    before=path.lstat()
+    def identity(s):
+        return (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_uid,s.st_gid,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>limit:
+        raise ValueError('TA input must be a bounded regular single-link file: '+str(path))
+    fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as f:
+        opened=os.fstat(f.fileno())
+        if identity(opened)!=identity(before):raise ValueError('TA input changed before read')
+        data=f.read(limit+1)
+        if len(data)>limit or len(data)!=opened.st_size or identity(os.fstat(f.fileno()))!=identity(opened):
+            raise ValueError('TA input changed during read')
+    if identity(path.lstat())!=identity(opened):raise ValueError('TA input changed after read')
+    return data,{'path':str(path),'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'stat':list(identity(opened))}
+def ta_rank_read(directory, source_root):
+    if not directory:raise ValueError('TA_RANK_PRIVATE_INCLUDE is required')
+    path=Path(directory)
+    if not path.is_absolute() or directory!=os.path.normpath(directory) or path.resolve(strict=True)!=path:
+        raise ValueError('TA_RANK_PRIVATE_INCLUDE must be an absolute canonical non-symlink directory')
+    if not stat.S_ISDIR(path.lstat().st_mode) or path.is_relative_to(Path(source_root).resolve(strict=True)):
+        raise ValueError('Private TA generated input must be a directory outside the source snapshot')
+    if os.path.lexists(Path(source_root)/'src/ta_rank_assets_private.h'):
+        raise ValueError('Source-local TA header would shadow the verified private include')
+    header,header_record=ta_rank_stable_file(path/'ta_rank_assets_private.h',8*1024*1024)
+    if header_record['sha256']!=TA_RANK_HEADER_SHA256:raise ValueError('TA header differs from fixed reviewed SHA-256')
+    proof=None;proof_record=None;proof_path=path/'ta-rank-assets-proof.json'
+    if os.path.lexists(proof_path):
+        proof,proof_record=ta_rank_stable_file(proof_path,1024*1024)
+        if json.loads(proof)['header']['sha256']!=TA_RANK_HEADER_SHA256:
+            raise ValueError('TA provenance proof/header digest mismatch')
+    # Proof metadata is a retained readset, never authority to change the fixed pin.
+    return header,proof,{'schema':'ta-rank-private-build-readset-v1','expected_header_sha256':TA_RANK_HEADER_SHA256,'header':header_record,'proof':proof_record}
+def ta_rank_publish(inputs, directory):
+    header,proof,readset=inputs;directory=Path(directory)
+    directory.mkdir(mode=0o700)
+    rows=[('ta_rank_assets_private.h',header),('readset.json',(json.dumps(readset,sort_keys=True,indent=2)+'\n').encode())]
+    if proof is not None:rows.append(('ta-rank-assets-proof.json',proof))
+    for name,data in rows:
+        fd=os.open(str(directory/name),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+    fd=os.open(str(directory),os.O_RDONLY|os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+    return directory
+# END TA_RANK_PINNED_INPUT_HELPERS
+
+# BEGIN VEHICLE_RESTORE_PINNED_INPUT_HELPERS
+VEHICLE_RESTORE_HEADERS = {
+    'body_color_assets_private.h': '9d400fbcbb480579afd1dcf759a4ffae07cf1a9adbedfa78a5c1727e504ecb87',
+    'player_paint_profile_private.h': '88631bfff65ae050881d85d71b73783b1eed11f5972a53dbdbd94a8d00c59075',
+    'player_paint_model_profile_private.h': '92093cfb799b19f73877a9590d8f3bf6154928e39c9cdc77a2074deee5ae8957',
+}
+VEHICLE_RESTORE_MAX_HEADER_BYTES = 8 * 1024 * 1024
+
+def vehicle_restore_identity(s):
+    return (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_uid,s.st_gid,
+            s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+
+def vehicle_restore_stable_file(directory_fd, directory, name):
+    before=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or
+            not 0<before.st_size<=VEHICLE_RESTORE_MAX_HEADER_BYTES):
+        raise ValueError('Vehicle input must be a bounded regular single-link file: '+str(directory/name))
+    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory_fd)
+    with os.fdopen(fd,'rb') as f:
+        opened=os.fstat(f.fileno())
+        if vehicle_restore_identity(opened)!=vehicle_restore_identity(before):
+            raise ValueError('Vehicle input changed before read')
+        data=f.read(VEHICLE_RESTORE_MAX_HEADER_BYTES+1)
+        if (len(data)!=opened.st_size or len(data)>VEHICLE_RESTORE_MAX_HEADER_BYTES or
+                vehicle_restore_identity(os.fstat(f.fileno()))!=vehicle_restore_identity(opened)):
+            raise ValueError('Vehicle input changed during read')
+    after=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+    if vehicle_restore_identity(after)!=vehicle_restore_identity(opened):
+        raise ValueError('Vehicle input changed after read')
+    digest=hashlib.sha256(data).hexdigest()
+    if digest!=VEHICLE_RESTORE_HEADERS[name]:
+        raise ValueError('Vehicle header differs from fixed reviewed SHA-256: '+name)
+    return data,{'path':str(directory/name),'sha256':digest,'bytes':len(data),
+                 'stat':list(vehicle_restore_identity(opened))}
+
+def vehicle_restore_read(directory, source_root):
+    if not isinstance(directory,str) or not directory:
+        raise ValueError('VEHICLE_RESTORE_PRIVATE_INCLUDE is required')
+    path=Path(directory);source=Path(source_root).resolve(strict=True)
+    if (not path.is_absolute() or directory!=os.path.normpath(directory) or
+            path.resolve(strict=True)!=path):
+        raise ValueError('VEHICLE_RESTORE_PRIVATE_INCLUDE must be an absolute canonical non-symlink directory')
+    before=path.lstat()
+    if not stat.S_ISDIR(before.st_mode) or path.is_relative_to(source):
+        raise ValueError('Private vehicle generated input must be a directory outside the source snapshot')
+    for name in VEHICLE_RESTORE_HEADERS:
+        for parent in (source,source/'src'):
+            if os.path.lexists(parent/name):
+                raise ValueError('Source-local vehicle header would shadow the verified private include: '+name)
+    # Anchoring reads to the verified directory prevents following a substituted
+    # parent path. The complete pathname and directory stat are rechecked too.
+    fd=os.open(str(path),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        if vehicle_restore_identity(os.fstat(fd))!=vehicle_restore_identity(before):
+            raise ValueError('Vehicle include directory changed before open')
+        headers={};records={}
+        for name in VEHICLE_RESTORE_HEADERS:
+            headers[name],records[name]=vehicle_restore_stable_file(fd,path,name)
+        if (vehicle_restore_identity(os.fstat(fd))!=vehicle_restore_identity(before) or
+                vehicle_restore_identity(path.lstat())!=vehicle_restore_identity(before) or
+                path.resolve(strict=True)!=path):
+            raise ValueError('Vehicle include directory changed during read')
+    finally:os.close(fd)
+    return headers,{'schema':'vehicle-restore-private-build-readset-v1',
+                    'expected_header_sha256':dict(VEHICLE_RESTORE_HEADERS),
+                    'headers':records,'source_root':str(source),
+                    'directory_stat':list(vehicle_restore_identity(before))}
+
+def vehicle_restore_publish(inputs, directory):
+    headers,readset=inputs
+    if (set(headers)!=set(VEHICLE_RESTORE_HEADERS) or
+            readset.get('schema')!='vehicle-restore-private-build-readset-v1' or
+            readset.get('expected_header_sha256')!=VEHICLE_RESTORE_HEADERS or
+            set(readset.get('headers',{}))!=set(VEHICLE_RESTORE_HEADERS)):
+        raise ValueError('Invalid vehicle private build capability')
+    for name,digest in VEHICLE_RESTORE_HEADERS.items():
+        data=headers[name];record=readset['headers'][name]
+        if (not isinstance(data,bytes) or hashlib.sha256(data).hexdigest()!=digest or
+                record.get('sha256')!=digest or record.get('bytes')!=len(data)):
+            raise ValueError('Vehicle private capability changed before publication')
+    directory=Path(directory);directory.mkdir(mode=0o700)
+    fd=os.open(str(directory),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        # Only the newly created directory/files are normalized, never inputs.
+        os.fchmod(fd,0o700)
+        rows=[*headers.items(),('readset.json',(json.dumps(readset,sort_keys=True,indent=2)+'\n').encode())]
+        for name,data in rows:
+            child=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=fd)
+            with os.fdopen(child,'wb') as f:
+                os.fchmod(f.fileno(),0o600);f.write(data);f.flush();os.fsync(f.fileno())
+        os.fsync(fd)
+    finally:os.close(fd)
+    return directory
+# END VEHICLE_RESTORE_PINNED_INPUT_HELPERS
+
 class Refusal(Exception): pass
 
 def need(ok, msg):
@@ -52,7 +196,7 @@ def validate_volume(root, bundle, space):
         need(v.f_bavail * v.f_frsize >= space, 'insufficient image or host free space')
 
 # Changes to these pins require human source review, not caller-supplied approval.
-REVIEWED = {'build_android.sh':'2d5f50e5c7be060537f4dddb1f135cb3d8e21aaf15ec9c6da27bf6d8a1c350dd', 'tools/recomp/guard_sections.py':'61637755f4fa2f288216f2641c67de20b0042b90bd9068d9e0a468acfa220373', 'tools/vkglsl.py':'874aabde05d8886af5606a52434c5cf63304bcb8853c8408ce4a0124fd8dcf7c'}
+REVIEWED = {'build_android.sh':'59dab64fb82d33d922e201fc07d01258775abf64547beb1c8675eb6deb404272', 'tools/recomp/guard_sections.py':'61637755f4fa2f288216f2641c67de20b0042b90bd9068d9e0a468acfa220373', 'tools/vkglsl.py':'874aabde05d8886af5606a52434c5cf63304bcb8853c8408ce4a0124fd8dcf7c'}
 SECRET = {'.jks','.keystore','.p12','.pfx','.pem','.key','.p8','.p7b','.p7c','.asc','.mobileprovision'}
 
 def scan(root):
@@ -104,7 +248,7 @@ def verify(root, files):
     actual = inventory(root)
     need(actual == files, 'manifest files or SHA-256 do not match snapshot')
 
-ASSETS = {'GAME_DATA_ZIP':'assets/re3dxplus-data.zip','CARD_RESOURCES':'assets/card-resources-v1.zip','STORY_CUTIN_BIN':'assets/story-cutin.bin','CARD_PAGES_BIN':'assets/card-pages.bin','BACKFIRE_WPK':'assets/backfire.wpk','BACKFIRE_BFX':'assets/backfire.bfx'}
+ASSETS = {'GAME_DATA_BASELINES_ZIP':'assets/data-baselines.zip','GAME_DATA_ZIP':'assets/re3dxplus-data.zip','CARD_RESOURCES':'assets/card-resources-v1.zip','STORY_CUTIN_BIN':'assets/story-cutin.bin','CARD_PAGES_BIN':'assets/card-pages.bin','BACKFIRE_WPK':'assets/backfire.wpk','BACKFIRE_BFX':'assets/backfire.bfx'}
 
 def resource_hash(path):
     fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
@@ -184,20 +328,28 @@ def run(args):
     need(args.reserve_gib >= 1, 'reserve must be at least 1 GiB')
     need(re.fullmatch('[0-9a-fA-F]{64}',args.expected_cert_sha256 or '') is not None, 'expected certificate SHA-256 is required')
     need(re.fullmatch('[0-9a-fA-F]{64}',args.expected_game_data_sha256 or '') is not None, 'expected game-data SHA-256 is required')
+    need(re.fullmatch('[0-9a-fA-F]{64}',getattr(args,'expected_baselines_sha256',None) or '') is not None, 'expected baseline-catalog SHA-256 is required')
     for key in ('_JAVA_OPTIONS','JDK_JAVA_OPTIONS','JAVA_TOOL_OPTIONS'):
         need(key not in os.environ, 'unset ' + key + ' before building')
     for key in ('ANDROID_HOME','JAVA_HOME'):
         v = os.environ.get(key,''); need(v and not any(c.isspace() for c in v), key + ' missing or contains whitespace'); canonical(v)
+    ta_rank_inputs=ta_rank_read(os.environ.get('TA_RANK_PRIVATE_INCLUDE'),snapshot)
+    vehicle_restore_inputs=vehicle_restore_read(os.environ.get('VEHICLE_RESTORE_PRIVATE_INCLUDE'),snapshot)
     assets = {}
-    for key in ('APP_ICON','CARD_RESOURCES','SIGNING_KEYSTORE','GAME_DATA_ZIP','STORY_CUTIN_BIN','CARD_PAGES_BIN','BACKFIRE_WPK','BACKFIRE_BFX'):
+    for key in ('APP_ICON','CARD_RESOURCES','SIGNING_KEYSTORE','GAME_DATA_ZIP','GAME_DATA_BASELINES_ZIP','STORY_CUTIN_BIN','CARD_PAGES_BIN','BACKFIRE_WPK','BACKFIRE_BFX'):
         v = os.environ.get(key,'')
-        if key in ('APP_ICON','CARD_RESOURCES','SIGNING_KEYSTORE','GAME_DATA_ZIP'):
+        if key in ('APP_ICON','CARD_RESOURCES','SIGNING_KEYSTORE','GAME_DATA_ZIP','GAME_DATA_BASELINES_ZIP'):
             need(v, key + ' is required')
         if v:
             resource = canonical(v)
             need(resource.is_file() and not resource.is_relative_to(snapshot), key + ' missing or inside snapshot')
             if key in ASSETS:
-                digest = verified_game_data(resource,args.expected_game_data_sha256) if key == 'GAME_DATA_ZIP' else resource_hash(resource)
+                if key == 'GAME_DATA_ZIP':
+                    digest = verified_game_data(resource,args.expected_game_data_sha256)
+                elif key == 'GAME_DATA_BASELINES_ZIP':
+                    digest = verified_game_data(resource,args.expected_baselines_sha256)
+                else:
+                    digest = resource_hash(resource)
                 assets[ASSETS[key]] = (resource,digest)
     for key,v in (('VERSION_CODE',args.version_code),('VERSION_NAME',args.version_name)):
         need(not os.environ.get(key) or os.environ[key] == v, key + ' conflicts')
@@ -213,8 +365,12 @@ def run(args):
         verify(snapshot,files); verify(copy,files); validate_volume(root,bundle,reserve)
         for d in ('tmp','home','cache'): (work/d).mkdir(mode=0o700)
         out,apk = work/'build',work/'output.apk'
+        ta_rank_prepared=ta_rank_publish(ta_rank_inputs,work/'ta-rank-private-input')
+        vehicle_restore_prepared=vehicle_restore_publish(vehicle_restore_inputs,work/'vehicle-restore-private-input')
         need(not os.path.lexists(out) and not os.path.lexists(apk), 'output exists')
         env = os.environ.copy(); env.update(BUILD_OUT=str(out),APK_OUT=str(apk),TMPDIR=str(work/'tmp'),TMP=str(work/'tmp'),TEMP=str(work/'tmp'),HOME=str(work/'home'),XDG_CACHE_HOME=str(work/'cache'),JAVA_TOOL_OPTIONS='-Djava.io.tmpdir='+str(work/'tmp'),PYTHONDONTWRITEBYTECODE='1',VERSION_CODE=args.version_code,VERSION_NAME=args.version_name)
+        env['TA_RANK_PRIVATE_INCLUDE']=str(ta_rank_prepared)
+        env['VEHICLE_RESTORE_PRIVATE_INCLUDE']=str(vehicle_restore_prepared)
         print('Isolated run (volume privacy depends on its mount):',work,flush=True)
         print('External tools may still write system caches; redirection is not a sandbox.',flush=True)
         result = subprocess.run(['/bin/sh',str(copy/'build_android.sh')],cwd=str(copy),env=env)
@@ -234,6 +390,7 @@ def main():
     p.add_argument('--version-code',required=True); p.add_argument('--version-name',required=True)
     p.add_argument('--root'); p.add_argument('--bundle'); p.add_argument('--workspace'); p.add_argument('--reserve-gib',type=int,default=0); p.add_argument('--expected-cert-sha256')
     p.add_argument('--expected-game-data-sha256', help='independently reviewed SHA-256 of GAME_DATA_ZIP; required for build')
+    p.add_argument('--expected-baselines-sha256', help='independently reviewed SHA-256 of GAME_DATA_BASELINES_ZIP; required for build')
     args = p.parse_args()
     try:
         need(args.root and args.bundle and args.workspace, 'manifest and build require root, bundle, and workspace')

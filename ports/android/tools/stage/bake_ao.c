@@ -172,7 +172,8 @@ static void get_vert(const batch *b, uint32_t i, vert *v) {
 static int occluder_group(int g) {
   return g == 0 || (g >= G_WHEEL && g < G_WHEEL + 4) || g == G_LAMP_OFF;
 }
-static int part_group(int g) { return g >= G_MIRROR && g < G_CTIRE; }
+static int part_group(int g) { return (g >= G_MIRROR && g < G_CTIRE) || (g >= 0x180 && g < 0x18a); }
+static int unlit_story_part(const batch *b) { return b->group >= 0x180 && b->group < 0x18a && b->prog != 1; }
 
 static int add_tris(const batch *bs, int nb, int want_group, tri **out, int *n, int *cap) {
   for (int i = 0; i < nb; ++i) {
@@ -240,7 +241,7 @@ int main(int argc, char **argv) {
     if (bs[i].prog == 1 && !(bs[i].flags & 3) && bs[i].tex < (int)n_tex && bs[i].group != G_SHADOW && page[bs[i].tex] >= 0)
       page[bs[i].tex] = 1;
   for (uint32_t i = 0; i < n_batch; ++i) {
-    if (bs[i].tex >= (int)n_tex || page[bs[i].tex] <= 0 || (bs[i].flags & 3)) continue;
+    if (bs[i].tex >= (int)n_tex || page[bs[i].tex] <= 0 || (bs[i].flags & 3) || unlit_story_part(&bs[i])) continue;
     for (uint32_t k = 0; k < bs[i].vcount; ++k) {
       float uv[2];
       memcpy(uv, file + bs[i].voff + 32u * k + 12, 8);
@@ -273,7 +274,7 @@ int main(int argc, char **argv) {
     long samples = 0;
     for (uint32_t i = 0; i < n_batch; ++i) {
       const batch *b = &bs[i];
-      if (b->tex != (int)t || (b->flags & 3) || b->group == G_SHADOW) continue;
+      if (b->tex != (int)t || (b->flags & 3) || b->group == G_SHADOW || unlit_story_part(b)) continue;
       if (!occluder_group(b->group) && !part_group(b->group)) continue;
       bvh part = { 0 };
       tri *pt = NULL;

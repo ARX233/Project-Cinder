@@ -3,8 +3,8 @@
 
 Two layers:
   * a synthetic C fragment that always runs (structure, failure modes, idempotence);
-  * when WMMT_PHYS_RC names a private generated src/phys/phys_rc.c, the real
-    Junction::MoveToPrev is patched, extracted and run
+  * when the private generated src/phys/phys_rc.c is present (WMMT_PHYS_RC or the local
+    control-layout project), the real Junction::MoveToPrev is patched, extracted and run
     against a fake emulated memory: index 0 stays put instead of reading array[-1], while
     index 1 and 2 still step back one area.  The Loop variant's wrapping is asserted to be
     byte-identical after patching.
@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 GUARD = ROOT / "ports/android/tools/recomp/guard_sections.py"
 ITOA = ROOT / "ports/ipad/tools/recomp/guard_sections.py"
-REAL = Path(os.environ["WMMT_PHYS_RC"]) if os.environ.get("WMMT_PHYS_RC") else None
+REAL = Path(os.environ.get("WMMT_PHYS_RC", ROOT.parent / "control-layout-v12/android/project/src/phys/phys_rc.c"))
 
 SYNTH = """/* _ZN2yt22CAreaProcessorJunction10MoveToPrevERNS_18SAreaProcessorInfoE */
 void f_89f8d9c(void) {
@@ -137,8 +137,8 @@ int main(void) { run(0); run(1); run(2); puts("PASS guard"); return 0; }
 
 
 def run_real(tmp):
-    if REAL is None or not REAL.is_file():
-        print("skip: set WMMT_PHYS_RC to an available generated phys_rc.c")
+    if not REAL.is_file():
+        print("skip: no private generated phys_rc.c at %s" % REAL)
         return
     work = tmp / "real"
     work.mkdir()

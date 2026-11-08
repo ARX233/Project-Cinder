@@ -3,7 +3,8 @@
 from pathlib import Path
 import os, subprocess, tempfile, unittest
 SRC = Path(__file__).resolve().parents[1] / 'src/app.c'
-WORK = tempfile.gettempdir()
+WORK = str(Path(os.environ.get('TMPDIR', str(SRC.parents[2] / 'tmp'))).resolve())
+Path(WORK).mkdir(parents=True, exist_ok=True)
 
 def segment(s,a,b):
     i=s.index(a); return s[i:s.index(b,i)]
@@ -14,10 +15,10 @@ class GoalFreeze(unittest.TestCase):
     s=SRC.read_text()
     entry=segment(s,'  if (!movie && !G.vs_closed && !G.menu.finish && !G.story_end_started', '  car_input in = {0};')
     sim=segment(s,'  int frozen = G.ten_freeze','  /* the time attack console\'s sounds:')
-    trigger=segment(s,'  if (race->over && !G.menu.finish && !movie && !G.story_end_started','  if (race->over && !G.menu.finish && !G.vs_closed && !movie && G.story_end_freeze <= 0)')
-    finish=segment(s,'  if (race->over && !G.menu.finish && !G.vs_closed && !movie && G.story_end_freeze <= 0)','    int goal = race->state')
+    trigger=segment(s,'  if (race->over && !G.menu.finish && !movie && !G.story_end_started','#ifdef __ANDROID__\n  int vs_finish_ready = 1;')
+    finish=segment(s,'  if (!app_ghost_mode() && race->over && !G.menu.finish && !G.vs_closed && !movie && G.story_end_freeze <= 0 && vs_finish_ready)','    int goal = race->state')
     render=segment(s,'  if (G.ten_freeze > 0 || G.story_end_freeze > 0) hud_negate','  if (!movie && G.movie_in > 0)')
-    controls=segment(s,'  if (G.story_end_freeze > 0 || G.story_old_ended)\n    G.hud.camera_pressed', '  /* One arcade frame per display frame:')
+    controls=segment(s,'  if (G.story_end_freeze > 0 || G.story_old_ended)\n    G.hud.camera_pressed', '  /* app_present supplies one exact 60 Hz logic interval')
     pre=r"""
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,13 +30,15 @@ class GoalFreeze(unittest.TestCase):
 #define TEN_WHITE_FADE 2
 #define SND_BEATEN 4
 #define MOVIE_FADE 20
+/* Legacy Story/VS scenarios retain their historical synthetic mode numbers. */
+static int app_ghost_mode(void){return 0;}
 typedef struct {int over,won,state,play_state,ten_beaten; float countdown;} car_race;
 typedef struct {int shift_up,shift_down;} car_input;
-static struct {int ten_freeze,story_end_freeze,story_end_started,story_old_ended,ten_bgm_off,ten_white,n_ten,ten_beaten_on,vs_race,rival,paused,vs_closed,movie_fade; float fps,movie_len,movie_frame; struct {int finish,game,manual;} menu; struct {int camera_pressed,reset_pressed,trans_pressed;} hud; int camera; struct {car_race race; float wall_hit; int body,effect,rival_body[2],rival_effect[2],rival_shown[2];} car;} G;
+static struct {int ten_freeze,story_end_freeze,story_end_started,story_old_ended,ten_bgm_off,ten_white,n_ten,ten_beaten_on,vs_race,rival,paused,vs_closed,movie_fade; float fps,movie_len,movie_frame; struct {int finish,game;} menu; struct {int camera_pressed,reset_pressed;} hud; int camera; struct {car_race race; float wall_hit; int body,effect,rival_body[2],rival_effect[2],rival_shown[2];} car;} G;
 #define CAR_VIEW_ROOF 1
 #define CAR_VIEW_BEHIND 0
 static int physics,dialogue,goal_at,negates,draws,order,control_actions;
-static int network_event,cleared,abort_calls,menu_calls,sound_calls;
+static int network_event,cleared,abort_calls,menu_calls,sound_calls,rev_quiets;
 static int capture_at,capture_result,capture_calls,observed_ticks;
 static int continuation,suspend_at,suspends,win_events,cut_finished;
 static int story_period_suspend(void){
@@ -56,10 +59,9 @@ static int vs_abort_to_lobby(void){abort_calls++; return network_event==2 && phy
 static void car_clear_junction(car_race*r){(void)r;cleared++;}
 static void menu_frame(int n,double t){(void)n;(void)t;menu_calls++;}
 static void snd_update(void*c,car_input*i,float dt){(void)c;(void)i;(void)dt;sound_calls++;}
+static void snd_rev_quiet(void){rev_quiets++;}
 static void car_view(int x){(void)x;control_actions++;}
 static void car_reset(void*x){(void)x;control_actions++;}
-static void car_set_manual(void*x,int n){(void)x;(void)n;control_actions++;}
-static void garage_save(void){control_actions++;}
 static void hud_story_cutin_step(car_race*r,int h){(void)h;dialogue++;if(r->over)result_seen=1;
  if(r->over&&r->won&&r->play_state==10&&!cut_finished){win_events++;cut_finished=1;}
 }
@@ -83,7 +85,7 @@ static void hud_story_cutin_draw(void){draws++;order=order*10+3;}
 static void frame(int steps,int movie){car_input in={0};car_race*race=&G.car.race; float dt=1.0f/60; double frame_start=0; if((G.paused&&!G.vs_race)||movie)steps=0;
 """
     # Simulate a goal arriving after the extracted loop, before the fallback.
-    mid='\nobserved_ticks=executed_physics_ticks;\nif(inject_late_goal){race->state=CAR_RACE_GOAL;race->over=1;inject_late_goal=0;}\n'+trigger+'\n'+finish+' G.menu.finish=1; }\n}\n'
+    mid='\nobserved_ticks=executed_physics_ticks;\nif(inject_late_goal){race->state=CAR_RACE_GOAL;race->over=1;inject_late_goal=0;}\n'+trigger+'\nint vs_finish_ready=1;\n'+finish+' G.menu.finish=1; }\n}\n'
     post='\nstatic void controls(void){\n'+controls+'\n}\n'
     post+='\nstatic void draw(int movie){car_input in={0}; __typeof__(G.car)*c=&G.car;\n'+render+'\n}\n'
     post+=r"""
@@ -126,8 +128,19 @@ int main(int argc,char**argv){int scenario=argc>1?atoi(argv[1]):0;
   frame(5,0);printf("%d %d %d %d %d\n",physics,dialogue,G.story_old_ended,capture_calls,observed_ticks);
   G.paused=1;frame(5,0);printf("%d %d %d %d %d\n",physics,dialogue,G.story_old_ended,capture_calls,observed_ticks);return 0;
  }
- if(scenario==8){G.story_end_freeze=10;G.car.race.state=CAR_RACE_RUN;G.car.race.play_state=2;G.hud.camera_pressed=G.hud.reset_pressed=G.hud.trans_pressed=1;controls();printf("%d %d %d %d\n",control_actions,G.hud.camera_pressed,G.hud.reset_pressed,G.hud.trans_pressed);return 0;}
+ if(scenario==8){G.story_end_freeze=10;G.car.race.state=CAR_RACE_RUN;G.car.race.play_state=2;G.hud.camera_pressed=G.hud.reset_pressed=1;controls();printf("%d %d %d\n",control_actions,G.hud.camera_pressed,G.hud.reset_pressed);return 0;}
  if(scenario==9){G.story_end_started=1;G.story_end_freeze=2;frame(20,0);printf("%d %d %d %d\n",G.story_end_freeze,G.menu.finish,physics,dialogue);return 0;}
+ if(scenario==22||scenario==23){
+  if(scenario==22){G.story_end_started=1;G.story_end_freeze=10;}
+  else {G.car.race.state=CAR_RACE_RUN;G.car.race.over=0;goal_at=1;}
+  frame(5,0);printf("%d %d\n",rev_quiets,G.story_end_freeze);return 0;
+ }
+ if(scenario==24){
+  G.car.race.state=CAR_RACE_RUN;G.car.race.over=0;capture_at=1;capture_result=0;
+  frame(5,0);printf("%d %d\n",rev_quiets,G.story_old_ended);
+  frame(5,0);printf("%d %d\n",rev_quiets,G.story_old_ended);
+  G.story_old_ended=0;frame(1,0);printf("%d %d\n",rev_quiets,G.story_old_ended);return 0;
+ }
  frame(scenario==6?5:1,scenario==10);draw(scenario==10);
  printf("%d %d %d %d %d %d %d %d\n",G.story_end_started,G.story_end_freeze,G.menu.finish,physics,dialogue,negates,draws,order);
  if(!scenario){G.paused=1;frame(40,0);printf("%d %d %d\n",G.story_end_freeze,physics,dialogue);G.paused=0;frame(178,0);draw(0);printf("%d %d %d %d %d\n",G.story_end_freeze,G.menu.finish,physics,dialogue,negates);frame(1,0);draw(0);frame(2,0);printf("%d %d %d %d %d\n",G.story_end_freeze,G.menu.finish,physics,dialogue,negates);}
@@ -182,8 +195,19 @@ int main(int argc,char**argv){int scenario=argc>1?atoi(argv[1]):0;
       self.assertEqual(paused,[initial_freeze,physics,initial_dialogue,1])
       self.assertEqual(almost,[1,0,physics,almost_dialogue,1,1])
       self.assertEqual(done,[0,1,physics+1,almost_dialogue+2,1,1])
+ def test_rev_loop_quiet_during_and_on_entry_to_freeze(self):
+    for scenario in (22, 23):
+     with self.subTest(scenario=scenario):
+      quiet, remaining = self.run_case(scenario)[0]
+      self.assertEqual(quiet, 1)
+      self.assertGreater(remaining, 0)
+ def test_rev_loop_quiet_for_ended_old_story_sequence(self):
+    first, following, restarted = self.run_case(24)
+    self.assertEqual(first, [1, 1])
+    self.assertEqual(following, [2, 1])
+    self.assertEqual(restarted, [2, 0])
  def test_frozen_controls(self):
-    self.assertEqual(self.run_case(8)[0],[0,0,0,0])
+    self.assertEqual(self.run_case(8)[0],[0,0,0])
  def test_goal_mid_batch(self):
     row=self.run_case(6)[0];self.assertEqual(row[:3],[1,180,0]);self.assertEqual(row[3],1,'physics advanced after goal')
 if __name__=='__main__': unittest.main()

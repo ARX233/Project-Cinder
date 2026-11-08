@@ -2,7 +2,7 @@
 """Compile the exact Android tire renderer with a recording GL stub.
 
 This is a host contract test, not verification of an actual GL context or GPU.
-Build products and temporary files remain in a unique the system temporary directory directory.
+Build products and temporary files remain in a unique /Volumes/CodexWork directory.
 """
 import os
 from pathlib import Path
@@ -118,7 +118,7 @@ class TireRenderHostTest(unittest.TestCase):
         self.assertIsNotNone(maximum, 'sprite limit missing')
         self.assertRegex(header, r'void\s+render_tire_tracks\s*\(')
         self.assertRegex(src, r'#ifdef\s+__ANDROID__\s*/\*[\s\S]*?\*/\s*void\s+render_tire_tracks\s*\(')
-        work = Path(tempfile.mkdtemp(prefix='tire-render-host-'))
+        work = Path(tempfile.mkdtemp(prefix='tire-render-host-', dir='/Volumes/CodexWork'))
         env = os.environ.copy()
         for key in ('HOME','TMPDIR','TMP','TEMP','XDG_CACHE_HOME'):
             env[key] = str(work)

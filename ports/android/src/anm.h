@@ -12,10 +12,9 @@ float anm_edge(void); /* the extra width on each side in 1024-wide layout pixels
  * lays those out 16:9 itself): app.c then leaves the sides as they are */
 int anm_wide_drawn(void);
 /* Opens data_dir/menu.bin (needs a GL context), optionally appending a validated sprites-only
- * story-cutin.bin. Android prefers <external-files>/wmmt-sidecars/story-cutin.bin and,
- * when absent, falls back to <data_dir>/story-cutin.bin; elsewhere uses the latter.
- * card-pages.bin is also optional and loaded after story-cutin.bin; Android prefers
- * <external-files>/wmmt-sidecars/card-pages.bin, otherwise <data_dir>/card-pages.bin.
+ * story-cutin.bin and card-pages.bin. Android receives each optional file's independently
+ * catalog-verified path from Java; unavailable files stay disabled with no path guessing.
+ * Other platforms load the optional files beside data_dir/menu.bin.
  * Invalid card packs leave the existing base and story resources unchanged. */
 int anm_load(const char *data_dir);
 /* Once a frame: drops the textures of sprites not drawn for three seconds. */
@@ -54,6 +53,14 @@ void anm_draw_xf(int anim, int frame, float alpha, float dx, float dy, float zoo
 /* And scaled by sx across, sy down (clSpriteAnime's setScale and setPos). */
 void anm_draw_xy(int anim, int frame, float alpha, float dx, float dy, float sx, float sy, const anm_swap *swap,
                  int nswap);
+/* A screen-specific composition may anchor semantic groups without stretching its
+ * pictures or disturbing the animation. Match ORIGINAL packed template identities
+ * (before image replacement); translate after the record's affine in 640x480
+ * units. Only matching records override the old implicit wide-edge decoration.
+ * NULL/empty moves retain the ordinary draw path; no global layout state. */
+typedef struct { int sprite; float dx, dy; } anm_layout_move;
+void anm_draw_layout(int anim, int frame, float alpha, float dx, float dy,
+                     const anm_swap *swap, int nswap, const anm_layout_move *moves, int nmoves);
 /* One packed sprite, top-left at (x, y) on the 640x480 screen, at its own size. */
 void anm_draw_sprite(int sprite, float x, float y, float alpha);
 /* The part src (x0, y0, x1, y1 in the sprite's pixels) of a packed sprite, stretched over dst
@@ -61,6 +68,11 @@ void anm_draw_sprite(int sprite, float x, float y, float alpha);
 void anm_draw_part(int sprite, const float src[4], const float dst[4], float alpha);
 /* The same in a colour: c * mul + add (an anim record's, anm_sprite_xf) */
 void anm_draw_part_col(int sprite, const float src[4], const float dst[4], const float mul[4], const float add[4]);
+/* Program-owned UI artwork, separate from the verified imported game resources.
+ * x/y/w/h are author-space 640x480 units; no game sprite IDs or sidecar paths
+ * are changed. The built-in texture follows the same idle trim lifecycle. */
+enum { ANM_BUILTIN_VS_MODE = 0 };
+void anm_draw_builtin(int image, float x, float y, float w, float h, float alpha);
 /* Where a frame draws packed sprite `sprite`: r = x0, y0, x1, y1 on the 640x480 screen.
  * Returns 0 if the frame has no such sprite. */
 int anm_sprite_rect(int anim, int frame, int sprite, float r[4]);

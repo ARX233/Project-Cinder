@@ -60,6 +60,14 @@ void snd_effect(const char *wav, float vol);
 void snd_menu_loop(int which, int on);
 /* Silence the car (engine, tyres, wall) when the race is left. */
 void snd_quiet(void);
+/* Game thread: successful native Mc_Start / teardown notifications only.
+ * Start fences the supplied latest physics sequence; no cached envelope reuse.
+ * Do not call these on ordinary model selection, pause/resume or an RPM edge. */
+void snd_rev_start(unsigned observed_sequence);
+void snd_rev_stop(void);
+/* Game thread: silence only the rev loop when physics updates stop. Mute keeps
+ * the playing source phase; a stopped source stays stopped until start. */
+void snd_rev_quiet(void);
 /* Audio thread: mix `frames` interleaved stereo int16 frames. */
 void snd_mix(short *out, int frames);
 #if defined(__ANDROID__) || defined(WMMT_AUDIO_DIAGNOSTICS)

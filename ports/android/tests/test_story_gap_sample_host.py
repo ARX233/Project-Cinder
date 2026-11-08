@@ -57,7 +57,7 @@ int main(void) {
  return 0;
 }
 '''
-        work = Path(tempfile.mkdtemp(prefix='story-gap-host-'))
+        work = Path(tempfile.mkdtemp(prefix='story-gap-host-', dir='/Volumes/CodexWork'))
         env = os.environ.copy()
         for key in ('HOME', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CACHE_HOME'):
             env[key] = str(work)

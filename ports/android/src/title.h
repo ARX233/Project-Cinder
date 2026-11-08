@@ -55,6 +55,7 @@ int title_judge(const title_play *p, int current, int out[3]);
 int title_glyphs(int id, const unsigned short **glyphs);
 /* whether glyph g takes a font's half width (the ASCII ones) rather than its full */
 int title_glyph_half(int g);
+int title_glyph_index(unsigned codepoint);
 /* a model's ids, -1 for none; the models of a car's colours */
 int title_model(int maker, int car, int color);
 

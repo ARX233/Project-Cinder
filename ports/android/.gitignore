@@ -35,6 +35,7 @@ __pycache__/
 /src/story_cutin_data.h
 /src/story_defaults_private.h
 /src/junction_table_private.h
+/src/tail_trail_private_data.h
 /src/storycity.h
 /src/storydemo.h
 /src/storyinfo.h

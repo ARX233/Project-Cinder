@@ -452,7 +452,7 @@ EXTRA += WHEEL_SET_SPRITES + [0x18b5, *range(0x18ad, 0x18b4), *range(0x19df, 0x1
 # messages (straight, spot), the bar white
 EXTRA += [*range(0x1bcf, 0x1bd5), 0x16f1, 0x16f3, 0x1ab3, 0x1ab4, 0x19dc]
 # the versus' race title page: the time attack's with menu_p_pre_title_vs
-EXTRA += [2910]
+EXTRA += [2910, 0x3a7]  # clSeqJoWaitThread: menu_p_wait_02
 # the stickers' change: the places' pictures (0x9409220: line 1, fire 1, line 2, fire 2,
 # Pac-Man, namco, the makers' works colours, line 3, fire 3, tribal), the lock, the swatches
 # (the colours, fire 2's gradations), the NEW marks (0x9409260), the gem cars' works colours
@@ -670,10 +670,7 @@ SAVE_TEXTS = ([(3, "SAVE DATA"), (3, "NEW GAME"), (3, "LOAD GAME")] + [(3, f"SAV
               [(3, "DELETE"), (1, "TAP A SAVE TO DELETE IT")] +
               [(1, f"TAP SAVE {n} AGAIN TO DELETE IT") for n in range(1, 5)])
 SAVE_GLYPHS = "0123456789/:"
-# the SAVE DATA screen's "i" key and its page (menu.c MENU_INFO; tools/infopage.py, in a CJK
-# font of the machine's), the page kept zlib-packed
-INFO_KEY, INFO_PAGE = 108000, 108001
-ZIPPED |= {INFO_PAGE}
+# The removed SAVE DATA information page has no generated sprites.
 # The save's cars (menu.c's HAVE, GARAGE and CARD screens) as CARD_TEXT_BASE + k; the
 # "do you have a card?" cards (clSeqCardHaveSelectThread's menu_p_yn_card_have_yes and _no)
 # with the port's captions in place of the arcade's (CARD_HAVE_YES, CARD_HAVE_NO); the card's
@@ -951,10 +948,6 @@ def main():
     for k, c in enumerate(SAVE_GLYPHS):
         sprites.append(render_text(elf, names, root, 1, c))
         ids.append(SAVE_GLYPH_BASE + k)
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import infopage
-    sprites += [infopage.render_key(), infopage.render_page()]
-    ids += [INFO_KEY, INFO_PAGE]
 
     for k, (font, text) in enumerate(CARD_TEXTS):
         sprites.append(render_text(elf, names, root, font, text))

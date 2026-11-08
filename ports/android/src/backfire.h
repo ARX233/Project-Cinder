@@ -21,5 +21,5 @@ void bfx_free(bfx_asset *asset);
 void bfx_reset(bfx_playback *p);
 int bfx_car_id(const char *key, const char *body);
 int bfx_variant_b(int id);
-void bfx_step(bfx_playback *p, const bfx_asset *a, int car, const char *id, int pulse, int type);
+void bfx_step(bfx_playback *p, const bfx_asset *a, int car, const char *id, int tuned_muffler, int pulse, int type);
 #endif

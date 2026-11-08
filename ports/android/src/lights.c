@@ -69,12 +69,21 @@ typedef struct {
   uint32_t type;
 } light_point;
 
+typedef struct {
+  char pack[48];
+  uint8_t kind, body, count;
+  float position[8][3];
+} front_halo_car;
+
 static struct {
   wpk_scene sprites;
   /* the under neons' glows (neon.wpk, loaded with the rest; neon_tried once it was tried) */
   wpk_scene neon;
   int neon_tried;
   char neon_path[1200];
+  wpk_scene front_halo;
+  front_halo_car *halo_cars;
+  uint32_t n_halo_cars;
   light_point *pts; /* street lights, then building lights */
   int n_street, n_building;
   render_vertex v[2][4 * RENDER_MAX_SPRITES];
@@ -116,6 +125,56 @@ int lights_load(const char *data_dir) {
   if (wpk_load(&L.neon, L.neon_path) != 0) fprintf(stderr, "no %s, no under neons\n", L.neon_path);
   snprintf(path, sizeof path, "%s/lights.bin", data_dir);
   return lights_points(path);
+}
+
+static uint32_t halo_le32(const unsigned char b[4]) {
+  return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+}
+
+int lights_front_halo_load(const char *atlas, const char *anchors) {
+  FILE *f = fopen(anchors, "rb");
+  if (!f) return -1;
+  unsigned char header[8];
+  uint32_t n = 0;
+  if (fread(header, 1, sizeof header, f) == sizeof header && !memcmp(header, "HL01", 4))
+    n = halo_le32(header + 4);
+  front_halo_car *cars = n && n <= 1024 ? calloc(n, sizeof *cars) : NULL;
+  int valid = cars != NULL;
+  for (uint32_t i = 0; valid && i < n; ++i) {
+    unsigned char row[52];
+    front_halo_car *c = &cars[i];
+    valid = fread(row, 1, sizeof row, f) == sizeof row && row[0] && memchr(row, 0, 48) &&
+            row[48] <= 1 && row[49] <= 3 && row[50] >= 1 && row[50] <= 8 && row[51] == 0;
+    if (!valid) break;
+    memcpy(c->pack, row, sizeof c->pack);
+    c->kind = row[48];
+    c->body = row[49];
+    c->count = row[50];
+    for (int a = 0; valid && a < c->count; ++a) {
+      for (int k = 0; valid && k < 3; ++k) {
+        unsigned char bytes[4];
+        if (fread(bytes, 1, sizeof bytes, f) != sizeof bytes) { valid = 0; break; }
+        uint32_t word = halo_le32(bytes);
+        memcpy(&c->position[a][k], &word, sizeof word);
+        valid = isfinite(c->position[a][k]) && fabsf(c->position[a][k]) <= 100.0f;
+      }
+    }
+  }
+  valid = valid && fgetc(f) == EOF && !ferror(f);
+  fclose(f);
+  if (!valid) { free(cars); return -1; }
+  wpk_scene sprites = {.fd = -1};
+  if (wpk_load(&sprites, atlas) != 0 || sprites.n_tex != 1 || !sprites.textures[0]) {
+    wpk_free(&sprites);
+    free(cars);
+    return -1;
+  }
+  if (L.n_halo_cars) wpk_free(&L.front_halo);
+  free(L.halo_cars);
+  L.front_halo = sprites;
+  L.halo_cars = cars;
+  L.n_halo_cars = n;
+  return 0;
 }
 
 /* a camera-facing quad of p at view-space centre c */
@@ -203,7 +262,8 @@ int lights_warm(void) {
   if (done || !L.sprites.n_tex) return 0;
   done = 1;
   for (uint32_t k = 0; k < L.sprites.n_tex; ++k) render_warm_texture(L.sprites.textures[k]);
-  return (int)L.sprites.n_tex;
+  if (L.n_halo_cars) render_warm_texture(L.front_halo.textures[0]);
+  return (int)L.sprites.n_tex + (L.n_halo_cars != 0);
 }
 
 void lights_draw_goal(const mat4 *proj, const mat4 *view, const car_race *r, float time, render_params *rp) {
@@ -309,6 +369,75 @@ void lights_draw_spots(const mat4 *proj, const mat4 *view, const float *const *b
     }
   }
   render_sprites_by_colour(proj, L.v[0], q, L.sprites.textures[TEX_SPOT], rp);
+}
+
+/* car_frontlight.igb's head01..03 on the shared car_headlight.dds atlas. */
+static const sprite_param HEADLIGHT[3] = {
+  { { 0.0f, 1.0f, 0.5f, 0.5f }, 15.0f, 15.0f, 0, 0 },
+  { { 0.5f, 1.0f, 1.0f, 0.5f }, 15.0f, 15.0f, 0, 0 },
+  { { 0.0f, 0.5f, 0.5f, 0.0f }, 15.0f, 15.0f, 0, 0 },
+};
+
+void lights_draw_front_halo(const mat4 *proj, const mat4 *view, const float *eye,
+                            const float *body, const char *pack, int aero, int mirror,
+                            render_params *rp) {
+  if (!pack) return;
+  const front_halo_car *car = NULL;
+  for (uint32_t i = 0; i < L.n_halo_cars; ++i) {
+    const front_halo_car *row = &L.halo_cars[i];
+    if (row->kind == 0 && row->body == aero && !strcmp(row->pack, pack)) { car = row; break; }
+  }
+  if (!car) return;
+  const float *forward = body + 8, *v = view->m;
+  const float length = sqrtf(forward[0]*forward[0] + forward[1]*forward[1] + forward[2]*forward[2]);
+  if (!(length > 0.0f)) return;
+  const float divisor[2][3] = {{30,30,20}, {20,30,10}};
+  const float limit[2][3] = {{6,6,10}, {6,6,8}};
+  int camera = !!mirror, n = 0;
+  /* clCarLampManager uses a reduced set on cars with more than two locators.
+   * The main-view Supra also omits R2 (slot 1 in each of its four bodies). */
+  int layers = car->count <= 2 ? 7 : camera ? 5 : 1;
+  int skip_supra_r2 = !camera && car->count > 2 && !strcmp(pack, "toy_JZA80");
+  for (int a = 0; a < car->count; ++a) {
+    if (skip_supra_r2 && a == 1) continue;
+    const float *local = car->position[a];
+    float world[3], direction[3], center[3];
+    float dist2 = 0, dot = 0;
+    for (int k = 0; k < 3; ++k) {
+      world[k] = body[k]*local[0] + body[4+k]*local[1] + body[8+k]*local[2] + body[12+k];
+      direction[k] = eye[k] - world[k];
+      dist2 += direction[k] * direction[k];
+      dot += direction[k] * forward[k];
+    }
+    /* clCarLampHalo::update, facing alpha and view-space billboard. */
+    const float distance = sqrtf(dist2);
+    if (!(dot > 0.0f) || !(distance > 5.0f) || !isfinite(distance)) continue;
+    const float alpha = fminf(1.0f, dot / (distance * length));
+    for (int k = 0; k < 3; ++k) world[k] += direction[k] * (5.0f / distance);
+    for (int k = 0; k < 3; ++k)
+      center[k] = v[k]*world[0] + v[4+k]*world[1] + v[8+k]*world[2] + v[12+k];
+    if (center[2] >= -1.0f) continue;
+    for (int layer = 0; layer < 3; ++layer) {
+      if (!(layers & (1 << layer))) continue;
+      sprite_param sprite = HEADLIGHT[layer];
+      float scale = fminf(distance / divisor[camera][layer], limit[camera][layer]);
+      sprite.w *= scale;
+      sprite.h *= scale;
+      render_vertex *q = L.v[0] + 4 * n++;
+      quad(q, center, &sprite);
+      for (int i = 0; i < 4; ++i) q[i].rgba[3] = (uint8_t)(alpha * 255.0f + 0.5f);
+      if (!camera && !layer) {
+        const float angle = 3.0f * (direction[0]*forward[0] + direction[2]*forward[2]) / (distance * length);
+        float s = sinf(angle), c = cosf(angle);
+        for (int i = 0; i < 4; ++i) {
+          float x = q[i].pos[0] - center[0], y = q[i].pos[1] - center[1];
+          q[i].pos[0] = center[0] + c*x - s*y;
+          q[i].pos[1] = center[1] + s*x + c*y;
+        }
+      }
+    }
+  }
+  render_sprites(proj, L.v[0], n, L.front_halo.textures[0], rp);
 }
 
 /* clNeon::setup (0x895094c): the model's matrix makeScale(NeonScaleGetFromCarId) with the

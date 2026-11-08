@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 ANDROID = ROOT / "ports/android"
-GENERATED = Path(os.environ["HUD_GENERATED"]) if os.environ.get("HUD_GENERATED") else ANDROID / "src"
+GENERATED = Path(os.environ.get("WMMT_GENERATED_ROOT", ROOT.parent / "control-layout-v12")) / "android/project/src"
 
 class PreRaceTuneHost(unittest.TestCase):
     def test_menu(self):

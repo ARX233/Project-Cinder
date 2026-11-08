@@ -1,6 +1,7 @@
 #include "menu.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include "cardb.h"
 #include "gl.h"
 #include "hud.h"
+#include "menu_mode_layout.h"
 #include "storypre.h"
 #include "storysel.h"
 #include "tendb.h"
@@ -23,6 +25,7 @@
 #include "mathx.h"
 #include "sound.h"
 #include "title.h"
+#include "story_assembly.h" /* shared original-earned budget contract; pure, no persistence */
 
 /* Derived locally from the user's verified original; never distributed in the repository. */
 #if defined(__ANDROID__) || defined(WMMT_STORY_DEFAULTS_TEST)
@@ -43,12 +46,13 @@
  * - menu_layout_ta_course_arrow: k*100+10..49 the arrows' pulse for course k. */
 static struct {
   int title, bg, line, logo, top, bottom, mode, mode_ring, course, arrow, course_map;
+  int tg_result_bar, tg_result_moji;
   int ten_timeup, ten_face, ten_x, ten_finish, ten_summary; /* clTenResult */
   int game, game_image, game_ring; /* the game mode select */
-  int vs_sel, vs_sel_image, vs_sel_ring; /* the versus select */
+  int vs_sel_image; /* the versus select preview and caption */
   int vs_course, vs_icon, vs_icon_omakase, vs_icon_omakase2, vs_ex_player, timer; /* the area vote */
   int shogo_bg, pre_shadow[3], pre_cars[3], pre_vs[3], plate, plate_ph; /* the cars flying in (MENU_VS_MATCH) */
-  int maker[3], pre_bg, ranking_bg, ranking;
+  int maker[3], pre_bg, ranking_bg, ranking, ranking_step;
   int prologue[2];
   /* the car select */
   int bg_carsel, maker_layout, maker_car, car_info, car_arrow, car_new, mes_r35, mes_jzs161;
@@ -137,6 +141,10 @@ static struct {
  * seqAtructCi 240 */
 #define TITLE_LEN 600
 #define RANKING_LEN 600
+#define RANKING_PLATE_START 13
+#define RANKING_PLATE_FIRST 11
+#define RANKING_PLATE_LAST 49
+#define RANKING_SETTLED (RANKING_PLATE_START + 2 * (TA_RANK_DISPLAY - 1) + RANKING_PLATE_LAST - RANKING_PLATE_FIRST)
 #define LOGO_LEN 240
 /* seqPrologue after the logos: atract_g_02 ("This game is a work of fiction..."), then with
  * the Japanese locale (0x9735384 == 1) atract_g_01, the story; each plays its 120 frames */
@@ -207,7 +215,7 @@ static void km_init(void) {
 
 /* A fresh machine's top ten: clTimeAttackRankingDataManager::load fills every course from
  * clRankingDefault::data_ (records 5, 4, 3, 2, 1, 0, 46, 45, 44, 43 in insertion order),
- * all ＧＵＥＳＴ, title 1 (湾岸の新人), class N, untuned (handling B) at 9'59"999.
+ * all ＧＵＥＳＴ, title 1 (湾岸の新人), class N, untuned (handling B) at 19'59"999.
  * Car name sprite = get_car_model_data(model)+0x2c, horsepower = GetCarData(car)+0x20. */
 static const struct { int car_sprite, hp; } DEFAULT_ROWS[10] = {
   { 7627, 205 }, /* FC3S */
@@ -221,7 +229,7 @@ static const struct { int car_sprite, hp; } DEFAULT_ROWS[10] = {
   { 7907, 280 }, /* JZS161 */
   { 7801, 260 }, /* UCF10 */
 };
-#define DEFAULT_TIME_MS 599999
+#define DEFAULT_TIME_MS TA_RANK_FACTORY_DISPLAY_MS
 
 /* clRankingPlate::InitForHorsePowerDisp: the template sprites of menu_layout_ranking it replaces */
 enum {
@@ -242,14 +250,13 @@ static struct {
   int bg_template, name_template, waku_template;
 } R;
 
-/* The arcade ranks a new course each round (seqRanking(round % 15)), skipping ids 5, 7 and
- * 11 (no card). */
+/* Native87bac20/87bb5be advances the previous order, skipping through87b4c14.
+ * Its continuous12-course cycle, not independent skip-ahead on demo%15.
+ * Port initial phase and demo/movie counter remain unchanged; no Ctor-phase claim. */
+#define RANKING_COURSES 12
 static int course_for(int demo) {
-  for (int i = 0; i < 15; ++i) {
-    int id = ORDER_TO_COURSE[(demo + i) % 15];
-    if (id != 5 && id != 7 && id != 11) return id;
-  }
-  return 0;
+  static const int enabled[RANKING_COURSES]={0,1,2,3,4,6,8,9,14,10,12,13};
+  return demo>=0?enabled[demo%RANKING_COURSES]:0;
 }
 
 static void ranking_init(void) {
@@ -280,30 +287,64 @@ static void ranking_init(void) {
   R.waku_template = anm_sprite(0x1f45);
 }
 
-/* one plate of menu_layout_ranking, as InitForHorsePowerDisp fills it */
-static void draw_plate(int rank, int frame, float alpha) {
-  anm_swap sw[24];
-  int n = 0, ms = DEFAULT_TIME_MS, hp = DEFAULT_ROWS[rank - 1].hp;
-  sw[n++] = (anm_swap){ R.t_waku, R.waku };
-  sw[n++] = (anm_swap){ R.t_rank10, rank > 9 ? R.digit[rank / 10 % 10] : -1 };
-  sw[n++] = (anm_swap){ R.t_rank1, R.digit[rank % 10] };
-  sw[n++] = (anm_swap){ R.t_name, R.guest };
-  const int t_digits[7] = { ms / 600000, ms % 600000 / 60000, ms % 60000 / 10000, ms % 10000 / 1000,
-                            ms % 1000 / 100, ms % 100 / 10, ms % 10 };
-  for (int i = 0; i < 7; ++i)
-    sw[n++] = (anm_swap){ R.t_time[i], i == 0 && ms < 600000 ? -1 : R.digit[t_digits[i]] };
-  sw[n++] = (anm_swap){ R.t_car, R.car[rank - 1] };
-  sw[n++] = (anm_swap){ R.t_hp[0], hp > 99 ? R.digit[hp / 100 % 10] : -1 };
-  sw[n++] = (anm_swap){ R.t_hp[1], hp > 9 ? R.digit[hp / 10 % 10] : -1 };
-  sw[n++] = (anm_swap){ R.t_hp[2], R.digit[hp % 10] };
-  sw[n++] = (anm_swap){ R.t_handling, R.handling_b };
-  /* class N: (none, none, N) from the table at 0x93f2300 */
-  sw[n++] = (anm_swap){ R.t_class[0], -1 };
-  sw[n++] = (anm_swap){ R.t_class[1], -1 };
-  sw[n++] = (anm_swap){ R.t_class[2], R.class_n };
-  sw[n++] = (anm_swap){ R.t_title, R.title };
-  /* plate k sits 36 px under plate k-1 (clSpriteAnime::setPosition) */
-  anm_draw_ex(ID.ranking, frame, alpha, 0, 36.0f * (float)(rank - 1), sw, n);
+#include "menu_ta_rank_ui.inc"
+
+/* One original ANM plate; real fields are actual immutable record metadata.
+ * Missing real-row assets blank its data rather than fabricating N/B/GUEST stats. */
+static int draw_plate(const menu_state *m,int rank,int pb_rank,const menu_ta_saved_pb *pb,int frame,float alpha) {
+  int saved=rank==pb_rank,slot=rank-1-(pb_rank>0 && rank>pb_rank);
+  const ta_rank_row *row=saved?NULL:ta_ui_row(m,slot);
+  int real=row && (row->source_kind==TA_RANK_SOURCE_LOCAL_UNVERIFIED || row->source_kind==TA_RANK_SOURCE_COMMUNITY_UNVERIFIED);
+  int failed=real && !ta_ui_real_assets(row);
+  int def=row && !real ? (int)row->default_index : slot;
+  if(def<0 || def>=10)return 0;
+  const ta_rank_metadata *data=real?&row->record.attempt.metadata:NULL;
+  int step=real && ta_ui_is_r35(data->model_id),anim=step?ID.ranking_step:ID.ranking;
+  if(step && anim<0)return 0; /* Missing original Step never falls back to an HP-converted R35. */
+  int ms=saved?pb->ms:row?(int)row->display_ms:(int)DEFAULT_TIME_MS;
+  int hp=!step && real && !failed?car_tune_hp(TA_UI_MODEL[data->model_id][1],(int)data->power):DEFAULT_ROWS[def].hp;
+  int grade=!step && real && !failed?car_tune_grade((int)data->power,(int)data->handling):CAR_GRADE_B;
+  anm_swap sw[24];int n=0;
+  sw[n++]=(anm_swap){R.t_waku,R.waku};
+  sw[n++]=(anm_swap){R.t_rank10,rank>9?R.digit[rank/10%10]:-1};
+  sw[n++]=(anm_swap){R.t_rank1,R.digit[rank%10]};
+  sw[n++]=(anm_swap){R.t_name,real || saved?-1:R.guest};
+  const int digits[7]={ms/600000,ms%600000/60000,ms%60000/10000,ms%10000/1000,ms%1000/100,ms%100/10,ms%10};
+  for(int k=0;k<7;++k)sw[n++]=(anm_swap){R.t_time[k],failed || (!k && ms<600000)?-1:R.digit[digits[k]]};
+  if(saved) {
+    sw[n++]=(anm_swap){R.t_car,pb->plate?anm_sprite(pb->plate):-1};
+    /* The saved card's mutable tune, class and title don't describe this run. */
+    const int hidden[]={R.t_hp[0],R.t_hp[1],R.t_hp[2],R.t_handling,
+      R.t_class[0],R.t_class[1],R.t_class[2],R.t_title,anm_sprite(4061),anm_sprite(3335),anm_sprite(3351)};
+    for (unsigned k=0;k<sizeof hidden/sizeof *hidden;++k) sw[n++]=(anm_swap){hidden[k],-1};
+  } else {
+    sw[n++]=(anm_swap){R.t_car,failed?-1:real?anm_sprite(menu_ta_rank_model_plate(data->model_id)):R.car[def]};
+    if(step) {
+      /* InitForStepDisp87b6e50: raw P/H decimals; hide tens below10, always show ones. */
+      int p=(int)data->power,h=(int)data->handling;
+      sw[n++]=(anm_swap){R.t_hp[0],!failed && p>9?R.digit[p/10]:-1};
+      sw[n++]=(anm_swap){R.t_hp[1],failed?-1:R.digit[p%10]};
+      sw[n++]=(anm_swap){anm_sprite(3354),!failed && h>9?R.digit[h/10]:-1};
+      sw[n++]=(anm_swap){anm_sprite(3355),failed?-1:R.digit[h%10]};
+    } else {
+      sw[n++]=(anm_swap){R.t_hp[0],!failed && hp>99?R.digit[hp/100%10]:-1};
+      sw[n++]=(anm_swap){R.t_hp[1],!failed && hp>9?R.digit[hp/10%10]:-1};
+      sw[n++]=(anm_swap){R.t_hp[2],failed?-1:R.digit[hp%10]};
+      sw[n++]=(anm_swap){R.t_handling,failed?-1:real?anm_sprite(TA_UI_HANDLING[grade]):R.handling_b};
+    }
+    for(int k=0;k<3;++k) {
+      int id=real && !failed?(int)TA_UI_CLASS[data->class_id][k]:k==2?3349:1;
+      sw[n++]=(anm_swap){R.t_class[k],failed || id<=3?-1:anm_sprite(id)};
+    }
+    sw[n++]=(anm_swap){R.t_title,real?-1:R.title};
+    /* Source slash is the last record, after title: replay it once after live glyphs. */
+    if(real)sw[n++]=(anm_swap){anm_sprite(3351),-1};
+  }
+  float dy=36.0f*(float)(rank-1);
+  anm_draw_ex(anim,frame,alpha,0,dy,sw,n);
+  if(real && !failed)ta_ui_text(row,anim,frame,alpha,dy);
+  if(saved)ta_ui_saved_text(pb,anim,frame,alpha,dy);
+  return !failed;
 }
 
 /* A phone's 16:9 (menu_wide): a course's photo behind a screen, menu_g_pre_bg, goes the
@@ -330,22 +371,71 @@ static void draw_back(int anim, int frame, float fade) {
   if (z > 1.0f) photo_bg = 1;
 }
 
-static void draw_ranking(const menu_state *m) {
+/* Cabinet ranking owns the course order. This mobile key reuses that order,
+ * in the board's 1024x768 input space, and leaves START on the rest of the screen. */
+static const float RANKING_NEXT[] = {836.0f, 722.0f, 175.0f, 40.0f};
+
+static int ranking_next_visible(const menu_state *m) {
+  return m->screen == MENU_RANKING && m->t >= FADE && m->t <= RANKING_LEN;
+}
+
+static int ranking_next_touch(menu_state *m, void *id, int phase, float x, float y) {
+  const float *r = RANKING_NEXT;
+  int inside = x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3];
+  if (id && id == m->ta_rank_touch) {
+    if (phase == TOUCH_MOVED) m->ta_rank_touch_inside = inside;
+    if (phase == TOUCH_ENDED || phase == TOUCH_CANCELLED) {
+      int next = phase == TOUCH_ENDED && inside && m->ta_rank_touch_inside && m->screen == MENU_RANKING;
+      m->ta_rank_touch = NULL;
+      m->ta_rank_touch_inside = 0;
+      if (next) {
+        m->ta_rank_offset = (m->ta_rank_offset + 1) % RANKING_COURSES;
+        m->t = RANKING_SETTLED;
+        snd_menu(SND_CURSOR);
+      }
+    }
+    return 1;
+  }
+  if (phase != TOUCH_BEGAN || !inside || !ranking_next_visible(m)) return 0;
+  if (id && !m->ta_rank_touch) {
+    m->ta_rank_touch = id;
+    m->ta_rank_touch_inside = 1;
+  }
+  return 1;
+}
+
+static void draw_ranking(const menu_state *m, float screen_w, float screen_h) {
   int t = m->t;
   float fade = 1.0f;
   if (t < FADE) fade = (float)t / FADE;
   else if (t > RANKING_LEN) fade = 1.0f - (float)(t - RANKING_LEN) / FADE;
-  int course = course_for(m->demo);
+  int course = menu_ta_rank_course(m);
+  if (course < 0) course = 0;
   anm_swap bg = { R.bg_template, anm_sprite(COURSE_BG[course]) };
   draw_photo_bg(&bg, fade);
   anm_swap head[2] = { { R.name_template, anm_sprite(COURSE_NAME[course]) }, { R.waku_template, R.name_waku } };
   anm_draw_ex(ID.ranking_bg, 0, fade, 0, 0, head, 2);
   /* clRanking::run starts plate k's slide-in (layout frames 11..49) at frame 13 + 2(k-1) */
-  for (int k = 1; k <= 10; ++k) {
-    int start = 13 + 2 * (k - 1);
+  int assets_ok=1;
+  const menu_ta_saved_pb *pb=&m->ta_rank_saved_pb[course];
+  int pb_rank=ta_ui_saved_pb_rank(m,pb->ms);
+  for (int k = 1; k <= TA_RANK_DISPLAY; ++k) {
+    int start = RANKING_PLATE_START + 2 * (k - 1);
     if (t < start) continue;
-    int f = 11 + t - start;
-    draw_plate(k, f < 49 ? f : 49, fade);
+    int f = RANKING_PLATE_FIRST + t - start;
+    assets_ok &= draw_plate(m,k,pb_rank,pb,f < RANKING_PLATE_LAST ? f : RANKING_PLATE_LAST,fade);
+  }
+  ta_ui_notice(!assets_ok?"LOCAL ASSET MISSING":m->ta_rank_status==MENU_TA_RANK_COMMUNITY?
+               "ONLINE UNVERIFIED":m->ta_rank_status==MENU_TA_RANK_STORE_ERROR?"LOCAL DATA ERROR":"LOCAL RANKING",fade);
+  if (ranking_next_visible(m)) {
+    const float *r = RANKING_NEXT;
+    const char *label = "NEXT COURSE >";
+    const float px = 2.0f;
+    hud_ui_begin(screen_w, screen_h);
+    hud_ui_button(r[0], r[1], r[2], r[3], m->ta_rank_touch_inside);
+    hud_ui_text(label, r[0] + 0.5f * (r[2] - hud_ui_text_width(label, px)),
+                r[1] + 0.5f * (r[3] - 7.0f * px), px, 1, 1, 1, 1);
+    hud_ui_end();
   }
 }
 
@@ -440,16 +530,36 @@ static int color_at(const menu_state *m, float x, float y) {
   return -1;
 }
 
-/* The game mode select's discs (seqModeSelect with a card: setMax 4, modes 0x38..0x3b):
- * story, the ghost versus battle (0x39, only with a card; the port's online versus in its
- * place), 10 out run, time attack */
-#define GAME_SLOTS 4
-static const int GAME_AT[GAME_SLOTS] = { MENU_GAME_STORY, MENU_GAME_VS, MENU_GAME_TEN, MENU_GAME_TA };
+#include "menu_body_color.inc"
+#include "menu_story_body_runtime.inc"
+
+/* Stable game identity is not a visual slot. These are resource identities only,
+ * not a copied private animation/frame table. Real-time VS has its own built-in
+ * icon/description; the original ghost disc/picture belong only to GHOST. Its old
+ * upgrade-parts label is deliberately not used without the corresponding rewards. */
+#define GAME_SLOTS MENU_MODE_SLOTS
+static const struct { int game, icon, picture, label; float picture_crop[4]; } GAME_MODE[GAME_SLOTS] = {
+  /* Source-alpha artwork bounds, not the 1024x512 padded texture canvas. */
+  { MENU_GAME_STORY, 2825, 3224, 2317, {192, 60, 640, 396} },
+  { MENU_GAME_GHOST, 2827, 3226,    0, {192, 58, 640, 396} }, /* no unimplemented upgrade-parts promise */
+  { MENU_GAME_TEN,   2824, 3223, 2316, {191, 58, 642, 397} },
+  { MENU_GAME_TA,    2826, 3225, 2318, {191,  8, 643, 447} },
+  { MENU_GAME_VS,       0,    0,    0, {0} },
+};
 
 static int game_slot(int game) {
   for (int k = 0; k < GAME_SLOTS; ++k)
-    if (GAME_AT[k] == game) return k;
+    if (GAME_MODE[k].game == game) return k;
   return 0;
+}
+
+static int game_rects(const menu_state *m, menu_mode_rect rect[GAME_SLOTS]) {
+  return menu_mode_layout(m->sel, m->from, m->t, anm_edge() * (640.0f / 1024.0f), rect);
+}
+
+static int game_hit(const menu_state *m) {
+  menu_mode_rect rect[GAME_SLOTS];
+  return game_rects(m, rect) ? menu_mode_hit(rect, m->tap_x, m->tap_y) : -1;
 }
 
 static void car_select_enter(menu_state *m, int screen) {
@@ -483,6 +593,664 @@ static void car_select_enter(menu_state *m, int screen) {
   if (screen == MENU_COURSE) {
     m->sel = m->course;
     m->course_pos = m->sel <= 3 ? m->sel : m->sel >= 9 ? m->sel - 6 : 3;
+  }
+}
+
+static int card_bgm_saved_line(const menu_state *m);
+
+/* Ghost requests are session-only and deliberately independent of m->vs. */
+static void ghost_invalidate(menu_state *m) {
+  if (m->ghost.request_serial != UINT_MAX) ++m->ghost.request_serial;
+  m->ghost.active_request = m->ghost.completed_request = m->ghost.prepared_request = 0;
+  m->ghost.completed_action = MENU_GHOST_ACTION_NONE;
+  m->ghost.pre_go = 0;
+  if (m->ghost.choose_race_options) m->zones = m->ghost.previous_zones;
+  m->ghost.choose_race_options = 0;
+  m->ghost.pending_action = m->ghost.inflight_action = MENU_GHOST_ACTION_NONE;
+  m->ghost.touch = NULL;
+  m->ghost.touch_action = m->ghost.held = 0;
+  m->ghost.request_catalog_epoch = 0;
+  m->ghost.request_record_index = UINT32_MAX;
+  m->ghost.request_area_slot = -1;
+  m->ghost.request_source_kind = UINT32_MAX;
+}
+
+void menu_ghost_open(menu_state *m) {
+  if (!m) return;
+  ghost_invalidate(m);
+  m->game = MENU_GAME_GHOST;
+  go(m, MENU_GHOST);
+  m->music = 1;
+  m->bars = 1;
+  m->tap = m->key = m->key_held = m->back = 0;
+  m->back_touch = m->key_touch = NULL;
+  m->finish = m->finish_story = m->pause.open = 0;
+  m->ghost.status = MENU_GHOST_IDLE;
+  m->ghost.result = MENU_GHOST_RESULT_NONE;
+  m->ghost.claim_eligible = m->ghost.claim_pending = 0;
+  m->ghost.note[0] = 0;
+  ghost_original_open(&m->ghost.ui, GHOST_UI_SEARCH);
+  m->ghost.directory_row = m->ghost.area_slot = -1;
+  m->ghost.search_kind = 0;
+  m->ghost.query_waiting = 0;
+  if (m->ghost.ramp < 1 || m->ghost.ramp > 22) m->ghost.ramp = 1;
+  if (m->ghost.route < 0) m->ghost.route = 0;
+  /* Retired real-time menu asks must not survive a visit to this independent hub.
+   * The app closes actual old connections when it observes the new screen. */
+  m->vs.connect = m->vs.join = m->vs.start = m->vs.area_go = m->vs.day = 0;
+  m->vs.state = MENU_VS_OFF;
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  pre_race_tune_clear(&m->pre_tune);
+  m->pre_tune_setting = 0;
+#endif
+}
+
+void menu_ghost_set_availability(menu_state *m, int local, int cloud, int king) {
+  if (!m) return;
+  m->ghost.local_available = !!local;
+  m->ghost.cloud_configured = !!cloud;
+  m->ghost.king_available = !!cloud && !!king;
+}
+
+static int ghost_player_map(int ramp,int route) {
+  return ramp>CAR_GHOST_TA_RAMP_BASE && ramp<=CAR_GHOST_TA_RAMP_BASE+CAR_COURSES && route==0;
+}
+
+static int ghost_set_map(menu_state *m,int raw_ramp,int route,int player) {
+  if (!m || ((raw_ramp < 1 || raw_ramp > CAR_LINK_RAMPS || route < 0) &&
+      !(player && ghost_player_map(raw_ramp,route))) || m->screen == MENU_GHOST_PRE ||
+      m->ghost.status == MENU_GHOST_BUSY || m->ghost.active_request) return 0;
+  if (m->ghost.ramp != raw_ramp || m->ghost.route != route) {
+    ghost_invalidate(m);
+    m->ghost.local_available = m->ghost.king_available = 0;
+    m->ghost.claim_eligible = m->ghost.claim_pending = 0;
+    m->ghost.result = MENU_GHOST_RESULT_NONE;
+    m->ghost.note[0] = 0;
+  }
+  m->ghost.ramp = raw_ramp;
+  m->ghost.route = route;
+  return 1;
+}
+
+int menu_ghost_set_map(menu_state *m,int raw_ramp,int route) {
+  return ghost_set_map(m,raw_ramp,route,0);
+}
+
+/* No file IO here: the APP lends genuine immutable catalogue/binding views. */
+int menu_ghost_name_glyphs(short glyph[5], const uint16_t name[5]) {
+  if (!glyph || !name) return 0;
+  short mapped[5];
+  for (int i=0;i<5;++i) {
+    mapped[i]=-1;
+    if (!name[i]) { for (;i<5;++i) mapped[i]=-1; break; }
+    for (int k=0;k<NAMEDB_N;++k) if (NAMEDB_WCHAR[k]==name[i]) { mapped[i]=(short)k; break; }
+    if (mapped[i]<0) { memset(glyph,-1,5*sizeof *glyph); return 0; }
+  }
+  memcpy(glyph,mapped,sizeof mapped); return 1;
+}
+
+int menu_ghost_course_area(int visual_slot) {
+  static const signed char area[8]={0,1,2,3,4,5,7,6};
+  return visual_slot>=0 && visual_slot<8 ? area[visual_slot] : -1;
+}
+
+static int ghost_profile_area(const menu_ghost_directory_area *a) {
+  return a && a->native_available && a->level>=0 && a->level<=9 && a->pack>=0 && a->paint>=0;
+}
+static int ghost_bound_area(const menu_ghost_directory_area *a) {
+  return ghost_profile_area(a) && a->ramp>=1 && a->ramp<=22 && a->route>=0;
+}
+static int ghost_directory_area(const menu_ghost_directory_row *row,const menu_ghost_directory_area *a) {
+  if(!row)return 0;
+  if(row->source_kind==MENU_GHOST_SOURCE_RECORDED)return ghost_bound_area(a);
+  if(row->source_kind==MENU_GHOST_SOURCE_CLOUD)
+    return ghost_bound_area(a) || (ghost_profile_area(a) && ghost_player_map(a->ramp,a->route));
+  if(row->source_kind==MENU_GHOST_SOURCE_LOCAL_CROWN)
+    return row->record_index<MENU_GHOST_DIRECTORY_AREAS && a==&row->areas[row->record_index] && ghost_bound_area(a);
+  return row->source_kind==MENU_GHOST_SOURCE_DEFAULT && ghost_profile_area(a) && a->ramp==-1 && a->route==-1;
+}
+static int ghost_directory_action(int action) {
+  return action==MENU_GHOST_CHALLENGE_ARCADE || action==MENU_GHOST_CHALLENGE_DEFAULT ||
+         action==MENU_GHOST_CHALLENGE_LOCAL_CROWN || action==MENU_GHOST_CHALLENGE_CLOUD;
+}
+static uint32_t ghost_directory_action_source(int action) {
+  if (action==MENU_GHOST_CHALLENGE_CLOUD) return MENU_GHOST_SOURCE_CLOUD;
+  if (action==MENU_GHOST_CHALLENGE_LOCAL_CROWN) return MENU_GHOST_SOURCE_LOCAL_CROWN;
+  return action==MENU_GHOST_CHALLENGE_ARCADE ? MENU_GHOST_SOURCE_RECORDED : MENU_GHOST_SOURCE_DEFAULT;
+}
+static int ghost_request_map_bound(const menu_state *m) {
+  return m && ((m->ghost.request_ramp>=1 && m->ghost.request_ramp<=CAR_LINK_RAMPS && m->ghost.request_route>=0) ||
+         (m->ghost.request_source_kind==MENU_GHOST_SOURCE_CLOUD &&
+          ghost_player_map(m->ghost.request_ramp,m->ghost.request_route))) &&
+         m->ghost.request_ramp==m->ghost.ramp && m->ghost.request_route==m->ghost.route;
+}
+
+int menu_ghost_set_directory(menu_state *m, const menu_ghost_directory_view *view) {
+  if (!m) return 0;
+  menu_ghost_directory_view next={0}; next.player_level=-1;
+  if (view) {
+    if (!view->rows || !view->count || view->count>MENU_GHOST_DIRECTORY_MAX_RECORDS || !view->epoch ||
+        view->player_level< -1 || view->player_level>9) return 0;
+    for (unsigned i=0;i<view->count;++i) {
+      const menu_ghost_directory_row *r=&view->rows[i];short glyph[5];
+      unsigned capacity=r->source_kind==MENU_GHOST_SOURCE_DEFAULT ? MENU_GHOST_DEFAULT_RECORDS :
+                        r->source_kind==MENU_GHOST_SOURCE_LOCAL_CROWN ? MENU_GHOST_DIRECTORY_AREAS :
+                        r->source_kind==MENU_GHOST_SOURCE_CLOUD ? MENU_GHOST_CLOUD_RECORDS + MENU_GHOST_LOCAL_RECORDS : MENU_GHOST_DIRECTORY_RECORDS;
+      if (r->source_kind>MENU_GHOST_SOURCE_CLOUD || r->record_index>=capacity ||
+          !menu_ghost_name_glyphs(glyph,r->name)) return 0;
+      for (unsigned j=0;j<i;++j) if (view->rows[j].source_kind==r->source_kind && view->rows[j].record_index==r->record_index) return 0;
+      for (unsigned j=0;j<8;++j) if (r->areas[j].level< -1 || r->areas[j].level>9 ||
+          (r->source_kind==MENU_GHOST_SOURCE_DEFAULT && (r->areas[j].ramp!=-1 || r->areas[j].route!=-1)) ||
+          (r->areas[j].native_available && !ghost_directory_area(r,&r->areas[j]))) return 0;
+    }
+    next=*view;
+  }
+  int changed=!view || next.rows!=m->ghost.directory.rows || next.count!=m->ghost.directory.count ||
+              next.epoch!=m->ghost.directory.epoch;
+  if (changed) {
+    int was_options=menu_ghost_choosing_options(m);
+    if (was_options) m->zone=m->ghost.previous_zone;
+    ghost_invalidate(m); /* invalidate BEFORE releasing the old borrowed pointer */
+    m->ready=0;
+    m->ghost.status=MENU_GHOST_IDLE;
+    m->ghost.directory_row=-1;m->ghost.area_slot=-1;
+    if (m->screen==MENU_GHOST || m->screen==MENU_GHOST_PRE || was_options) {
+      if(m->screen!=MENU_GHOST)go(m,MENU_GHOST);
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+      if (was_options) {
+        m->pre_tune_setting=0;
+        pre_race_tune_clear(&m->pre_tune);
+      }
+#endif
+      if(was_options || (m->ghost.ui.page!=GHOST_UI_SEARCH && m->ghost.ui.page!=GHOST_UI_NAME &&
+                          m->ghost.ui.page!=GHOST_UI_LEVEL && m->ghost.ui.page!=GHOST_UI_COURSE))
+        ghost_original_open(&m->ghost.ui,GHOST_UI_SEARCH);
+    }
+  }
+  m->ghost.directory=next;
+  return 1;
+}
+
+static int ghost_name_matches(const menu_state *m, const menu_ghost_directory_row *row) {
+  int n=0;uint16_t query[5];
+  while(n<5 && m->ghost.query[n]>=0) {
+    int g=m->ghost.query[n];if(g>=NAMEDB_N)return 0;
+    query[n]=NAMEDB_WCHAR[g];++n;
+  }
+  if(!n)return 0;
+  for(int start=0;start+n<=5;++start) {
+    int i=0;while(i<n && row->name[start+i]==query[i])++i;
+    if(i==n)return 1;
+  }
+  return 0;
+}
+
+/* The original manager supplies one seed per area (getDefaultCrown,
+ * 0x86959b0). A complete locally recorded win can supersede that seed. */
+static int ghost_champion(const menu_state *m,int area) {
+  int holder=-1,local=-1,seed_count=0;
+  for (unsigned i=0;i<m->ghost.directory.count;++i) {
+    const menu_ghost_directory_row *row=&m->ghost.directory.rows[i];
+    const menu_ghost_directory_area *a=&row->areas[area];
+    if (!ghost_directory_area(row,a)) continue;
+    if (row->source_kind==MENU_GHOST_SOURCE_LOCAL_CROWN) local=(int)i;
+    else if (row->source_kind==MENU_GHOST_SOURCE_DEFAULT && a->default_crown) {
+      ++seed_count;
+      holder=(int)i;
+    }
+  }
+  return local>=0 ? local : seed_count==1 ? holder : -1;
+}
+
+static int ghost_row_matches(const menu_state *m, unsigned index, int area, int level) {
+  if(index>=m->ghost.directory.count || !m->ghost.directory.rows)return 0;
+  const menu_ghost_directory_row *row=&m->ghost.directory.rows[index];
+  if(row->source_kind==MENU_GHOST_SOURCE_LOCAL_CROWN ||
+     (m->ghost.search_kind==3 && !ghost_name_matches(m,row)))return 0;
+  for(int k=0;k<8;++k) {
+    if(area>=0 && area!=k)continue;
+    const menu_ghost_directory_area *a=&row->areas[k];
+    if(!ghost_directory_area(row,a) || (level>=0 && a->level!=level))continue;
+    if(m->ghost.search_kind==1 && (!m->ghost.directory.player_history_available || !a->history_available))continue;
+    if(m->ghost.search_kind==2 && (!m->ghost.directory.player_revenge_available || !a->revenge_available))continue;
+    return 1;
+  }
+  return 0;
+}
+
+static int ghost_directory_count(const menu_state *m,int area,int level) {
+  if (level==9) {
+    if (area>=0) return ghost_champion(m,area)>=0;
+    int count=0;
+    for (int k=0;k<MENU_GHOST_DIRECTORY_AREAS;++k) count+=ghost_champion(m,k)>=0;
+    return count;
+  }
+  int count=0;for(unsigned i=0;i<m->ghost.directory.count;++i)count+=ghost_row_matches(m,i,area,level);
+  return count;
+}
+static int ghost_directory_index(const menu_state *m,int selected) {
+  int level=m->ghost.search_kind==0?m->ghost.level:-1;
+  if (level==9) return selected==0 && m->ghost.area_slot>=0 ? ghost_champion(m,m->ghost.area_slot) : -1;
+  for(int players=1;players>=0;--players)
+    for(unsigned i=0;i<m->ghost.directory.count;++i)
+      if((m->ghost.directory.rows[i].source_kind==MENU_GHOST_SOURCE_CLOUD)==players &&
+         ghost_row_matches(m,i,m->ghost.area_slot,level) && selected--==0) return (int)i;
+  return -1;
+}
+static int ghost_arcade_snapshot_current(const menu_state *m) {
+  if(!m || !m->ghost.directory.rows || !m->ghost.request_catalog_epoch ||
+     m->ghost.request_catalog_epoch!=m->ghost.directory.epoch ||
+     m->ghost.request_area_slot<0 || m->ghost.request_area_slot>=8)return 0;
+  for(unsigned i=0;i<m->ghost.directory.count;++i) {
+    const menu_ghost_directory_row *r=&m->ghost.directory.rows[i];
+    if(r->source_kind!=m->ghost.request_source_kind || r->record_index!=m->ghost.request_record_index)continue;
+    const menu_ghost_directory_area *a=&r->areas[m->ghost.request_area_slot];
+    if(r->id_devel!=m->ghost.request_id_devel || r->id1!=m->ghost.request_id1 ||
+       r->id2!=m->ghost.request_id2 || !ghost_directory_area(r,a))return 0;
+    if(r->source_kind!=MENU_GHOST_SOURCE_DEFAULT)
+      return a->ramp==m->ghost.request_ramp && a->route==m->ghost.request_route;
+    return (m->ghost.request_ramp==-1 && m->ghost.request_route==-1) || ghost_request_map_bound(m);
+  }
+  return 0;
+}
+
+static int ghost_directory_action_current(const menu_state *m,int action) {
+  uint32_t kind=ghost_directory_action_source(action);
+  return ghost_directory_action(action) && m->ghost.request_source_kind==kind && ghost_arcade_snapshot_current(m);
+}
+static int ghost_action_enabled(const menu_state *m, int action) {
+  if (!m || m->screen != MENU_GHOST || m->game != MENU_GAME_GHOST ||
+      (action!=MENU_GHOST_CHALLENGE_DEFAULT &&
+       (m->ghost.ramp<1 || m->ghost.ramp>CAR_LINK_RAMPS || m->ghost.route<0) &&
+       !(action==MENU_GHOST_CHALLENGE_CLOUD && ghost_player_map(m->ghost.ramp,m->ghost.route)))) return 0;
+  switch (action) {
+  case MENU_GHOST_CHALLENGE_DEFAULT:
+  case MENU_GHOST_CHALLENGE_ARCADE:
+  case MENU_GHOST_CHALLENGE_LOCAL_CROWN:
+  case MENU_GHOST_CHALLENGE_CLOUD: {
+    int i=m->ghost.directory_row,k=m->ghost.area_slot;
+    if(!m->ghost.directory.rows || !m->ghost.directory.epoch || i<0 ||
+       (unsigned)i>=m->ghost.directory.count || k<0 || k>=8)return 0;
+    const menu_ghost_directory_row *r=&m->ghost.directory.rows[i];
+    const menu_ghost_directory_area *a=&r->areas[k];
+    if(!ghost_directory_area(r,a))return 0;
+    if(action==MENU_GHOST_CHALLENGE_DEFAULT)return r->source_kind==MENU_GHOST_SOURCE_DEFAULT;
+    return r->source_kind==ghost_directory_action_source(action) && a->ramp==m->ghost.ramp && a->route==m->ghost.route;
+  }
+  case MENU_GHOST_RECORD_LOCAL: return 1;
+  case MENU_GHOST_CHALLENGE_LOCAL: return m->ghost.local_available;
+  case MENU_GHOST_FETCH_KING: return m->ghost.cloud_configured;
+  case MENU_GHOST_CHALLENGE_KING: return m->ghost.cloud_configured && m->ghost.king_available;
+  case MENU_GHOST_SUBMIT_CLAIM: return m->ghost.cloud_configured && m->ghost.claim_eligible;
+  default: return 0;
+  }
+}
+
+int menu_ghost_action_available(const menu_state *m, int action) {
+  return m && m->ghost.status != MENU_GHOST_BUSY && !m->ghost.active_request &&
+         m->ghost.request_serial != UINT_MAX && ghost_action_enabled(m, action);
+}
+
+int menu_ghost_request(menu_state *m, int action) {
+  if (!menu_ghost_action_available(m, action)) return 0;
+  m->ghost.active_request = ++m->ghost.request_serial;
+  m->ghost.completed_request = m->ghost.prepared_request = 0;
+  m->ghost.completed_action = MENU_GHOST_ACTION_NONE;
+  m->ghost.pre_go = 0;
+  m->ghost.pending_action = action;
+  m->ghost.request_ramp = m->ghost.ramp;
+  m->ghost.request_route = m->ghost.route;
+  m->ghost.request_catalog_epoch=0;m->ghost.request_record_index=UINT32_MAX;m->ghost.request_area_slot=-1;
+  m->ghost.request_source_kind=UINT32_MAX;
+  if(ghost_directory_action(action)) {
+    const menu_ghost_directory_row *r=&m->ghost.directory.rows[m->ghost.directory_row];
+    m->ghost.request_source_kind=r->source_kind;
+    if(action==MENU_GHOST_CHALLENGE_DEFAULT)m->ghost.request_ramp=m->ghost.request_route=-1;
+    m->ghost.request_record_index=r->record_index;m->ghost.request_area_slot=m->ghost.area_slot;
+    m->ghost.request_catalog_epoch=m->ghost.directory.epoch;
+    m->ghost.request_id_devel=r->id_devel;m->ghost.request_id1=r->id1;m->ghost.request_id2=r->id2;
+  }
+  m->ghost.inflight_action = MENU_GHOST_ACTION_NONE;
+  m->ghost.status = MENU_GHOST_BUSY;
+  if (action == MENU_GHOST_RECORD_LOCAL || action == MENU_GHOST_CHALLENGE_LOCAL || action == MENU_GHOST_CHALLENGE_KING || ghost_directory_action(action)) {
+    m->ghost.result = MENU_GHOST_RESULT_NONE;
+    m->ghost.claim_eligible = m->ghost.claim_pending = 0;
+  }
+  if (action == MENU_GHOST_SUBMIT_CLAIM) m->ghost.claim_pending = 1;
+  snprintf(m->ghost.note, sizeof m->ghost.note, "%s", action == MENU_GHOST_SUBMIT_CLAIM ?
+           "PENDING SERVER VALIDATION" : "REQUEST PENDING");
+  return 1;
+}
+
+int menu_ghost_take_action(menu_state *m, unsigned *request_id) {
+  if (request_id) *request_id = 0;
+  if (!request_id || !m || !m->ghost.active_request ||
+      m->ghost.status != MENU_GHOST_BUSY || !m->ghost.pending_action) return MENU_GHOST_ACTION_NONE;
+  if (!ghost_action_enabled(m, m->ghost.pending_action) ||
+      (ghost_directory_action(m->ghost.pending_action) && !ghost_directory_action_current(m,m->ghost.pending_action))) {
+    ghost_invalidate(m);
+    m->ghost.status = MENU_GHOST_ERROR;
+    snprintf(m->ghost.note, sizeof m->ghost.note, "SELECTION NO LONGER AVAILABLE");
+    return MENU_GHOST_ACTION_NONE;
+  }
+  int action = m->ghost.pending_action;
+  m->ghost.pending_action = MENU_GHOST_ACTION_NONE;
+  m->ghost.inflight_action = action;
+  *request_id = m->ghost.active_request;
+  return action;
+}
+
+int menu_ghost_bind_default_request(menu_state *m,uint64_t request_id,int nativeERamp,int rawRoute) {
+  if(!m || m->screen!=MENU_GHOST || m->game!=MENU_GAME_GHOST || !request_id ||
+     request_id!=m->ghost.active_request || m->ghost.status!=MENU_GHOST_BUSY || m->ghost.pending_action ||
+     m->ghost.inflight_action!=MENU_GHOST_CHALLENGE_DEFAULT ||
+     !ghost_directory_action_current(m,MENU_GHOST_CHALLENGE_DEFAULT) || nativeERamp<1 || nativeERamp>22 || rawRoute<0)return 0;
+  if(m->ghost.request_ramp!=-1 || m->ghost.request_route!=-1)
+    return ghost_request_map_bound(m) && m->ghost.request_ramp==nativeERamp && m->ghost.request_route==rawRoute;
+  m->ghost.request_ramp=m->ghost.ramp=nativeERamp;
+  m->ghost.request_route=m->ghost.route=rawRoute;
+  return 1;
+}
+
+int menu_ghost_complete(menu_state *m, unsigned request_id, int ok, const char *note) {
+  if (!m || m->screen != MENU_GHOST || m->game != MENU_GAME_GHOST || !request_id ||
+      request_id != m->ghost.active_request || !m->ghost.inflight_action) return 0;
+  int action = m->ghost.inflight_action;
+  if(ghost_directory_action(action) && !ghost_directory_action_current(m,action)) {
+    ghost_invalidate(m);m->ghost.status=MENU_GHOST_ERROR;return 0;
+  }
+  if(action==MENU_GHOST_CHALLENGE_DEFAULT && (m->ghost.status!=MENU_GHOST_BUSY || (ok && !ghost_request_map_bound(m))))return 0;
+  m->ghost.active_request = 0;
+  m->ghost.pending_action = m->ghost.inflight_action = MENU_GHOST_ACTION_NONE;
+  m->ghost.status = ok ? MENU_GHOST_READY : MENU_GHOST_ERROR;
+  if (!ok) m->ghost.choose_race_options=0;
+  m->ghost.completed_request = ok ? request_id : 0;
+  m->ghost.completed_action = ok ? action : MENU_GHOST_ACTION_NONE;
+  if (action == MENU_GHOST_SUBMIT_CLAIM) {
+    m->ghost.claim_pending = !!ok;
+    if (ok) m->ghost.claim_eligible = 0;
+  }
+  snprintf(m->ghost.note, sizeof m->ghost.note, "%s", note ? note :
+           !ok ? "REQUEST FAILED" : action == MENU_GHOST_SUBMIT_CLAIM ?
+           "PENDING SERVER VALIDATION" : "REQUEST COMPLETE");
+  return 1;
+}
+
+int menu_ghost_begin_pre(menu_state *m) {
+  if (!m || m->screen != MENU_GHOST || m->game != MENU_GAME_GHOST ||
+      m->ghost.status != MENU_GHOST_READY || !m->ghost.completed_request ||
+      m->ghost.completed_request != m->ghost.request_serial ||
+      (!ghost_directory_action(m->ghost.completed_action) &&
+       m->ghost.completed_action != MENU_GHOST_RECORD_LOCAL &&
+       m->ghost.completed_action != MENU_GHOST_CHALLENGE_LOCAL &&
+       m->ghost.completed_action != MENU_GHOST_CHALLENGE_KING) ||
+       (ghost_directory_action(m->ghost.completed_action) && !ghost_directory_action_current(m,m->ghost.completed_action)) ||
+      !ghost_request_map_bound(m)) return 0;
+  m->ghost.prepared_request = m->ghost.completed_request;
+  m->ghost.completed_request = 0;
+  m->ghost.pre_go = 0;
+  m->ghost.status = MENU_GHOST_BUSY;
+  m->ghost.touch = NULL; m->ghost.touch_action = m->ghost.held = 0;
+  if (m->ghost.choose_race_options) {
+    go(m, MENU_BGM);
+    m->sel=card_bgm_saved_line(m);
+    m->slide=m->card_t=0;
+    m->bars=1;
+  } else go(m, MENU_GHOST_PRE);
+  m->ready = 0;
+  m->tap = m->key = m->key_held = m->back = 0;
+  m->back_touch = m->key_touch = NULL;
+  snprintf(m->ghost.note, sizeof m->ghost.note, "LOADING GHOST RACE");
+  return 1;
+}
+
+static int ghost_prepared(const menu_state *m) {
+  return m && m->game == MENU_GAME_GHOST &&
+         m->ghost.status == MENU_GHOST_BUSY && m->ghost.prepared_request &&
+         m->ghost.prepared_request == m->ghost.request_serial &&
+         ghost_request_map_bound(m) &&
+          (!ghost_directory_action(m->ghost.completed_action) || ghost_directory_action_current(m,m->ghost.completed_action));
+}
+
+int menu_ghost_preparing(const menu_state *m) {
+  return m && m->screen==MENU_GHOST_PRE && ghost_prepared(m);
+}
+
+int menu_ghost_choosing_options(const menu_state *m) {
+  if (!m || !m->ghost.choose_race_options || !ghost_prepared(m)) return 0;
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  if (m->screen==MENU_SETTING && m->pre_tune_setting) return 1;
+#endif
+  return m->screen==MENU_BGM;
+}
+
+void menu_ghost_race_finished(menu_state *m, int result, int claim_eligible) {
+  if (!m) return;
+  int directory_action=ghost_directory_action(m->ghost.completed_action) ||
+                       ghost_directory_action(m->ghost.pending_action) || ghost_directory_action(m->ghost.inflight_action);
+  int arcade=directory_action && ghost_directory_action_current(m,m->ghost.completed_action) &&
+             ghost_request_map_bound(m) && m->ghost.prepared_request &&
+             m->ghost.prepared_request==m->ghost.request_serial && m->ghost.pre_go;
+  if(directory_action && !arcade){result=MENU_GHOST_RESULT_INVALID;claim_eligible=0;}
+  menu_ghost_open(m);
+  if (result < MENU_GHOST_RESULT_FINISHED || result > MENU_GHOST_RESULT_INVALID) result = MENU_GHOST_RESULT_INVALID;
+  m->ghost.result = result;
+  m->ghost.claim_eligible = result == MENU_GHOST_RESULT_WIN && !!claim_eligible;
+  m->ghost.claim_pending = m->ghost.claim_eligible;
+  m->ghost.status = result == MENU_GHOST_RESULT_INVALID ? MENU_GHOST_ERROR : MENU_GHOST_READY;
+  const char *note = result == MENU_GHOST_RESULT_WIN ?
+      (m->ghost.claim_eligible ? "LOCAL WIN - PENDING SERVER VALIDATION" : "LOCAL WIN - PRACTICE ONLY") :
+      result == MENU_GHOST_RESULT_LOSE ? "LOCAL LOSS - NO CLAIM" :
+      result == MENU_GHOST_RESULT_FINISHED ? "LOCAL RUN FINISHED" : "INVALID RUN - NO CLAIM";
+  snprintf(m->ghost.note, sizeof m->ghost.note, "%s", note);
+}
+
+/* Original page tree. Every row is borrowed from the APP, never synthesized. */
+static int ghost_name_touch_code(const menu_state *m,float x,float y);
+static void ghost_name_input(menu_state *m,int code);
+static int ghost_query_length(const menu_state *m) {
+  int n=0;while(n<5 && m->ghost.query[n]>=0)++n;return n;
+}
+static int ghost_root_available(const menu_state *m,int slot) {
+  if(!m->ghost.directory.rows || !m->ghost.directory.epoch)return 0;
+  if(slot==3)return m->ghost.directory.count>0;
+  if(slot==1 && !m->ghost.directory.player_history_available)return 0;
+  if(slot==2 && !m->ghost.directory.player_revenge_available)return 0;
+  for(unsigned i=0;i<m->ghost.directory.count;++i)for(int k=0;k<8;++k) {
+    const menu_ghost_directory_area *a=&m->ghost.directory.rows[i].areas[k];
+    if(ghost_directory_area(&m->ghost.directory.rows[i],a) && (slot==0 || (slot==1&&a->history_available) || (slot==2&&a->revenge_available)))return 1;
+  }
+  return 0;
+}
+static void ghost_page(menu_state *m,int page) {
+  ghost_original_open(&m->ghost.ui,page);
+  m->ghost.touch=NULL;m->ghost.touch_action=m->ghost.held=0;
+  m->ghost.note[0]=0;m->ghost.status=MENU_GHOST_IDLE;
+}
+static void ghost_courses(menu_state *m) {
+  ghost_page(m,GHOST_UI_COURSE);
+  for(int v=0;v<8;++v)if(menu_ghost_course_area(v)==m->ghost.area_slot) {
+    ghost_original_focus_course(&m->ghost.ui,v);
+    break;
+  }
+}
+static void ghost_rivals(menu_state *m,int area) {
+  int previous=m->ghost.directory_row;
+  m->ghost.area_slot=area;
+  ghost_page(m,GHOST_UI_RIVAL);
+  m->ghost.ui.count=ghost_directory_count(m,area,m->ghost.search_kind==0?m->ghost.level:-1);
+  for(int selected=0;selected<m->ghost.ui.count;++selected)
+    if(ghost_directory_index(m,selected)==previous){m->ghost.ui.sel=selected;break;}
+  m->ghost.directory_row=ghost_directory_index(m,m->ghost.ui.sel);
+}
+static void ghost_cancel_options(menu_state *m) {
+  m->zone=m->ghost.previous_zone;
+  ghost_invalidate(m);
+  go(m,MENU_GHOST);
+  ghost_rivals(m,m->ghost.area_slot);
+}
+static int ghost_course_available(const menu_state *m,int visual) {
+  int area=menu_ghost_course_area(visual);
+  if(area<0)return 0;
+  return ghost_directory_count(m,area,m->ghost.search_kind==0?m->ghost.level:-1)>0;
+}
+static int ghost_choose_available(const menu_state *m) {
+  const ghost_original_ui *u=&m->ghost.ui;
+  if(u->page==GHOST_UI_SEARCH)return ghost_root_available(m,u->sel);
+  if(u->page==GHOST_UI_NAME_TYPE)return u->sel==0 || m->ghost.previous_query_valid;
+  if(u->page==GHOST_UI_LEVEL)return ghost_directory_count(m,-1,u->sel)>0;
+  if(u->page==GHOST_UI_COURSE)return ghost_course_available(m,u->sel);
+  if(u->page==GHOST_UI_RIVAL)return ghost_directory_index(m,u->sel)>=0;
+  return 0;
+}
+static int ghost_arcade_request(menu_state *m) {
+  int i=m->ghost.directory_row,k=m->ghost.area_slot;
+  if(!m->ghost.directory.rows || i<0 || (unsigned)i>=m->ghost.directory.count || k<0 || k>=8)return 0;
+  const menu_ghost_directory_row *r=&m->ghost.directory.rows[i];
+  const menu_ghost_directory_area *a=&r->areas[k];
+  if(!ghost_directory_area(r,a))return 0;
+  int action=MENU_GHOST_CHALLENGE_DEFAULT;
+  if (r->source_kind!=MENU_GHOST_SOURCE_DEFAULT) {
+    if (!ghost_set_map(m,a->ramp,a->route,r->source_kind==MENU_GHOST_SOURCE_CLOUD)) return 0;
+    action=r->source_kind==MENU_GHOST_SOURCE_LOCAL_CROWN ?
+      MENU_GHOST_CHALLENGE_LOCAL_CROWN : r->source_kind==MENU_GHOST_SOURCE_CLOUD ?
+      MENU_GHOST_CHALLENGE_CLOUD : MENU_GHOST_CHALLENGE_ARCADE;
+  }
+  if (!menu_ghost_request(m,action)) return 0;
+  m->ghost.previous_zone=m->zone;
+  m->ghost.previous_zones=m->zones;
+  m->ghost.choose_race_options=1;
+  return 1;
+}
+static void ghost_choose(menu_state *m) {
+  if(ghost_original_decide(&m->ghost.ui,ghost_choose_available(m)))snd_menu(SND_SELECT);
+  else snd_menu(SND_CANCEL);
+}
+static void ghost_navigate(menu_state *m,int d) {
+  if(ghost_original_move(&m->ghost.ui,d))snd_menu(SND_CURSOR);
+  if(m->ghost.ui.page==GHOST_UI_RIVAL)m->ghost.directory_row=ghost_directory_index(m,m->ghost.ui.sel);
+}
+static int ghost_back_page(menu_state *m) {
+  int page=m->ghost.ui.page;
+  ghost_invalidate(m);m->ghost.status=MENU_GHOST_IDLE;
+  if(page==GHOST_UI_SEARCH)return 0;
+  if(page==GHOST_UI_NAME && m->ghost.query_waiting) {
+    m->ghost.query_waiting=0;m->ghost.note[0]=0;snd_menu(SND_CANCEL);return 1;
+  }
+  if(page==GHOST_UI_NAME && ghost_query_length(m)) {
+    m->ghost.query[ghost_query_length(m)-1]=-1;m->ghost.query_char_pop=0;
+  } else if(page==GHOST_UI_NAME)ghost_page(m,GHOST_UI_NAME_TYPE);
+  else if(page==GHOST_UI_RIVAL) ghost_courses(m);
+  else if(page==GHOST_UI_COURSE) {
+    if(m->ghost.search_kind==0) { ghost_page(m,GHOST_UI_LEVEL);m->ghost.ui.sel=m->ghost.level; }
+    else ghost_page(m,m->ghost.search_kind==3?GHOST_UI_NAME:GHOST_UI_SEARCH);
+  } else ghost_page(m,GHOST_UI_SEARCH);
+  if(m->ghost.ui.page==GHOST_UI_SEARCH && m->ghost.search_kind>=0 && m->ghost.search_kind<4)
+    m->ghost.ui.sel=m->ghost.search_kind;
+  snd_menu(SND_CANCEL);return 1;
+}
+
+static int ghost_hit(const menu_state *m,float x,float y) {
+  int key=hud_menu_key(x*(1024.0f/640.0f),y*(768.0f/480.0f));
+  if(key==-1)return 1000;
+  if(key==1)return 1001;
+  if(m->ghost.ui.page==GHOST_UI_NAME)return ghost_name_touch_code(m,x,y);
+  ghost_original_assets a=ghost_original_bind();
+  if(m->ghost.ui.page==GHOST_UI_SEARCH && !ghost_original_available(a))return 0;
+  const ghost_original_ui *u=&m->ghost.ui;
+  int slot=ghost_original_hit(a,u,x,y);
+  if(slot>=0)return 10+slot;
+  if(u->page==GHOST_UI_RIVAL) {
+    int frame=ghost_rival_arrow_frame(u);
+    int sprite=anm_sprite(446);
+    if(frame>=0&&a.rival_arrows>=0) {
+      for(int i=0;i<4;++i) {
+        float r[4],alpha;
+        if(!anm_sprite_rect_at(a.rival_arrows,frame,sprite,i,r,&alpha))break;
+        if(alpha>0&&x>=r[0]&&x<r[2]&&y>=r[1]&&y<r[3])
+          return x<320?1000:1001;
+      }
+    }
+  }
+  return 0;
+}
+static void ghost_input(menu_state *m,int chosen) {
+  if(!chosen || m->ghost.status==MENU_GHOST_BUSY || m->ghost.active_request || m->ghost.query_waiting)return;
+  ghost_original_ui *u=&m->ghost.ui;
+  if(u->page==GHOST_UI_RESULT) { menu_ghost_open(m);snd_menu(SND_SELECT);return; }
+  if(u->page==GHOST_UI_NAME) {
+    if(chosen==1000||chosen==1001) {
+      m->ghost.query_page=(m->ghost.query_page+(chosen==1000?4:1))%5;snd_menu(SND_CURSOR);
+    } else ghost_name_input(m,chosen);
+  } else if(chosen==1000||chosen==1001)ghost_navigate(m,chosen==1000?-1:1);
+  else {
+    int slot=chosen-10;
+    if(slot<0||slot>=u->count)return;
+    if(slot==u->sel)ghost_choose(m);
+    else if(u->page==GHOST_UI_COURSE && abs(slot-u->sel)>1) {
+      /* Touch may name a visible card several steering steps away. */
+      if(ghost_original_focus_course(u,slot))snd_menu(SND_CURSOR);
+    } else ghost_navigate(m,slot<u->sel?-1:1);
+  }
+}
+static void ghost_touch(menu_state *m,void *id,int phase,float x,float y) {
+  int action=ghost_hit(m,x,y);
+  if(phase==TOUCH_BEGAN) {
+    if(id && !m->ghost.touch && action) {
+      m->ghost.touch=id;m->ghost.touch_action=m->ghost.held=action;
+    }
+  } else if(id && id==m->ghost.touch) {
+    if(phase==TOUCH_MOVED)m->ghost.held=action==m->ghost.touch_action?action:0;
+    else if(phase==TOUCH_ENDED || phase==TOUCH_CANCELLED) {
+      int chosen=phase==TOUCH_ENDED&&action==m->ghost.touch_action?action:0;
+      m->ghost.touch=NULL;m->ghost.touch_action=m->ghost.held=0;
+      ghost_input(m,chosen);
+    }
+  }
+}
+static void ghost_step(menu_state *m) {
+  if(m->ghost.query_pop)--m->ghost.query_pop;
+  if(m->ghost.query_char_pop)--m->ghost.query_char_pop;
+  if(!ghost_original_tick(&m->ghost.ui))return;
+  ghost_original_ui *u=&m->ghost.ui;
+  if(!ghost_choose_available(m)) {u->commit=0;return;} /* recheck after animation */
+  int sel=u->sel;
+  switch(u->page) {
+  case GHOST_UI_SEARCH:
+    m->ghost.search_kind=sel;m->ghost.directory_row=m->ghost.area_slot=-1;
+    if(sel==0) {
+      ghost_page(m,GHOST_UI_LEVEL);
+      int level=m->ghost.directory.player_level;
+      if(level<0 || level>9 || !ghost_directory_count(m,-1,level)) {
+        level=0;while(level<9&&!ghost_directory_count(m,-1,level))++level;
+      }
+      m->ghost.ui.sel=level;
+    } else if(sel==3)ghost_page(m,GHOST_UI_NAME_TYPE);
+    else ghost_courses(m);
+    break;
+  case GHOST_UI_NAME_TYPE:
+    if(sel==0) {
+      memset(m->ghost.query,-1,sizeof m->ghost.query);m->ghost.query_page=0;
+      m->ghost.query_key=-1;ghost_page(m,GHOST_UI_NAME);
+    } else {
+      memcpy(m->ghost.query,m->ghost.previous_query,sizeof m->ghost.query);
+      if(m->ghost.cloud_configured) {
+        ghost_page(m,GHOST_UI_NAME);m->ghost.query_waiting=1;
+        snprintf(m->ghost.note,sizeof m->ghost.note,"SEARCHING PLAYER REPLAYS");
+      } else ghost_courses(m);
+    }
+    break;
+  case GHOST_UI_LEVEL:
+    m->ghost.level=sel;ghost_courses(m);break;
+  case GHOST_UI_COURSE:
+    m->ghost.area_slot=menu_ghost_course_area(sel);
+    ghost_rivals(m,m->ghost.area_slot);
+    break;
+  case GHOST_UI_RIVAL:
+    m->ghost.directory_row=ghost_directory_index(m,sel);
+    ghost_arcade_request(m);
+    break;
+  default:break;
   }
 }
 
@@ -667,11 +1435,58 @@ static mat4 tg_rotation(const float *pos, float x, float y, float z) {
 
 static int match_scene3d(const menu_state *m, menu_scene *s);
 
-int menu_scene3d(const menu_state *m, menu_scene *s) {
+#include "ghost_preview_pose.inc"
+
+const menu_ghost_directory_area *menu_ghost_preview_profile(const menu_state *m,int ghost_row) {
+  if (m->screen!=MENU_GHOST || m->ghost.ui.page!=GHOST_UI_RIVAL ||
+      ghost_row<=0 || (unsigned)ghost_row>m->ghost.directory.count ||
+      !m->ghost.directory.rows || m->ghost.area_slot<0 || m->ghost.area_slot>=MENU_GHOST_DIRECTORY_AREAS) return NULL;
+  const menu_ghost_directory_row *row=&m->ghost.directory.rows[ghost_row-1];
+  const menu_ghost_directory_area *area=&row->areas[m->ghost.area_slot];
+  return ghost_directory_area(row,area) ? area : NULL;
+}
+
+static int ghost_preview_scene(const menu_state *m,menu_scene *s) {
+  const ghost_original_ui *u=&m->ghost.ui;
+  int center=u->from>=0 ? u->from : u->sel;
+  s->env=1; /* clSeqTgRivalSelectThread, 0x885c4fe */
+  s->fov_x=2.0f*0.637045026f;
+  s->eye[2]=1000.0f; /* clSpriteAnimeCarModel::init, 0x8526234 */
+  for (int item=center-3;item<=center+3;++item) {
+    if (item<0 || item>=u->count) continue;
+    int frame=ghost_original_card_frame(u,item);
+    if (frame<0 || frame>=(int)sizeof GHOST_PREVIEW_FRAME || !GHOST_PREVIEW_FRAME[frame]) continue;
+    int row=ghost_directory_index(m,item)+1;
+    const menu_ghost_directory_area *a=menu_ghost_preview_profile(m,row);
+    if (!a) continue;
+    const float *pose=GHOST_PREVIEW_POSES[GHOST_PREVIEW_FRAME[frame]-1];
+    menu_car *c=&s->cars[s->n++];
+    c->ghost_row=row;
+    c->pack=a->pack;c->paint=a->base_paint;c->aero=a->aero;
+    c->mirror=a->mirror;c->wing=a->wing;c->bonnet=a->bonnet;
+    c->wheel=a->wheel;c->neon=a->neon;c->vinyl=a->vinyl;
+    c->cp=1;c->cp_x=pose[0];c->cp_y=pose[1];
+    /* 0x863c58a distinguishes confirmation from ordinary selection. On
+     * confirmation the authored 3D animation supplies X/Y scale at depth 0.
+     * Otherwise the X scale supplies depth, and both sprite scales are reset
+     * to 1 before clSpriteAnimeCarModel::update (0x863c5cb..0x863c5e9). */
+    const float scale[]={u->deciding?pose[2]:1.0f,u->deciding?pose[3]:1.0f,1.0f};
+    const float pos[]={-12.0f*scale[0],-6.0f*scale[1],u->deciding?0.0f:(pose[2]-1.0f)*500.0f};
+    mat4 model=tg_rotation(pos,0.29670596f/DEG,-0.50614548f/DEG,-0.13962634f/DEG);
+    for (int j=0;j<3;++j)
+      for (int k=0;k<3;++k) model.m[j+4*k]*=6.8999996f*scale[j];
+    memcpy(c->model,model.m,sizeof c->model);
+  }
+  return s->n!=0;
+}
+
+static int menu_scene3d_base(const menu_state *m, menu_scene *s) {
   /* all of it: a car's aero and cp left unset made the car select's cars aero cars not in
    * (push86, nothing drawn) */
   memset(s, 0, sizeof *s);
   s->env = 4;
+  if (m->screen==MENU_GHOST && m->ghost.ui.page==GHOST_UI_RIVAL)
+    return ghost_preview_scene(m,s);
   /* the cars flying in (and while the race loads before them: their packs in) */
   if (m->screen == MENU_VS_MATCH || (m->screen == MENU_VS && m->vs.state == MENU_VS_LOADING && m->vs.match_n))
     return match_scene3d(m, s);
@@ -735,7 +1550,9 @@ int menu_scene3d(const menu_state *m, menu_scene *s) {
     s->n = 1;
     return 1;
   }
-  if (m->screen == MENU_COLOR || m->screen == MENU_SETTING) {
+  if (m->screen == MENU_COLOR || m->screen == MENU_SETTING || m->screen == MENU_BODY_COLOR) {
+    menu_body_color_view repaint;
+    if (m->screen == MENU_BODY_COLOR && !menu_body_color_get(m, &repaint)) return 0;
     /* clMenu3dEnvironment's default projection (73 degrees), the turntable of car_common
      * (the setting screen's too, with the colour chosen) */
     s->fov_x = 73.0f * DEG;
@@ -747,7 +1564,7 @@ int menu_scene3d(const menu_state *m, menu_scene *s) {
     s->cars[0].pack = c->pack;
     s->cars[0].paint = c->paint;
     /* the setting's car in its parts, as the garage showed it (push116) */
-    if (m->screen == MENU_SETTING) {
+    if (m->screen == MENU_SETTING || m->screen == MENU_BODY_COLOR) {
       s->cars[0].aero = m->aero[m->maker][m->car];
       tg_wear(m, &s->cars[0]);
     }
@@ -962,6 +1779,32 @@ int menu_scene3d(const menu_state *m, menu_scene *s) {
   return 0;
 }
 
+int menu_scene3d(const menu_state *m, menu_scene *s) {
+  int ok = menu_scene3d_base(m, s);
+  if (!ok || m->new_card) return ok;
+  /* Every allowed branch above explicitly constructs THIS selected player's
+   * card; aero/part previews may construct several views of that same card.
+   * Never stamp purchase maker/car/colour previews, VS opponents or match cars. */
+  switch (m->screen) {
+  case MENU_VS_STAR: case MENU_GARAGE: case MENU_SETTING: case MENU_BODY_COLOR:
+  case MENU_ST_EFF: case MENU_TG_GET: case MENU_TG_AERO: case MENU_TG_PART:
+  case MENU_TG_SELECT: case MENU_TG_WHEEL: case MENU_TG_VINYL: case MENU_TG_WEAR: {
+    menu_body_color_view v; menu_story_body_stamp earned;
+    if (!menu_body_color_get(m, &v) || !menu_story_body_get(m,&earned)) { s->n = 0; return 0; }
+    for (int i = 0; i < s->n; ++i) {
+      menu_car *c = &s->cars[i];
+      if (c->pack != v.pack || c->paint != v.paint) { s->n = 0; return 0; }
+      c->body_color_valid = 1; c->body_color = v;
+      c->story_body_valid=1;c->story_body=earned;
+      c->body_color.aero = c->aero; c->body_color.vinyl = c->vinyl; c->body_color.bonnet = c->bonnet;
+    }
+    break;
+  }
+  default: break;
+  }
+  return ok;
+}
+
 static void draw_car_select(const menu_state *m, int clock, void (*draw3d)(void *), void *ctx) {
   if (m->screen == MENU_MAKER) {
     draw_back(ID.bg, clock % 600, 1);
@@ -1107,7 +1950,8 @@ static const char MUSIC_RESULT[] = "sys_04";
 const char *menu_bgm(const menu_state *m, int racing) {
   /* result2 stops the race's song as the race ends; clRaceThread::run only after the select's
    * last period, the song plays on into the next */
-  if (racing && m->finish && m->finish_story != 3) return m->finish > m->finish_wait ? MUSIC_RESULT : NULL;
+  if (racing && m->finish && m->finish_story != 3)
+    return m->finish > m->finish_wait && (!m->finish_ghost || m->finish_goal) ? MUSIC_RESULT : NULL;
   if (racing || (m->screen == MENU_PRE && m->pre_quiet)) return card_bgm_file(m, m->song);
   if (m->screen < MENU_START) return NULL; /* the attract loop: its movies have their own sound */
   /* mseqTimeAttack stops the music once the BGM is chosen (before seqTaCourseDecide) */
@@ -1198,7 +2042,11 @@ static int day_select_step(menu_state *m, int tap, int key) {
       if (line < 0 || line >= lines) line = 0;
       m->song = line == 0 ? 1 + rand() % (lines - 2) : line == lines - 1 ? -1 : line;
 #endif
-    } else day_decide(m);
+    } else {
+      int saved_bgm=m->bgm, saved_source=m->bgm_source;
+      day_decide(m);
+      if (menu_ghost_choosing_options(m)) { m->bgm=saved_bgm; m->bgm_source=saved_source; }
+    }
     return 1;
   }
   return 0;
@@ -1207,7 +2055,7 @@ static int day_select_step(menu_state *m, int tap, int key) {
 /* The versus' time zone vote (seqJoinDayTimeSelect: the same screen, clArg's join set): the
  * card chosen sets this machine's vote (clNet::setJoinDayTime), 20 s (at 0 the card shown is
  * the vote); voted, the card holds decided till the host's result (getJoinDayTime: the most
- * voted, a tie at random), which the card turns to. The BGM is each player's. */
+ * voted; equal counts choose day0), which the card turns to. Original BGM is each player's. */
 #define DAY_TIME (20 * 60)
 static void vs_day_step(menu_state *m, int tap, int key) {
   /* the vote lost its lobby (the host gone, the connection lost): back to the versus screen */
@@ -1237,36 +2085,40 @@ static void vs_day_step(menu_state *m, int tap, int key) {
   if (day_select_step(m, tap, key)) m->vs.day_voted = 1, m->vs.day_t = 0;
 }
 
-/* The omakase key (the bottom bar's middle, HUD_MENU_HIDDEN's place) of the area vote and the
- * time zone vote: the choice left to the others (Allan 10-27: the area strip's omakase card
- * went unseen, the time zone vote had none). On the area vote it is the strip's card 0, which
- * the cursor walks to; on the time zone vote the card shown stays, the BGM line its song. */
+static int vs_omakase_card(const menu_state *m) {
+  uint32_t first = m->vs.omakase_sample_valid ? m->vs.omakase_sample[0] : (uint32_t)m->t;
+  uint32_t second = m->vs.omakase_sample_valid ? m->vs.omakase_sample[1] : (uint32_t)m->t;
+  uint32_t third = m->vs.omakase_sample_valid ? m->vs.omakase_sample[2] : (uint32_t)m->t;
+  int area = (int)(first & 7u);
+  if (area == 6 && (second & 1u)) area = (int)((third >> 2) & 7u);
+  for (int card = 1; card < MENU_VS_CARDS; ++card)
+    if (menu_vs_card_area(card) == area) return card;
+  return 1;
+}
+
+/* Area omakase is a concrete random vote (original run0x8819dcd.., confirmed
+ * area low7 plus highbit presentation marker0x80). NOT an abstention. The
+ * shortcut is port UI; original time select has only day/night, no random key. */
 static int vs_omakase_shown(const menu_state *m) {
   if (m->vs.state != MENU_VS_LOBBY) return 0;
-  if (m->screen == MENU_VS_AREA) return !m->vs.voted && m->vs.area_final < 0;
-  return m->screen == MENU_BGM && m->vs.day && !m->vs.day_voted && m->vs.day_final < 0 && !m->slide;
+  return m->screen == MENU_VS_AREA && !m->vs.voted && m->vs.area_final < 0;
 }
 
 static void vs_omakase(menu_state *m) {
-  if (m->screen == MENU_VS_AREA) {
+  if (vs_omakase_shown(m)) {
     snd_menu(SND_SELECT);
     m->vs.voted = 2;
-    m->vs.vote = 0;
+    m->vs.vote = vs_omakase_card(m);
     m->vs.vote_t = 0;
-  } else {
-    day_decide(m);
-    m->vs.day_voted = 2;
-    m->vs.day_t = 0;
   }
 }
 
 /* the key, or (voted so) its caption alone */
 static void draw_vs_omakase(const menu_state *m, float screen_w, float screen_h) {
-  int voted = m->screen == MENU_VS_AREA ? m->vs.voted == 2 && m->vs.area_final < 0
-                                        : m->vs.day_voted == 2 && m->vs.day_final < 0;
+  int voted = m->screen == MENU_VS_AREA && m->vs.voted == 2 && m->vs.area_final < 0;
   if (!voted && !vs_omakase_shown(m)) return;
   if (!voted) hud_draw_menu_hidden(screen_w, screen_h, m->key_held == HUD_MENU_HIDDEN);
-  const char *s = voted ? "LEFT TO THE OTHERS" : "LEAVE IT TO THE OTHERS";
+  const char *s = voted ? "RANDOM AREA SELECTED" : "RANDOM AREA";
   float px = 2.4f;
   hud_ui_begin(screen_w, screen_h);
   hud_ui_text(s, 0.5f * (screen_w - hud_ui_text_width(s, px)), 680.0f - 3.5f * px, px, 1.0f, voted ? 0.55f : 1.0f,
@@ -1274,7 +2126,26 @@ static void draw_vs_omakase(const menu_state *m, float screen_w, float screen_h)
   hud_ui_end();
 }
 
+#ifdef __ANDROID__
+/* The peer cooldown note also belongs on the time-zone vote screen. */
+static void draw_vs_day_wait_note(const menu_state *m, float screen_w, float screen_h) {
+  if (m->screen != MENU_BGM || !m->vs.day || strcmp(m->vs.note, "WAITING FOR ALL PLAYERS") != 0 || screen_w <= 0.0f) return;
+  const char *s = m->vs.note;
+  float width = hud_ui_text_width(s, 1.0f);
+  float px = width > 0.0f ? fminf(2.5f, screen_w * 0.9f / width) : 2.5f;
+  hud_ui_begin(screen_w, screen_h);
+  hud_ui_text(s, 0.5f * (screen_w - hud_ui_text_width(s, px)), 615.0f - 3.5f * px, px, 1.0f, 0.85f, 0.4f, 1.0f);
+  hud_ui_end();
+}
+#endif
+
 void menu_vs_day_open(menu_state *m) {
+  if (m->vs.round) {
+    if (m->vs.flow_stage != MENU_VS_FLOW_AREA || m->vs.round_cancel ||
+        m->vs.state != MENU_VS_LOBBY || m->screen != MENU_VS_AREA ||
+        m->vs.area_final <= 0 || m->vs.area_final >= MENU_VS_CARDS) return;
+    m->vs.flow_stage = MENU_VS_FLOW_DAY;
+  }
   go(m, MENU_BGM);
   m->vs.day = 1;
   m->vs.day_timer = DAY_TIME;
@@ -1362,18 +2233,15 @@ static void draw_day_select(const menu_state *m, int clock, float fade, int bars
   anm_draw_ex(ID.day_sound, 0, fade, 0, 0, name, 2);
 }
 
-/* ---- the car setting (clSeqCarSettingThread: in this build only its debug menus run it,
- * the art is all there), between the colour select and the mode select ----
- * Over the colour select's turntable: STOCK or FULL TUNE top left and AT or MT top right,
- * tapped, on menu_layout_setting's course band (a car picked from the save's keeps its
- * card's STOCK or FULL TUNE: that chip alone). With full tune the left/right keys move the
- * balance as the arcade's wheel does (left more power, right more handling, SE 0x19):
- * power and handling share CAR_TUNE_TOTAL points, neither under 10 (m_select_gage_max =
- * total - 10), the wheel prompt menu_g_setting_handle looping meanwhile. Below, where
- * menu_layout_setting has them, Power and Handling over their gauges (initGageAnime: 24
- * lights each, x from the table at 0x93f0780 less 34 past 30 points, y 266 and 304; lit by
- * ten in the s1, s2 and s3 colours), the horsepower (GetHorsePower) and the balance badges
- * DG..HG (menu_g_setting_setting's, the car's lit: GetHandling). A tap on the car goes on. */
+/* ---- the port's normal car setting, with clSeqCarSettingThread artwork,
+ * between colour select and mode select ----
+ * STOCK / FULL TUNE and AT / MT retain their ordinary setting controls. An
+ * already-earned tune>20 points can redistribute its own budget with the
+ * wheel/left-right keys, whether earned manually or explicitly FULL. Normal
+ * settings deliberately persist that same-budget allocation; pre-race editors
+ * remain temporary. Both axes stay>=10, maximum=earned_total-10. The authored
+ * gauge uses20 cells through29 total and total-10 cells above29, shifted34 units
+ * left only above29 (table0x93f0780); no partial car is rendered as full34. */
 typedef char garage_fits[CARDB_ALL <= MENU_GARAGE_MAKERS && CARDB_MAX_CARS <= MENU_GARAGE_CARS ? 1 : -1];
 enum {
   T_SET_BAND = 3364, T_SET_POWER = 3363, T_SET_HANDLING = 5695, T_SET_LIGHT = 7315, /* s1..s3 */
@@ -1415,8 +2283,8 @@ void menu_tune(const menu_state *m, int *power, int *handling) {
 }
 
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
-/* Capture the effective tune, never the saved arrays. Single-player keeps its
- * full-tune eligibility; VS also permits a partial card's existing point total. */
+/* Capture the effective tune, never the saved arrays. Original car-setting
+ * eligibility (>20 earned points / >600 hp) is owned by pre_race_tune_begin. */
 static int pre_tune_enter(menu_state *m, int origin, int bgm_sel, int story_day) {
   int p, h;
   pre_race_tune_clear(&m->pre_tune);
@@ -1424,6 +2292,9 @@ static int pre_tune_enter(menu_state *m, int origin, int bgm_sel, int story_day)
   if (m->game == MENU_GAME_STORY) menu_story_tune(m, &p, &h);
   else menu_tune(m, &p, &h);
   if (!pre_race_tune_begin(&m->pre_tune, m->game, m->maker, m->car, p, h)) return 0;
+  if (!pre_race_tune_bind_slot(&m->pre_tune, m->save_slot, m->save_skip)) {
+    pre_race_tune_clear(&m->pre_tune); return 0;
+  }
   m->pre_tune_origin = origin;
   m->pre_tune_bgm_sel = bgm_sel;
   m->pre_tune_story_day = story_day;
@@ -1434,6 +2305,8 @@ static int pre_tune_enter(menu_state *m, int origin, int bgm_sel, int story_day)
 
 #endif
 
+#include "menu_vs_flow.inc"
+
 /* the chips' left edges: STOCK, FULL TUNE, AT, MT */
 static void setting_chips(float x[4]) {
   x[0] = 24.0f;
@@ -1442,16 +2315,64 @@ static void setting_chips(float x[4]) {
   x[2] = x[3] - SET_CHIP_GAP - anm_sprite_width(anm_sprite(SET_TEXT + 2));
 }
 
+/* Normal garage settings deliberately persist a same-budget redistribution.
+ * A race editor instead owns pre_tune and never reaches these array writes.
+ * Full is an explicit34-point setting; a hand-earned car uses its existing
+ * st_power/st_handling allocation, regardless of the st_full/tune_full flags. */
+static int setting_balance(menu_state *m, int delta) {
+  if (!m || m->screen != MENU_SETTING || pre_tune_context(m) || menu_vs_round_active(m) ||
+      (delta != -1 && delta != 1) || m->maker < 0 || m->maker >= CARDB_ALL ||
+      m->car < 0 || m->car >= CARDB_NCARS[m->maker]) return 0;
+  int p, h, lo, hi;
+  menu_tune(m, &p, &h);
+  if (!story_tune_selectable(p, h)) return 0;
+  int total = story_tune_budget(p, h), next = p + delta;
+  if (!story_tune_power_range(total, &lo, &hi) || next < lo || next > hi) return 0;
+  int mk = m->maker, c = m->car;
+  if (m->tune_full[mk][c]) {
+    m->tune_power[mk][c] = (signed char)next;
+  } else {
+    m->st_power[mk][c] = (signed char)next;
+    m->st_handling[mk][c] = (signed char)(total - next);
+  }
+  m->garage_changed = 1;
+  return 1;
+}
+
+/* One eligibility predicate for normal arrows, wheel prompt and keyboard input.
+ * Transient drafts are read only here; their dedicated editor owns all changes. */
+static int setting_power_selectable(const menu_state *m) {
+  if (!m || m->maker < 0 || m->maker >= CARDB_ALL || m->car < 0 ||
+      m->car >= CARDB_NCARS[m->maker]) return 0;
+  int p, h;
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  if (pre_tune_context(m)) {
+    if (!pre_race_tune_slot_matches(&m->pre_tune, m->save_slot, m->save_skip)) return 0;
+    p = m->pre_tune.power;
+    h = m->pre_tune.base_power + m->pre_tune.base_handling - p;
+  } else
+#endif
+  {
+    if (menu_vs_round_active(m)) return 0;
+    menu_tune(m, &p, &h);
+  }
+  return story_tune_selectable(p, h);
+}
+
+/* Original initGageAnime:20 cells through total29; beyond29, total-10
+ * cells with the authored34-unit left shift. No fake34-point grid on partials. */
+static int setting_gage_layout(int power, int handling, float *dx) {
+  int total = story_tune_budget(power, handling);
+  if (dx) *dx = total > 29 ? GAGE_DX : 0.0f;
+  return total < 0 ? 0 : total <= 29 ? 20 : total - STORY_TUNE_BASIC_MAX;
+}
+
 /* one step of the car setting; returns 1 when it goes on */
 static int setting_step(menu_state *m, int tap, int key) {
   int mk = m->maker, c = m->car;
   m->spin -= 0.3f;
   if (key) {
-    int p = m->tune_power[mk][c] - key;
-    if (!m->tune_full[mk][c] || p < SET_MIN_POWER || p > CAR_TUNE_MAX) return 0;
-    snd_menu(SND_CURSOR);
-    m->tune_power[mk][c] = (signed char)p;
-    m->garage_changed = 1;
+    if (setting_balance(m, -key)) snd_menu(SND_CURSOR);
     return 0;
   }
   if (!tap) return 0;
@@ -1499,19 +2420,21 @@ static void draw_setting(const menu_state *m, int clock, void (*draw3d)(void *),
   setting_chips(x);
   int lit[4] = { !full, full, !m->manual, m->manual };
   /* a saved car's mode fixed: only its chip */
-  for (int k = 0; k < 4; ++k)
+  for (int k = 0; k < 4 && !pre_tune_context(m); ++k)
     if (!(k < 2 && m->tune_locked && !lit[k]))
       anm_draw_sprite(anm_sprite(SET_TEXT + k), x[k], SET_ROW_Y, lit[k] ? 1.0f : 0.3f);
-  if (full || pre_tune_context(m)) anm_draw(ID.set_handle, clock % anm_frames(ID.set_handle), 1);
+  if (setting_power_selectable(m)) anm_draw(ID.set_handle, clock % anm_frames(ID.set_handle), 1);
   /* the gauges */
   anm_draw_sprite(anm_sprite(T_SET_BAND), -192.0f, 246.0f, 0.5f);
   anm_draw_sprite(anm_sprite(T_SET_POWER), 7.0f, 256.0f, 1);
   anm_draw_sprite(anm_sprite(T_SET_HANDLING), 6.0f, 290.0f, 1);
+  float gage_dx;
+  int cells = setting_gage_layout(power, handling, &gage_dx);
   for (int row = 0; row < 2; ++row) {
     int n = row ? handling : power;
     float y = row ? 304.0f : 266.0f;
-    for (int i = 0; i < CAR_TUNE_MAX; ++i) {
-      float gx = (float)GAGE_X[i] + GAGE_DX - 32.0f, gy = y - 32.0f;
+    for (int i = 0; i < cells; ++i) {
+      float gx = (float)GAGE_X[i] + gage_dx - 32.0f, gy = y - 32.0f;
       anm_draw_sprite(anm_sprite(T_SET_EMPTY), gx, gy, 1);
       if (i < n) anm_draw_sprite(anm_sprite(T_SET_LIGHT + i / 10), gx, gy, 1);
     }
@@ -1527,7 +2450,10 @@ static void draw_setting(const menu_state *m, int clock, void (*draw3d)(void *),
   for (int k = 0; k < 5; ++k)
     anm_draw_sprite(anm_sprite(SET_BADGE[k][k == grade]), SET_BADGE_X + SET_BADGE_DX * (float)k - 64.0f, 347.5f - 32.0f, 1);
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(T_SET_TITLE) };
-  draw_topbar(bars, 1, &title);
+  if (menu_vs_round_active(m) && m->vs.flow_stage == MENU_VS_FLOW_TUNE) {
+    draw_topbar_timed(bars, 1, &title);
+    vs_timer(m->vs.tune_timer, bars, 1);
+  } else draw_topbar(bars, 1, &title);
   anm_draw(ID.bottom, bars, 1);
   int hint = anm_sprite(SET_TEXT + 4);
   if (!bars) anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
@@ -1608,8 +2534,8 @@ static void option_set(menu_state *m, int *v, int want) {
 
 /* Android's GRAPHICS (hq_rows): two columns of five rows, the chips at x */
 #define OPT_HQ_Y 288.0f /* the first row's middle */
-#define OPT_HQ_DY 23.0f
-#define OPT_HQ_HALF 11.0f
+#define OPT_HQ_DY 20.0f
+#define OPT_HQ_HALF 10.0f
 static const struct { int label, first; float x, chip_x; } OPT_HQ_ROW[10] = {
   { O_REFLECTION, O_ON, 16, 190 }, { O_SHARP, O_ON, 16, 190 }, { O_AO, O_ON, 16, 190 }, { O_BM, O_ON, 16, 190 },
   { O_HD, O_ON, 16, 190 }, { O_BLOOM, O_ON, 332, 500 }, { O_SSAO, O_ON, 332, 500 }, { O_WET, O_ON, 332, 500 },
@@ -1687,6 +2613,40 @@ static void draw_option_res(const menu_state *m, float screen_w, float screen_h)
   hud_ui_end();
 }
 
+#ifdef __ANDROID__
+#define OPT_FPS_Y 390.0f
+#define OPT_FPS_X 190.0f
+#define OPT_FPS_W 66.0f
+#define OPT_FPS_STEP 74.0f
+static const int OPT_FPS_LIMITS[] = {0, 60, 90, 120};
+static const char *const OPT_FPS_LABELS[] = {"AUTO", "60 FPS", "90 FPS", "120 FPS"};
+
+static void option_fps_step(menu_state *m) {
+  if (m->tap_y < OPT_FPS_Y - 10.0f || m->tap_y >= OPT_FPS_Y + 10.0f) return;
+  for (int i = 0; i < 4; ++i) {
+    float x = OPT_FPS_X + i * OPT_FPS_STEP;
+    if (m->tap_x < x || m->tap_x >= x + OPT_FPS_W || m->frame_rate_limit == OPT_FPS_LIMITS[i]) continue;
+    m->frame_rate_limit = OPT_FPS_LIMITS[i];
+    m->options_dirty = 1;
+    snd_menu(SND_CURSOR);
+    return;
+  }
+}
+
+static void draw_option_fps(const menu_state *m, float screen_w, float screen_h) {
+  const float k = 1.6f, size = 2.0f, y = OPT_FPS_Y * k;
+  hud_ui_begin(screen_w, screen_h);
+  hud_ui_text("FRAME RATE LIMIT", 16.0f * k, y - 3.5f * size, size, 1, 1, 1, 1);
+  for (int i = 0; i < 4; ++i) {
+    float x = (OPT_FPS_X + i * OPT_FPS_STEP) * k, width = OPT_FPS_W * k;
+    hud_ui_button(x, y - 10.0f * k, width, 20.0f * k, m->frame_rate_limit == OPT_FPS_LIMITS[i]);
+    const char *label = OPT_FPS_LABELS[i];
+    hud_ui_text(label, x + (width - hud_ui_text_width(label, size)) * 0.5f, y - 3.5f * size, size, 1, 1, 1, 1);
+  }
+  hud_ui_end();
+}
+#endif
+
 /* ---- the OPTION screen's KEY LAYOUT (MENU_LAYOUT, Allan 10-29: the touch keys' size and
  * place the player's own): the race's keys over the screen as they will be, a group dragged
  * by a finger moves (kept on the screen), the panel's - and + size the chosen group, RESET ALL
@@ -1696,14 +2656,14 @@ static void draw_option_res(const menu_state *m, float screen_w, float screen_h)
 #if defined(__ANDROID__) || defined(WMMT_HUD_CUSTOM_TEST)
 /* Android has a separate, versioned extension; the three legacy key groups stay untouched. */
 enum { LAY_PAGE, LAY_PREV, LAY_NEXT, LAY_SMALLER, LAY_BIGGER, LAY_DEAD_MINUS, LAY_DEAD_PLUS,
-       LAY_RESET, LAY_RESET_ALL, LAY_DONE, LAY_CENTER, LAY_BUTTONS };
-static const float LAY_PANEL[4] = { 272, 198, 480, 380 };
+       LAY_RESET, LAY_RESET_ALL, LAY_DONE, LAY_CENTER, LAY_OPACITY_MINUS, LAY_OPACITY_PLUS, LAY_BUTTONS };
+static const float LAY_PANEL[4] = { 272, 198, 480, 416 };
 static const float LAY_BUTTON[LAY_BUTTONS][4] = {
   { 296, 238, 432, 38 }, { 296, 283, 80, 38 }, { 648, 283, 80, 38 },
   { 296, 328, 80, 38 }, { 648, 328, 80, 38 },
   { 296, 373, 80, 38 }, { 648, 373, 80, 38 },
   { 296, 418, 204, 38 }, { 524, 418, 204, 38 }, { 296, 506, 432, 45 },
-  { 296, 554, 432, 22 }
+  { 296, 585, 432, 22 }, { 296, 554, 80, 25 }, { 648, 554, 80, 25 }
 };
 static const float OPT_LAYOUT_KEY[4] = { 446, 110, 176, 26 };
 #define LAY_K_STEP 10
@@ -1715,7 +2675,12 @@ static int layout_button(float x, float y) {
   return -1;
 }
 static HudCustomTransform *layout_transform(menu_state *m, int g) {
-  if (!m->lay_page) return g == HUD_EDIT_SHIFT ? &m->custom_layout.shift : NULL;
+  if (!m->lay_page) {
+    if (g == HUD_EDIT_SHIFT) return &m->custom_layout.shift;
+    if (g >= HUD_EDIT_SHIFT_UP && g < HUD_EDIT_GROUPS)
+      return &m->custom_layout.button[g - HUD_EDIT_SHIFT_UP];
+    return NULL;
+  }
   switch (g) {
     case HUD_RACE_MAP: return &m->custom_layout.map;
     case HUD_RACE_RANK: return &m->custom_layout.rank;
@@ -1724,10 +2689,32 @@ static HudCustomTransform *layout_transform(menu_state *m, int g) {
     default: return NULL;
   }
 }
-static int layout_count(const menu_state *m) { return m->lay_page ? HUD_RACE_GROUPS : HUD_KEY_GROUPS + 1; }
+static int layout_count(const menu_state *m) { return m->lay_page ? HUD_RACE_GROUPS : HUD_EDIT_GROUPS; }
 static int layout_valid(const menu_state *m, int g) { return g >= 0 && g < layout_count(m); }
+static unsigned layout_button_bit(int g) {
+  return 1u << (g - HUD_EDIT_SHIFT_UP);
+}
+static int layout_separate(const menu_state *m, int g) {
+  if (g == HUD_EDIT_SHIFT) return m->custom_layout.shift_separate;
+  return (m->custom_layout.separate_buttons & layout_button_bit(g)) != 0;
+}
+static void layout_set_separate(menu_state *m, int g, int separate) {
+  if (g == HUD_EDIT_SHIFT) m->custom_layout.shift_separate = separate;
+  else {
+    unsigned bit = layout_button_bit(g);
+    if (separate) m->custom_layout.separate_buttons |= bit;
+    else m->custom_layout.separate_buttons &= ~bit;
+  }
+}
+static HudCustomTransform layout_parent(const menu_state *m, int g) {
+  if ((g == HUD_EDIT_SHIFT_UP || g == HUD_EDIT_SHIFT_DOWN) && m->custom_layout.shift_separate)
+    return m->custom_layout.shift;
+  int side = g <= HUD_EDIT_SHIFT_DOWN ? HUD_KEYS_RIGHT : HUD_KEYS_TOP;
+  return (HudCustomTransform){m->key_k[side], m->key_dx[side], m->key_dy[side]};
+}
 static int layout_k(menu_state *m, int g) {
-  if (!m->lay_page && g==HUD_EDIT_SHIFT && !m->custom_layout.shift_separate) return m->key_k[HUD_KEYS_RIGHT];
+  if (!m->lay_page && g >= HUD_EDIT_SHIFT && !layout_separate(m,g))
+    return layout_parent(m,g).k;
   HudCustomTransform *t = layout_transform(m,g);
   return t ? t->k : m->key_k[g];
 }
@@ -1741,6 +2728,8 @@ static void layout_dirty(menu_state *m, int g) {
     static const unsigned bits[HUD_RACE_GROUPS] = { CUSTOM_DIRTY_MAP, CUSTOM_DIRTY_RANK, CUSTOM_DIRTY_TIME, CUSTOM_DIRTY_METER };
     if (g>=0 && g<HUD_RACE_GROUPS) m->custom_layout_dirty |= bits[g];
   } else if (g==HUD_EDIT_SHIFT) m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT;
+  else if (g>=HUD_EDIT_SHIFT_UP && g<HUD_EDIT_GROUPS)
+    m->custom_layout_dirty |= CUSTOM_DIRTY_BUTTON_0 << (g - HUD_EDIT_SHIFT_UP);
   else if (g>=0 && g<HUD_KEY_GROUPS) m->key_layout_dirty |= 1u << g;
 }
 static void layout_clamp(menu_state *m, int g) {
@@ -1755,6 +2744,11 @@ static void layout_apply(const menu_state *m) {
   const HudCustomLayout *c = &m->custom_layout;
   hud_set_stick_deadzone_percent(c->stick_deadzone_percent);
   hud_shift_layout_set(c->shift_separate,c->shift.k*0.01f,c->shift.dx,c->shift.dy);
+  hud_set_button_opacity_percent(c->button_opacity_percent);
+  for (int g=HUD_EDIT_SHIFT_UP; g<HUD_EDIT_GROUPS; ++g) {
+    const HudCustomTransform *b = &c->button[g-HUD_EDIT_SHIFT_UP];
+    hud_button_layout_set(g,layout_separate(m,g),b->k*0.01f,b->dx,b->dy);
+  }
   const HudCustomTransform *t[4] = { &c->map, &c->rank, &c->timer, &c->meter };
   for (int g=0; g<HUD_RACE_GROUPS; ++g) hud_race_layout_set(g,t[g]->k*0.01f,t[g]->dx,t[g]->dy);
 }
@@ -1767,6 +2761,7 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
     if (!id || m->lay_touch || m->lay_tap || m->back) return 1;
     int b=layout_button(x,y);
     if (b==LAY_CENTER && (m->lay_page || m->gyro!=HUD_STEER_STICK || m->lay_sel!=HUD_KEYS_LEFT)) return 1;
+    if (m->lay_page && (b==LAY_OPACITY_MINUS || b==LAY_OPACITY_PLUS)) return 1;
     if (b>=0) { m->lay_touch=id; m->lay_button_down=b+1; return 1; }
     int handle=x>=392 && x<632 && y>=462 && y<492;
     if (!handle && x>=LAY_PANEL[0] && x<=LAY_PANEL[0]+LAY_PANEL[2] && y>=LAY_PANEL[1] && y<=LAY_PANEL[1]+LAY_PANEL[3]) return 1;
@@ -1775,12 +2770,9 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
     int g=handle ? m->lay_sel : (m->lay_page ? hud_race_layout_hit(x,y) : hud_layout_hit_mode(m->gyro,x,y));
     if (!layout_valid(m,g)) return 1;
     m->lay_sel=g; m->lay_drag=1; m->lay_touch=id;
-    if (!m->lay_page && g==HUD_EDIT_SHIFT) {
-      m->lay_shift_old_separate=m->custom_layout.shift_separate;
-      if (!m->lay_shift_old_separate) {
-        m->custom_layout.shift.k=m->key_k[HUD_KEYS_RIGHT];
-        m->custom_layout.shift.dx=m->key_dx[HUD_KEYS_RIGHT]; m->custom_layout.shift.dy=m->key_dy[HUD_KEYS_RIGHT];
-      }
+    if (!m->lay_page && g>=HUD_EDIT_SHIFT) {
+      m->lay_old_separate=layout_separate(m,g);
+      if (!m->lay_old_separate) *layout_transform(m,g)=layout_parent(m,g);
     }
     int *dx,*dy; layout_xy(m,g,&dx,&dy);
     m->lay_old_dx=*dx; m->lay_old_dy=*dy; m->lay_x=x; m->lay_y=y;
@@ -1791,7 +2783,7 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
     int g=m->lay_sel,*dx,*dy; layout_xy(m,g,&dx,&dy);
     if (phase==TOUCH_CANCELLED) {
       *dx=m->lay_old_dx; *dy=m->lay_old_dy;
-      if (!m->lay_page && g==HUD_EDIT_SHIFT) m->custom_layout.shift_separate=m->lay_shift_old_separate;
+      if (!m->lay_page && g>=HUD_EDIT_SHIFT) layout_set_separate(m,g,m->lay_old_separate);
     } else if (phase==TOUCH_MOVED || phase==TOUCH_ENDED) {
       if (x==m->lay_x && y==m->lay_y) {
         /* A tap, or a drag returned to its origin, must preserve exact identity. */
@@ -1802,7 +2794,7 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
         layout_clamp(m,g);
       }
       int changed=*dx!=m->lay_old_dx || *dy!=m->lay_old_dy;
-      if (!m->lay_page && g==HUD_EDIT_SHIFT) m->custom_layout.shift_separate=m->lay_shift_old_separate || changed;
+      if (!m->lay_page && g>=HUD_EDIT_SHIFT) layout_set_separate(m,g,m->lay_old_separate || changed);
       if (phase==TOUCH_ENDED && changed) layout_dirty(m,g);
     }
     layout_apply(m);
@@ -1837,30 +2829,45 @@ static void layout_step(menu_state *m,int back) {
       int n=m->custom_layout.stick_deadzone_percent+(b==LAY_DEAD_PLUS ? 1 : -1);
       if (n>=0 && n<=50) { m->custom_layout.stick_deadzone_percent=n; m->custom_layout_dirty |= CUSTOM_DIRTY_DEADZONE; }
     }
+  } else if ((b==LAY_OPACITY_MINUS || b==LAY_OPACITY_PLUS) && !m->lay_page) {
+    int value=m->custom_layout.button_opacity_percent+(b==LAY_OPACITY_PLUS ? 10 : -10);
+    if (value<0) value=0;
+    if (value>100) value=100;
+    if (value!=m->custom_layout.button_opacity_percent) {
+      m->custom_layout.button_opacity_percent=value;
+      m->custom_layout_dirty |= CUSTOM_DIRTY_OPACITY;
+    }
   } else if (b==LAY_SMALLER || b==LAY_BIGGER) {
     int g=m->lay_sel;
-    if (!m->lay_page && g==HUD_EDIT_SHIFT && !m->custom_layout.shift_separate) {
-      m->custom_layout.shift.k=m->key_k[HUD_KEYS_RIGHT]; m->custom_layout.shift.dx=m->key_dx[HUD_KEYS_RIGHT]; m->custom_layout.shift.dy=m->key_dy[HUD_KEYS_RIGHT];
-    }
+    if (!m->lay_page && g>=HUD_EDIT_SHIFT && !layout_separate(m,g))
+      *layout_transform(m,g)=layout_parent(m,g);
     int k=layout_k(m,g)+(b==LAY_BIGGER ? LAY_K_STEP : -LAY_K_STEP);
     if (m->lay_page && k > layout_k(m,g) && k*0.01f > hud_race_layout_max_scale(g)) return;
     if (k >= (int)(HUD_KEY_K_MIN*100+0.5f) && k <= (int)(HUD_KEY_K_MAX*100+0.5f)) {
       HudCustomTransform *t=layout_transform(m,g); if (t) t->k=k; else m->key_k[g]=k;
-      if (!m->lay_page && g==HUD_EDIT_SHIFT) m->custom_layout.shift_separate=1;
+      if (!m->lay_page && g>=HUD_EDIT_SHIFT) layout_set_separate(m,g,1);
       layout_clamp(m,g); layout_dirty(m,g);
     }
   } else if (b==LAY_RESET) {
-    if (!m->lay_page && m->lay_sel==HUD_EDIT_SHIFT) {
-      m->custom_layout.shift_separate=0;
-      m->custom_layout.shift.k=m->key_k[HUD_KEYS_RIGHT]; m->custom_layout.shift.dx=m->key_dx[HUD_KEYS_RIGHT]; m->custom_layout.shift.dy=m->key_dy[HUD_KEYS_RIGHT];
-      m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT;
-    } else layout_reset_group(m,m->lay_sel);
+    int g=m->lay_sel;
+    if (!m->lay_page && g>=HUD_EDIT_SHIFT) {
+      layout_set_separate(m,g,0);
+      *layout_transform(m,g)=layout_parent(m,g);
+      layout_dirty(m,g);
+    } else layout_reset_group(m,g);
   } else if (b==LAY_RESET_ALL) {
     if (m->lay_page) for (int i=0;i<HUD_RACE_GROUPS;++i) layout_reset_group(m,i);
     else {
       for (int i=0;i<HUD_KEY_GROUPS;++i) layout_reset_group(m,i);
       m->custom_layout.shift_separate=0; m->custom_layout.shift.k=100; m->custom_layout.shift.dx=m->custom_layout.shift.dy=0;
-      m->custom_layout.stick_deadzone_percent=8; m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT | CUSTOM_DIRTY_DEADZONE;
+      m->custom_layout.stick_deadzone_percent=8;
+      m->custom_layout.button_opacity_percent=100;
+      m->custom_layout.separate_buttons=0;
+      m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT | CUSTOM_DIRTY_DEADZONE | CUSTOM_DIRTY_OPACITY;
+      for (int g=HUD_EDIT_SHIFT_UP; g<HUD_EDIT_GROUPS; ++g) {
+        *layout_transform(m,g)=(HudCustomTransform){100,0,0};
+        layout_dirty(m,g);
+      }
       if (m->stick_center_mode != HUD_STICK_FLOAT) {
         m->stick_center_mode=HUD_STICK_FLOAT; m->stick_center_dirty=1;
         m->stick_center_retries=0; m->stick_center_retry_frames=0;
@@ -1874,7 +2881,7 @@ static void layout_text_mid(const char *s,float y,float px,float r,float g,float
 }
 static void draw_layout(const menu_state *cm,int clock,float screen_w,float screen_h) {
   menu_state *m=(menu_state *)cm;
-  static const char *const keys[]={"TOP KEYS","LEFT KEYS","RIGHT KEYS","SHIFT"};
+  static const char *const keys[]={"TOP KEYS","LEFT KEYS","RIGHT KEYS","SHIFT PAIR","SHIFT UP","SHIFT DOWN","PAUSE","VIEW"};
   static const char *const race[]={"MAP","RANK","TIME","METER"};
   draw_back(ID.bg,clock%600,1); anm_fill(0,0,0,0.6f); layout_apply(m);
   if (m->lay_page) hud_draw_race_layout(screen_w,screen_h,m->lay_sel);
@@ -1883,11 +2890,12 @@ static void draw_layout(const menu_state *cm,int clock,float screen_w,float scre
   hud_ui_rect(p[0],p[1],p[2],p[3],0.03f,0.04f,0.06f,0.90f);
   hud_ui_rect(p[0],p[1],p[2],3,1,0.42f,0.05f,0.95f);
   layout_text_mid("LAYOUT EDITOR",p[1]+10,3,1,1,1);
-  static const char *const label[]={"KEYS / HUD","<",">","-","+","-","+","RESET GROUP","RESET ALL","DONE","CENTER"};
+  static const char *const label[]={"KEYS / HUD","<",">","-","+","-","+","RESET","RESET ALL","DONE","CENTER","-","+"};
   for (int b=0;b<LAY_BUTTONS;++b) { const float *r=LAY_BUTTON[b]; float px=2.2f;
     if ((b==LAY_DEAD_MINUS || b==LAY_DEAD_PLUS) &&
         (m->lay_page || m->gyro!=HUD_STEER_STICK || m->lay_sel!=HUD_KEYS_LEFT)) continue;
     if (b==LAY_CENTER && (m->lay_page || m->gyro!=HUD_STEER_STICK || m->lay_sel!=HUD_KEYS_LEFT)) continue;
+    if (m->lay_page && (b==LAY_OPACITY_MINUS || b==LAY_OPACITY_PLUS)) continue;
     if (b==LAY_CENTER) px=1.7f;
     const char *text=b==LAY_CENTER ? (m->stick_center_mode ? "STATIC - TAP FOR FLOAT" : "FLOAT - TAP FOR STATIC") :
                      b==LAY_RESET_ALL ? (m->lay_page ? "RESET HUD" : "RESET KEYS") : label[b];
@@ -1899,8 +2907,13 @@ static void draw_layout(const menu_state *cm,int clock,float screen_w,float scre
   snprintf(line,sizeof line,"SIZE %d PCT",layout_k(m,g)); layout_text_mid(line,338,2,1,1,1);
   if (!m->lay_page && m->gyro==HUD_STEER_STICK && g==HUD_KEYS_LEFT) {
     snprintf(line,sizeof line,"DEADZONE %d PCT",m->custom_layout.stick_deadzone_percent); layout_text_mid(line,383,2,1,1,1);
-  } else if (!m->lay_page && g==HUD_EDIT_SHIFT) layout_text_mid(m->custom_layout.shift_separate?"SHIFT SEPARATE":"SHIFT FOLLOWS RIGHT",383,1.8f,1,1,1);
+  } else if (!m->lay_page && g>=HUD_EDIT_SHIFT)
+    layout_text_mid(layout_separate(m,g)?"INDEPENDENT":"FOLLOWS GROUP",383,1.8f,1,1,1);
   else layout_text_mid("DRAG GROUP TO MOVE",383,1.8f,1,1,1);
+  if (!m->lay_page) {
+    snprintf(line,sizeof line,"BUTTON OPACITY %d PCT",m->custom_layout.button_opacity_percent);
+    layout_text_mid(line,560,1.7f,1,1,1);
+  }
   hud_ui_button(392,462,240,30,m->lay_drag);
   layout_text_mid("DRAG TO MOVE",469,2,1,1,1);
   if (m->stick_center_dirty && m->stick_center_status==2) layout_text_mid("UNKNOWN CENTER FILE - NOT SAVED",493,1.3f,1,0.4f,0.2f);
@@ -2069,6 +3082,9 @@ static void option_step(menu_state *m, int tap, int key) {
     return;
   }
   if (!tap) return;
+#ifdef __ANDROID__
+  option_fps_step(m);
+#endif
   const float *lk = OPT_LAYOUT_KEY;
   if (m->tap_x >= lk[0] && m->tap_x < lk[0]+lk[2] && m->tap_y >= lk[1] && m->tap_y < lk[1]+lk[3]) { snd_menu(SND_SELECT); layout_enter(m); return; }
   int k = menu_steer_hit(m->tap_x, m->tap_y);
@@ -2176,13 +3192,8 @@ enum {
 #define SAVE_DY 64.0f
 #define SAVE_H 58.0f
 #define SAVE_INFO_X 176.0f
-/* the "i" key on the chips' row and its page (MENU_INFO, Allan 10-27: who made the port and
- * that it is not Bandai Namco's): menupack.py INFO_KEY, INFO_PAGE (tools/infopage.py, drawn
- * there at 1.6 times this space's size) */
-#define INFO_KEY 108000
-#define INFO_PAGE 108001
-#define INFO_SCALE 1.6f
-static const float INFO_KEY_RECT[4] = { 572, 96, 40, 40 };
+/* MENU_INFO remains a reserved internal screen value, but the port-information
+ * key/page is removed. Existing menu resources may still contain unused sprites. */
 
 static void save_enter(menu_state *m) {
   go(m, MENU_SAVE);
@@ -2217,14 +3228,6 @@ static int save_step(menu_state *m, int tap, int key) {
     return 0;
   }
   if (!tap) return 0;
-  const float *ik = INFO_KEY_RECT;
-  if (anm_sprite(INFO_KEY) >= 0 && m->tap_x >= ik[0] - 8 && m->tap_x < ik[0] + ik[2] + 8 && m->tap_y >= ik[1] - 8 &&
-      m->tap_y < ik[1] + ik[3] + 8) {
-    snd_menu(SND_SELECT);
-    m->save_confirm = 0;
-    go(m, MENU_INFO);
-    return 0;
-  }
   if (m->tap_y >= SET_ROW_Y - 16.0f && m->tap_y < SET_ROW_Y + 46.0f) {
     float x[3];
     save_chips(x);
@@ -2320,32 +3323,6 @@ static void draw_save(const menu_state *m, int clock, int bars) {
                                      : m->save_confirm ? S_HINT_AGAIN + m->save_confirm - 1
                                      : m->save_new ? S_HINT_NEW : S_HINT_LOAD));
   if (!bars) anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
-  int key = anm_sprite(INFO_KEY);
-  if (key >= 0) {
-    float src[4] = { 0, 0, anm_sprite_width(key), anm_sprite_height(key) };
-    const float *r = INFO_KEY_RECT;
-    float dst[4] = { r[0], r[1], r[0] + r[2], r[1] + r[3] };
-    anm_draw_part(key, src, dst, 1);
-  }
-}
-
-/* the "i" page: the port's own words over the SAVE DATA screen's background; a tap or the
- * back key back to it */
-static void draw_info(int clock, int bars) {
-  draw_back(ID.bg, clock % 600, 1);
-  anm_draw(ID.line, clock % anm_frames(ID.line), 1);
-  int page = anm_sprite(INFO_PAGE);
-  if (page >= 0) {
-    float w = anm_sprite_width(page), h = anm_sprite_height(page);
-    float src[4] = { 0, 0, w, h };
-    /* between the top bar and the bottom one */
-    float k = fminf(1.0f / INFO_SCALE, 322.0f / h), x = 320.0f - 0.5f * w * k, y = 72.0f;
-    float dst[4] = { x, y, x + w * k, y + h * k };
-    anm_draw_part(page, src, dst, 1);
-  }
-  anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(SAVE_TEXT + S_TITLE) };
-  draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
 }
 
 /* ---- the save's cars: each one of the arcade's cards (clV386CardData: its car, tune,
@@ -2423,8 +3400,12 @@ void menu_class_update(menu_state *m) {
 
 /* a new card's (and a deleted one's): stock, no parts, no results */
 static void own_clear(menu_state *m, int mk, int c) {
+  m->custom_color[mk][c] = 0;
+  menu_body_color_clear_pages(m);
+  memset(&m->body_edit, 0, sizeof m->body_edit);
   m->tune_full[mk][c] = 0, m->tune_power[mk][c] = CAR_TUNE_MAX;
   m->st_power[mk][c] = m->st_handling[mk][c] = m->st_gauge[mk][c] = 0;
+  m->dress_points[mk][c] = 0;
   m->dress_lv[mk][c] = m->aero[mk][c] = m->mirror[mk][c] = m->wing[mk][c] = m->bonnet[mk][c] = 0;
   m->wheel[mk][c] = 0;
   m->neon[mk][c] = 0;
@@ -2463,6 +3444,7 @@ static void own_register(menu_state *m) {
     int power = m->tune_power[mk][c];
     int p = power < SET_MIN_POWER ? SET_MIN_POWER : power > CAR_TUNE_MAX ? CAR_TUNE_MAX : power;
     m->dress_lv[mk][c] = 63;
+    m->dress_points[mk][c] = 0;
     m->st_power[mk][c] = (signed char)p;
     m->st_handling[mk][c] = (signed char)(CAR_TUNE_TOTAL - p);
     m->garage_changed = 1;
@@ -2867,6 +3849,136 @@ static void draw_name(const menu_state *m, int clock, int bars) {
   }
 }
 
+/* Ghost card-name search owns its own five glyphs. No MENU_NAME dispatch and no
+ * name_tap()/garage_changed callback. Page0 is original 0x93f7ca0 digits/BS;
+ * pages1..4 reuse the original NAMEDB grids verbatim. */
+/* Original tabs are 122x32 (numeric) and64x32; keep their real ANM
+ * bounds clear of last glyph row361 and HUD pedals beginning396.25.
+ * The scoped7/8 transform fits even the authored1.3x key-pop (ends365.8). */
+#define GHOST_NAME_TAB_Y 380.0f
+#define GHOST_NAME_TAB_Z .875f
+static const float GHOST_NAME_TAB_X[6]={95,199,267,335,403,471};
+static int ghost_name_tab(const menu_state *m,int k,int *anim,int *frame,float r[4]) {
+  static const int sprite[6][2]={{6241,5586},{6777,6584},{6776,6583},
+                                {6582,6240},{5588,4733},{3869,3229}};
+  if(k<0||k>=6)return 0;
+  int a=k==0?anm_find("menu_g_name_number"):ID.name_tab[k-1];
+  int lit=k==5?ghost_query_length(m)>0:k==m->ghost.query_page;
+  int f=lit?0:anm_frames(a)-1;
+  if(a<0||!anm_sprite_rect(a,f,anm_sprite(sprite[k][lit?0:1]),r))return 0;
+  r[0]=GHOST_NAME_TAB_X[k]+GHOST_NAME_TAB_Z*r[0];r[2]=GHOST_NAME_TAB_X[k]+GHOST_NAME_TAB_Z*r[2];
+  r[1]=GHOST_NAME_TAB_Y+GHOST_NAME_TAB_Z*r[1];r[3]=GHOST_NAME_TAB_Y+GHOST_NAME_TAB_Z*r[3];
+  if(anim)*anim=a;if(frame)*frame=f;return 1;
+}
+static int ghost_name_grid(const menu_state *m,int key) {
+  if(key<0||key>=60)return -1;
+  if(m->ghost.query_page>0 && m->ghost.query_page<=4)return NAMEDB_GRID[m->ghost.query_page-1][key];
+  if(m->ghost.query_page!=0)return -1;
+  if(key==10)return NAMEDB_BS;
+  if(key>=10)return -1;
+  for(int i=0;i<NAMEDB_N;++i)if(NAMEDB_WCHAR[i]==0xff10u+(unsigned)key)return i;
+  return -1;
+}
+static int ghost_name_touch_code(const menu_state *m,float x,float y) {
+  if(!isfinite(x)||!isfinite(y)||x< -64||x>704||y<0||y>480)return 0;
+  for(int k=0;k<6;++k) {
+    float r[4];if(ghost_name_tab(m,k,NULL,NULL,r)&&x>r[0]&&x<r[2]&&y>r[1]&&y<r[3])return 270+k;
+  }
+  int row=(int)floorf((y-(float)NAMEDB_GRID_Y[0]+4.0f)/32.0f),col=0;
+  if(row<0||row>2)return 0;
+  for(int c=1;c<20;++c)
+    if(fabsf(x-12.0f-(float)NAMEDB_GRID_X[c])<fabsf(x-12.0f-(float)NAMEDB_GRID_X[col]))col=c;
+  if(fabsf(x-12.0f-(float)NAMEDB_GRID_X[col])>=16.0f)return 0;
+  int key=row*20+col;
+  return ghost_name_grid(m,key)==-1?0:200+key;
+}
+unsigned menu_ghost_search_query(const menu_state *m,uint16_t name[5]) {
+  if(!m || !name || m->screen!=MENU_GHOST || m->ghost.ui.page!=GHOST_UI_NAME ||
+     !m->ghost.query_waiting) return 0;
+  unsigned n=(unsigned)ghost_query_length(m);
+  for(unsigned i=0;i<n;++i) {
+    if(m->ghost.query[i]>=NAMEDB_N)return 0;
+    name[i]=NAMEDB_WCHAR[m->ghost.query[i]];
+  }
+  return n;
+}
+
+void menu_ghost_search_complete(menu_state *m,int available) {
+  uint16_t name[5];
+  if(!menu_ghost_search_query(m,name))return;
+  m->ghost.query_waiting=0;
+  if(!ghost_directory_count(m,-1,-1)) {
+    snprintf(m->ghost.note,sizeof m->ghost.note,"%s",
+             available?"NO MATCHING RECORDED CARD":"CLOUD UNAVAILABLE / NO LOCAL MATCH");
+    snd_menu(SND_CANCEL);
+    return;
+  }
+  m->ghost.note[0]=0;
+  memcpy(m->ghost.previous_query,m->ghost.query,sizeof m->ghost.query);
+  m->ghost.previous_query_valid=1;
+  ghost_courses(m);snd_menu(SND_SELECT);
+}
+
+static void ghost_name_input(menu_state *m,int code) {
+  if(m->ghost.ui.page!=GHOST_UI_NAME || m->ghost.status==MENU_GHOST_BUSY ||
+     m->ghost.active_request || m->ghost.query_waiting)return;
+  int n=ghost_query_length(m);
+  if(code>=270 && code<276) {
+    int page=code-270;
+    if(page<5) {m->ghost.query_page=page;snd_menu(SND_CURSOR);return;}
+    if(!n) {
+      snprintf(m->ghost.note,sizeof m->ghost.note,"ENTER A CARD NAME");
+      snd_menu(SND_CANCEL);return;
+    }
+    m->ghost.query_waiting=1;
+    if(m->ghost.cloud_configured)
+      snprintf(m->ghost.note,sizeof m->ghost.note,"SEARCHING PLAYER REPLAYS");
+    else menu_ghost_search_complete(m,1);
+    return;
+  }
+  int key=code-200,v=ghost_name_grid(m,key);
+  if(v==NAMEDB_BS) {
+    if(n) {m->ghost.query[n-1]=-1;m->ghost.query_char_pop=0;snd_menu(SND_CANCEL);}
+  } else if(v==NAMEDB_DAKU || v==NAMEDB_HANDAKU) {
+    int to=n?NAMEDB_VOICED[m->ghost.query[n-1]][v==NAMEDB_HANDAKU]:-1;
+    if(to<0) {snd_menu(SND_CANCEL);return;}
+    m->ghost.query[n-1]=(short)to;m->ghost.query_char_pop=NAME_POP;snd_menu(SND_CURSOR);
+  } else if(v>=0 && v<NAMEDB_N) {
+    if(n==5) {snd_menu(SND_CANCEL);return;}
+    m->ghost.query[n]=(short)v;m->ghost.query_char_pop=NAME_POP;snd_menu(SND_CURSOR);
+  } else return;
+  m->ghost.query_key=key;m->ghost.query_pop=NAME_POP;m->ghost.note[0]=0;
+}
+static void draw_ghost_name(const menu_state *m,int clock,int bars) {
+  anm_draw(ID.name_back,0,1);
+  int n=ghost_query_length(m);
+  for(int i=0;i<5;++i) {
+    float x=NAME_X+NAME_DX*(float)i;
+    anm_draw_ex(ID.name_use,i<n?0:1,1,x+49,196,NULL,0);
+    if(i==n)anm_draw_ex(ID.name_line,clock%anm_frames(ID.name_line),1,x+49,196,NULL,0);
+    if(i<n)name_glyph(anm_sprite(NAME_GLYPH10+m->ghost.query[i]),x,NAME_Y,100,
+                    i==n-1?1.0f+.1f*(float)m->ghost.query_char_pop:1,1);
+  }
+  anm_draw(ID.name_select,0,1);
+  for(int key=0;key<60;++key) {
+    int v=ghost_name_grid(m,key);
+    int g=v==NAMEDB_BS?NAMEDB_N:v==NAMEDB_DAKU?NAMEDB_DAKU_MARK:v==NAMEDB_HANDAKU?NAMEDB_HANDAKU_MARK:
+          v>=0&&NAMEDB_WCHAR[v]==0x3000?NAMEDB_N+1:v;
+    if(g<0)continue;
+    float x=(float)NAMEDB_GRID_X[key%20],y=(float)NAMEDB_GRID_Y[key/20];
+    int hit=key==m->ghost.query_key && m->ghost.query_pop;
+    if(hit) {
+      float ring=anm_sprite_width(anm_sprite(S_NAME_RING));
+      name_glyph(anm_sprite(S_NAME_RING),x+12-ring*.5f,y+16-ring*.5f,ring,1,(float)m->ghost.query_pop/NAME_POP);
+    }
+    name_glyph(anm_sprite(NAME_GLYPH8+g),x,y,32,hit?1+.1f*(float)m->ghost.query_pop:1,1);
+  }
+  for(int k=0;k<6 && !bars;++k) {
+    int a,f;float r[4];
+    if(ghost_name_tab(m,k,&a,&f,r))anm_draw_xf(a,f,1,GHOST_NAME_TAB_X[k],GHOST_NAME_TAB_Y,GHOST_NAME_TAB_Z,NULL,0);
+  }
+}
+
 /* text in a font's glyphs (CARD_GLYPH2 / 5: digits, then the extra characters) from (x, y);
  * returns the x after it */
 static float card_glyphs(int base, const char *extra, float adv, const char *text, float x, float y, float a) {
@@ -3011,6 +4123,218 @@ static void card_settings_draw(const menu_state *m, float fade) {
   if (m->card_save_failed && (m->card_page == 8 || m->card_page == 9)) card_notice("SAVE FAILED", 245, 350, fade);
 }
 
+static void card_number(unsigned value, int sprite_base, float right, float y, float advance, float fade) {
+  char text[16];
+  snprintf(text, sizeof text, "%u", value);
+  float x = right - advance * (float)(strlen(text) - 1);
+  for (const char *digit = text; *digit; ++digit, x += advance) {
+    int sprite = anm_sprite(sprite_base + *digit - '0');
+    if (sprite < 0) sprite = anm_sprite(CARD_GLYPH2 + *digit - '0');
+    anm_draw_sprite(sprite, x, y, fade);
+  }
+}
+
+/* get_story_data (0x88db030), indexed after the arcade's get_story_index. */
+static const unsigned short CARD_STORY_RAMPS[111] = {
+  0x1c22, 0x1c28, 0x1c1d, 0x1c2b, 0x1c23, 0x1b52, 0x1c18, 0x1c27, 0x1c24, 0x1c16,
+  0x1c16, 0x1c19, 0x1c22, 0x1c23, 0x1c25, 0x1c22, 0x1c20, 0x1c20, 0x1c18, 0x1c1a,
+  0x1c1d, 0x1c1a, 0x1c16, 0x1c18, 0x1c20, 0x1c1a, 0x1c21, 0x1c28, 0x1c18, 0x1c20,
+  0x1c17, 0x1c20, 0x1c24, 0x1c18, 0x1c23, 0x1b52, 0x1c1d, 0x1c1b, 0x1c23, 0x1c1f,
+  0x1b52, 0x1b51, 0x1b51, 0x1b51, 0x1c27, 0x1c1b, 0x1c1d, 0x1c20, 0x1c1b, 0x1c1e,
+  0x1b52, 0x1c27, 0x1c1b, 0x1c2a, 0x1c2b, 0x1c18, 0x1c24, 0x1c29, 0x1c1e, 0x1c1b,
+  0x1c17, 0x1c1c, 0x1c28, 0x1c1b, 0x1c26, 0x1c23, 0x1c22, 0x1c28, 0x1c1b, 0x1c1d,
+  0x1c17, 0x1c1b, 0x1c21, 0x1c18, 0x1c24, 0x1c28, 0x1c1b, 0x1c18, 0x1c16, 0x1c1f,
+  0x1c23, 0x1c27, 0x1c24, 0x1b52, 0x1c1f, 0x1b52, 0x1c26, 0x1c1b, 0x1c16, 0x1c1e,
+  0x1c16, 0x1c29, 0x1c25, 0x1c1e, 0x1c1d, 0x1c1f, 0x1c27, 0x1c20, 0x1c1e, 0x1c17,
+  0x1c27, 0x1c22, 0x1c16, 0x1b52, 0x1b51, 0x1c20, 0x1c2c, 0x1c18, 0x1c27, 0x1c17,
+  0x1c17,
+};
+static int st_index(int loop, int n);
+
+static int card_story_portrait(int index, int cleared) {
+  if (index == 110) return 0x1a51;
+  if (index == 100) index = 1;
+  if (index >= 80 && index < 90) return (cleared ? 0x1802 : 0xac1) + index - 80;
+  if (index == 109) return cleared ? 0x1801 : 0xac0;
+  if (index >= 90) index -= 10;
+  return (cleared ? 0x1522 : 0x847) + index;
+}
+
+/* clSeqCardDisp2::run shows the current division as four rows of five. For the first
+ * pass after division one it reveals the next rival in order. First-division final
+ * rivals have prerequisites and the last one requires the preceding nineteen. */
+static void card_story_draw(const menu_state *m, float fade) {
+  const unsigned bits = (unsigned)m->st_bits & 0xfffffu;
+  const unsigned division = m->st_div < 0 ? 0 : m->st_div > 0x1391 ? 0x1391 : (unsigned)m->st_div;
+  const unsigned loop = division / 5;
+  const int row_anim = anm_find("menu_g_cardcheck_2_chara");
+  const int layout = anm_find("menu_layout_cardcheck_2");
+  const anm_swap frame_only[] = {
+    { anm_sprite(0xabd), -1 }, { anm_sprite(0x1518), -1 }, { anm_sprite(0x11ef), -1 }, { anm_sprite(0x151a), -1 },
+    { anm_sprite(0x488), -1 }, { anm_sprite(0x489), -1 }, { anm_sprite(0x48a), -1 }, { anm_sprite(0x48b), -1 },
+    { anm_sprite(0x48c), -1 }, { anm_sprite(0x48d), -1 }, { anm_sprite(0x48e), -1 }, { anm_sprite(0x48f), -1 },
+  };
+  anm_swap layout_hide[32];
+  memcpy(layout_hide, frame_only, sizeof frame_only);
+  for (int i = 0; i < 20; ++i) layout_hide[12 + i] = (anm_swap){ anm_sprite(0x6b4 + i), -1 };
+  anm_draw_ex(layout, 0, fade, 0, 0, layout_hide, 32);
+  for (unsigned i = 0; i < 20; ++i) {
+    const int cleared = (bits >> i) & 1u;
+    int visible = 1;
+    if (!cleared && !loop) {
+      if (division && i) visible = (bits >> (i - 1)) & 1u;
+      else if (!division && i == 19) visible = (bits & 0x7ffffu) == 0x7ffffu;
+      else if (!division && i % 5 == 4) visible = ((bits >> (i - 4)) & 15u) == 15u;
+    }
+    const int index = st_index((int)loop, (int)(division % 5 * 20 + i));
+    int portrait = anm_sprite(visible ? card_story_portrait(index, cleared) : 0x1a51);
+    const int original_portrait = portrait;
+    if (portrait < 0 && visible) portrait = anm_sprite(STORYSEL_IMAGE[index][cleared]);
+    const float x = 105.0f + 108.0f * (float)(i % 5), y = 170.0f + 60.0f * (float)(i / 5);
+    const anm_swap cell[] = {
+      { anm_sprite(0x1f54), original_portrait }, { anm_sprite(0x1f97), original_portrait },
+      { anm_sprite(0x1c16), visible ? anm_sprite(CARD_STORY_RAMPS[index]) : -1 },
+      { anm_sprite(0x1e81), -1 }, { anm_sprite(0x1e82), -1 }, { anm_sprite(0x1e83), -1 },
+      { anm_sprite(0x1e84), -1 }, { anm_sprite(0x1e85), -1 },
+    };
+    anm_draw_ex(row_anim, cleared, fade, x, y, cell, 8);
+    /* Older sidecars may lack the small card portraits but still carry the story selection art. */
+    if (original_portrait < 0 && portrait >= 0) {
+      float w = anm_sprite_width(portrait), h = anm_sprite_height(portrait);
+      const float src[4] = { 0, 0, w, h }, dst[4] = { x - 25, y - 19, x + 40, y + 11 };
+      if (w > 0 && h > 0) anm_draw_part(portrait, src, dst, fade);
+    } else if (portrait < 0 && !visible) card_notice("?", x - 4, y - 13, fade);
+    unsigned episode = division * 20 + i + 1;
+    if (episode > 99999) episode = 99999;
+    card_number(episode, 0x1204, x + 7, y - 1, 12, fade);
+  }
+  /* The arcade had a separate clear-total field. Cinder's older saves retain the
+   * active division's clear bits only, so use them for the total in division one. */
+  if (!division) {
+    unsigned cleared = 0;
+    for (unsigned i = 0; i < 20; ++i) cleared += (bits >> i) & 1u;
+    anm_draw_sprite(anm_sprite(0xabd), 371, 116, fade);
+    anm_draw_sprite(anm_sprite(0x11ef), 553, 116, fade);
+    card_number(cleared, 0x488, 538, 116, 14, fade);
+  }
+  anm_draw_sprite(anm_sprite(0x1518), 378, 96, fade);
+  anm_draw_sprite(anm_sprite(0x151a), 546, 96, fade);
+  card_number(loop < 1000 ? loop + 1 : 1000, 0x488, 524, 96, 14, fade);
+  if (m->maker >= 0 && m->maker < CARDB_ALL && m->car >= 0 && m->car < CARDB_NCARS[m->maker]) {
+    int streak = m->st_streak_car[m->maker][m->car];
+    int label = anm_sprite(0x1800);
+    if (streak > 0 && label >= 0) {
+      anm_draw_sprite(anm_sprite(0xabe), 271, 97, fade);
+      anm_draw_sprite(label, 258, 99, fade);
+      anm_draw_sprite(anm_sprite(0x11ee), 348, 112, fade);
+      card_number((unsigned)streak, 0x488, 331, 116, 14, fade);
+    }
+  }
+}
+
+static void card_ghost_draw(const menu_state *m, float fade) {
+  const menu_card_ghost_stats *stats = &m->card_ghost_stats;
+  int level = m->dress_lv[m->maker][m->car];
+  char text[24];
+  card_notice("LV", 215, 154, fade);
+  card_number((unsigned)(level < 0 ? 0 : level), 0x488, 261, 151, 14, fade);
+  if (level < 63) {
+    snprintf(text, sizeof text, "%u/1000", (unsigned)m->dress_points[m->maker][m->car]);
+    card_notice(text, 218, 178, fade);
+  }
+  if (stats->races) {
+    card_number(stats->races > 999999 ? 999999 : stats->races, 0x488, 285, 207, 14, fade);
+    anm_draw_sprite(anm_sprite(0x196f), 298, 207, fade);
+    card_number(stats->wins > 999999 ? 999999 : stats->wins, 0x488, 402, 207, 14, fade);
+    anm_draw_sprite(anm_sprite(0x1970), 419, 207, fade);
+  } else {
+    anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 215, 207, fade);
+  }
+  card_number(stats->coins, 0x488, 285, 260, 14, fade);
+  anm_draw_sprite(anm_sprite(0x492), 303, 260, fade);
+  static const int crown_frames[8] = { 0x1b59, 0x1b5e, 0x1b5f, 0x1b60, 0x1b5c, 0x1b5d, 0x1b5b, 0x1b5a };
+  anm_swap crowns[8];
+  for (unsigned area = 0; area < 8; ++area) {
+    int frame = anm_sprite(crown_frames[area]);
+    int earned = anm_sprite(0x11fc + (int)area);
+    crowns[area] = (anm_swap){ frame, (stats->crown_mask & (1u << area)) && earned >= 0 ? earned : frame };
+  }
+  anm_draw_ex(anm_find("menu_layout_cardcheck_3_crown"), 0, fade, 0, 0, crowns, 8);
+}
+
+static int card_ghost_match_logo(uint32_t model) {
+  for (int mk = 0; mk < CARDB_ALL; ++mk) for (int car = 0; car < CARDB_NCARS[mk]; ++car) {
+    const cardb_car *c = &CARDB_CARS[mk][car];
+    for (int color = 0; color < c->ncolors; ++color)
+      if ((uint32_t)title_model(mk, car, color) == model) return anm_sprite(c->logo);
+  }
+  return -1;
+}
+
+static void card_defense_draw(const menu_card_ghost_stats *stats, float fade) {
+  if (!stats->defense_races) {
+    anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 260, 220, fade);
+    return;
+  }
+  card_number(stats->defense_races > 999999 ? 999999 : stats->defense_races, 0x493, 442, 130, 14, fade);
+  card_number(stats->defense_wins > 999999 ? 999999 : stats->defense_wins, 0x493, 554, 130, 14, fade);
+  static const char *const area_names[8] = { "C1", "BELT", "WANGAN", "YOKOHANE", "NAGOYA", "OSAKA", "HAKONE", "FUKUOKA" };
+  const int row_anim = anm_find("menu_g_cardcheck_14_data");
+  int sprites[32], count = anm_sprites(row_anim, sprites, 32);
+  anm_swap swaps[32 + 15];
+  int n = 0;
+  for (int k = 0; k < count && k < 32; ++k) {
+    int sid = anm_sprite_id(sprites[k]);
+    if ((sid < 0x9ec || sid > 0x9f5) && sid != 0x1bf2 && sid != 0x1bf3 &&
+        sid != 0x171c && sid != 0x13c3 && sid != 0xed6 && sid != 0xed4)
+      swaps[n++] = (anm_swap){ sprites[k], -1 };
+  }
+  for (unsigned i = 0; i < stats->defense_recent_count && i < MENU_CARD_GHOST_RECENT; ++i) {
+    const menu_card_ghost_match *match = &stats->defense_recent[i];
+    const float y = 189.0f + 24.0f * (float)i;
+    char date[24];
+    const menu_ghost_record_date *d = &match->date;
+    int dated = d->year > 0 && d->year <= 9999 && d->month >= 1 && d->month <= 12 &&
+                d->day >= 1 && d->day <= 31 && d->hour < 24 && d->minute < 60;
+    if (dated) snprintf(date, sizeof date, "%04u%02u%02u%02u%02u",
+                        (unsigned)d->year, (unsigned)d->month, (unsigned)d->day,
+                        (unsigned)d->hour, (unsigned)d->minute);
+    int row_count = n;
+    for (int k = 0; k < 12; ++k) {
+      int sid = k < 10 ? 0x9ec + k : 0x1bf2 + k - 10;
+      swaps[row_count++] = (anm_swap){ anm_sprite(sid), dated ? anm_sprite(0x9ec + date[k] - '0') : -1 };
+    }
+    if (!dated) {
+      swaps[row_count++] = (anm_swap){ anm_sprite(0x171c), -1 };
+      swaps[row_count++] = (anm_swap){ anm_sprite(0x13c3), -1 };
+    }
+    if (match->hp <= 0) swaps[row_count++] = (anm_swap){ anm_sprite(0xed4), -1 };
+    anm_draw_ex(row_anim, 0, fade, 319, y, swaps, row_count);
+    char text[32];
+    if (match->has_gap) {
+      if (match->gap_m > -100000 && match->gap_m < 100000)
+        snprintf(text, sizeof text, "%+dM", match->gap_m);
+      else snprintf(text, sizeof text, "%s", match->gap_m > 0 ? "WIN" : "LOSE");
+      card_notice(text, 43, y - 7, fade);
+    }
+    for (unsigned j = 0; j < 5 && match->glyphs[j] >= 0 && match->glyphs[j] < NAMEDB_N; ++j) {
+      int s = anm_sprite(NAME_GLYPH5 + match->glyphs[j]);
+      float w = anm_sprite_width(s), h = anm_sprite_height(s), x = 109.0f + 11.0f * (float)j;
+      const float src[4] = { 0, 0, w, h }, dst[4] = { x, y - 7, x + 11, y + 7 };
+      if (w > 0 && h > 0) anm_draw_part(s, src, dst, fade);
+    }
+    int logo = card_ghost_match_logo(match->raw_model);
+    float w = anm_sprite_width(logo), h = anm_sprite_height(logo);
+    if (w > 0 && h > 0) {
+      float scale = fminf(128.0f / w, 25.0f / h), x = 236.0f - w * scale * 0.5f;
+      const float src[4] = { 0, 0, w, h }, dst[4] = { x, y - h * scale * 0.5f, x + w * scale, y + h * scale * 0.5f };
+      anm_draw_part(logo, src, dst, fade);
+    }
+    if (match->area >= 0 && match->area < 8) card_notice(area_names[match->area], 287, y - 7, fade);
+    if (match->hp > 0) card_number((unsigned)match->hp, 0x9ec, 407, y - 8, 8, fade);
+  }
+}
+
 static void draw_card(const menu_state *m, int clock, float fade, int bars) {
   if (m->card_page > 1 && m->card_page <= 9 && card_page_available(m->card_page)) {
     int a = anm_find(CARD_PAGE_FRAME[m->card_page - 1]);
@@ -3026,47 +4350,38 @@ static void draw_card(const menu_state *m, int clock, float fade, int bars) {
       /* The original route-list sprite has eight combined rows; our ten-route
        * matrix has different rows, so retaining it overlaps and mislabels them. */
       if (m->card_page == 5 && id == 0x8aa) safe = 0;
+      if (m->card_page == 4 && m->card_ghost_stats.defense_races)
+        safe |= id == 0xed5 || id == 0x196f || id == 0x1970 || id == 0xab7;
       if (!safe) hidden[count++] = (anm_swap){ sprites[i], -1 };
     }
     draw_back(ID.bg, clock % 600, fade);
     anm_draw_ex(a, 0, fade, 0, 0, hidden, count);
     if (m->card_page >= 8) card_settings_draw(m, fade);
-    else if (m->card_page == 2 || m->card_page == 5) {
+    else if (m->card_page == 2) card_story_draw(m, fade);
+    else if (m->card_page == 3 && m->maker >= 0 && m->maker < CARDB_ALL &&
+             m->car >= 0 && m->car < CARDB_NCARS[m->maker]) card_ghost_draw(m, fade);
+    else if (m->card_page == 4) card_defense_draw(&m->card_ghost_stats, fade);
+    else if (m->card_page == 5) {
       int value = 0;
-      if (m->card_page == 2) {
-        unsigned bits = (unsigned)m->st_bits & 0xfffffu;
-        value = (m->st_div > 0 ? m->st_div : 0) * 20;
-        for (int i = 0; i < 20; ++i) value += (bits >> i) & 1u;
-      } else {
-        for (int i = 0; i < 10; ++i) for (int j = 0; j < 10; ++j)
-          value += m->ten_result[i][j] == 3;
-      }
+      for (int i = 0; i < 10; ++i) for (int j = 0; j < 10; ++j)
+        value += m->ten_result[i][j] == 3;
       char text[24]; snprintf(text, sizeof text, "%d", value);
-      if (m->card_page == 2) {
-        /* A completed division can include skipped early episodes: this value is
-         * progress, not proof that every preceding race was won. */
-        card_notice("STORY PROGRESS", 160, 220, fade);
-      } else {
-        anm_draw_sprite(anm_sprite(SAVE_TEXT + S_MEDALS), 155, 135, fade);
-      }
-      save_glyphs(text, 390, m->card_page == 5 ? 135 : 220, fade);
-      if (m->card_page == 5) {
-        /* Ten route rows and ten standard levels: B/S/G are recorded medal
-         * values, '-' means no recorded result. Level 11 is not assumed. */
-        card_notice("LOCAL ROUTE    LEVEL 1 TO 10", 125, 160, fade);
-        static const unsigned char menu_to_record[10] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 8}; /* TEN_ORDER */
-        for (int route = 0; route < 10; ++route) {
-          char row[12]; snprintf(row, sizeof row, "ROUTE %d", route + 1);
-          float y = 180.0f + 17.0f * route;
-          card_notice(row, 125, y, fade);
-          for (int level = 0; level < 10; ++level) {
-            int medal = m->ten_result[menu_to_record[route]][level];
-            if (medal >= 1 && medal <= 3) {
-              const char *mark = medal == 1 ? "B" : medal == 2 ? "S" : "G";
-              card_notice(mark, 230.0f + 25.0f * level, y, fade);
-            } else {
-              card_glyphs(CARD_GLYPH2, "-,", 8.0f, "-", 230.0f + 25.0f * level, y, fade);
-            }
+      anm_draw_sprite(anm_sprite(SAVE_TEXT + S_MEDALS), 155, 135, fade);
+      save_glyphs(text, 390, 135, fade);
+      /* Ten route rows and ten standard levels: B/S/G are recorded medal values. */
+      card_notice("LOCAL ROUTE    LEVEL 1 TO 10", 125, 160, fade);
+      static const unsigned char menu_to_record[10] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 8}; /* TEN_ORDER */
+      for (int route = 0; route < 10; ++route) {
+        char row[12]; snprintf(row, sizeof row, "ROUTE %d", route + 1);
+        float y = 180.0f + 17.0f * route;
+        card_notice(row, 125, y, fade);
+        for (int level = 0; level < 10; ++level) {
+          int medal = m->ten_result[menu_to_record[route]][level];
+          if (medal >= 1 && medal <= 3) {
+            const char *mark = medal == 1 ? "B" : medal == 2 ? "S" : "G";
+            card_notice(mark, 230.0f + 25.0f * level, y, fade);
+          } else {
+            card_glyphs(CARD_GLYPH2, "-,", 8.0f, "-", 230.0f + 25.0f * level, y, fade);
           }
         }
       }
@@ -3259,6 +4574,9 @@ static void lvup_open(menu_state *m);
 static void shogo_open(menu_state *m);
 
 void menu_vs_closed(menu_state *m, const char *note) {
+  vs_flow_clear(m);
+  m->vs.start = m->vs.area_go = m->vs.day = 0;
+  m->vs.connect = m->vs.join = m->vs.tap = m->vs.held = 0;
   m->vs.state = MENU_VS_OFF;
   m->vs.n = 0;
   m->finish_story = 0;
@@ -3271,8 +4589,16 @@ void menu_vs_closed(menu_state *m, const char *note) {
   snprintf(m->vs.note, sizeof m->vs.note, "%s", note);
 }
 
+void menu_vs_left(menu_state *m) {
+  int kind = m->vs.kind;
+  menu_vs_closed(m, "");
+  go(m, MENU_VS_SEL);
+  m->sel = kind == MENU_VS_NET ? MENU_VS_NET : MENU_VS_LAN;
+}
+
 /* A peer left: the host and connection survive, but the old race and votes do not. */
 void menu_vs_aborted(menu_state *m, const char *note) {
+  vs_flow_clear(m);
   m->vs.state = MENU_VS_LOBBY;
   m->vs.start = m->vs.area_go = m->vs.day = 0;
   m->vs.connect = m->vs.join = 0;
@@ -3293,9 +4619,14 @@ void menu_vs_aborted(menu_state *m, const char *note) {
  * the black as from the course select */
 static void back_from_race(menu_state *m, int white) {
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
-  if (m->game != MENU_GAME_VS) pre_race_tune_clear(&m->pre_tune);
+  pre_race_tune_clear(&m->pre_tune); /* race-only redistribution never leaks into a rematch */
   m->pre_tune_setting = 0;
 #endif
+  if (!white && m->finish_ghost) {
+    m->finish_ghost = 0;
+    if (!tg_due(m)) menu_ghost_open(m);
+    return;
+  }
   /* a story race goes back to the game mode select; one whose select runs a second race on
    * (menu_finish_story's next) to that race's title */
   if (m->finish_story == 3) {
@@ -3312,6 +4643,7 @@ static void back_from_race(menu_state *m, int white) {
   }
   /* an online versus back to its lobby (the class-up and the rest wait for the next race) */
   if (m->vs.state == MENU_VS_RACE) {
+    vs_flow_clear(m);
     m->vs.state = MENU_VS_LOBBY;
     m->finish_story = 0;
     /* the stars won or lost first (seqJoStarGet) */
@@ -3484,6 +4816,7 @@ void menu_finish_open(menu_state *m, int goal, const menu_result *res) {
   m->finish = 1;
   m->finish_goal = goal != 0;
   m->finish_wait = goal ? FINISH_GOAL_WAIT : FINISH_TIMEUP_WAIT;
+  m->finish_ghost = 0;
   m->finish_out = 0;
   m->finish_story = 0;
   m->tap = 0;
@@ -3797,7 +5130,9 @@ enum { ST_RES_LEN = 420, ST_RES_ADV = 121, ST_RES_GAUGE = 180, ST_RES_COUNT = 22
 enum { T_ADV_MINUS = 0xafd, T_ADV_D0 = 0x1843, T_ADV_D1 = 0x1844, T_ADV_COMMA = 0xafc, T_ADV_D2 = 0x1845,
        T_ADV_D3 = 0x1846, T_ADV_D4 = 0x1847, T_ST_GET = 0x1d47, T_ST_GET2 = 0x1f3c,
        ADV_DIGIT = 1193 /* menu_p_finish_0..9 (0x93d0260) */ };
-static int st_t0(const menu_state *m) { return m->finish_story == 1 ? 30 : 0; }
+static int st_t0(const menu_state *m) {
+  return m->finish_story == 1 || m->finish_ghost == MENU_GHOST_RESULT_WIN ? 30 : 0;
+}
 static int st_full(const menu_state *m) { return m->st_prev + m->st_gain >= 1000; }
 /* the counter the gauge fills at (point_disp's +0x520: then SE 0x22, 10 on the message) */
 static int st_fill_at(const menu_state *m) { return ST_RES_COUNT + (int)(m->st_gain * 0.2f / ST_BAR_STEP) + 10; }
@@ -3832,7 +5167,7 @@ static void st_result_step(const menu_state *m, int t) {
 
 static void draw_st_result(const menu_state *m, int t) {
   t -= st_t0(m);
-  if (t >= ST_RES_ADV) {
+  if (t >= ST_RES_ADV && (!m->finish_ghost || m->finish_goal)) {
     /* point_calc's digits: ten thousands .. ones with a comma from 1000, leading zeros blank
      * and the minus just before the first digit, blank too when ahead */
     static const int SLOT[7] = { T_ADV_MINUS, T_ADV_D0, T_ADV_D1, T_ADV_COMMA, T_ADV_D2, T_ADV_D3, T_ADV_D4 };
@@ -3855,15 +5190,18 @@ static void draw_st_result(const menu_state *m, int t) {
   }
   if (!m->st_show || t < ST_RES_GAUGE) return;
   anm_draw(ID.st_waku, 0, 1);
+  int title = m->finish_ghost ? ID.tg_result_moji : ID.st_moji;
+  int bar = m->finish_ghost ? ID.tg_result_bar : ID.st_bar;
   int fill = st_full(m) ? st_fill_at(m) : 1 << 30;
   if (t >= fill) {
     int f = 80 + (t - fill < 78 ? t - fill : 78);
     anm_swap sw[2] = { { anm_sprite(T_ST_GET), anm_sprite(m->st_get) }, { anm_sprite(T_ST_GET2), anm_sprite(m->st_get) } };
-    anm_draw_ex(ID.st_moji, f, 1, 0, 0, sw, 2);
+    if (m->finish_ghost) anm_draw(title, f, 1);
+    else anm_draw_ex(title, f, 1, 0, 0, sw, 2);
   } else {
-    anm_draw(ID.st_moji, 0, 1);
+    anm_draw(title, 0, 1);
   }
-  anm_draw(ID.st_bar, st_bar_frame(m, t), 1);
+  anm_draw(bar, st_bar_frame(m, t), 1);
 }
 
 /* the counter of the first best row with a new record (CONGRATULATIONS starts with it), or -1 */
@@ -3886,12 +5224,12 @@ int menu_finish_update(menu_state *m, float dt) {
     m->tap = 0;
     int t = m->finish++ - m->finish_wait; /* clTaResult's or clTaTimeUp's counter */
     if (t < 0) continue;
-    if (!m->finish_goal) {
+    if (!m->finish_goal && !m->finish_ghost) {
       if (t >= TIMEUP_FADE + TIMEUP_LEN + TIMEUP_BLACK) return finish_leave(m);
       continue;
     }
     if (m->finish_out) {
-      if (++m->finish_out > RES_OUT_FADE + RES_OUT_BLACK) return finish_leave(m);
+      if (++m->finish_out > RES_OUT_FADE + (m->finish_ghost ? 0 : RES_OUT_BLACK)) return finish_leave(m);
       continue;
     }
     if (m->finish_story == 4) {
@@ -3909,9 +5247,9 @@ int menu_finish_update(menu_state *m, float dt) {
       if (t >= 300 || (tap && t >= 120)) m->finish_out = 1;
       continue;
     }
-    if (m->finish_story) {
+    if (m->finish_story || m->finish_ghost) {
       /* WIN plays its 150 frames, LOSE its first 180, under the advantage and the points */
-      if (t == 0) snd_menu(m->finish_story == 1 ? SND_FINISH : SND_FINISH2);
+      if (t == 0) snd_menu(m->finish_story == 1 || m->finish_ghost == MENU_GHOST_RESULT_WIN ? SND_FINISH : SND_FINISH2);
       st_result_step(m, t);
       if (t >= ST_RES_LEN) {
         snd_menu_loop(SND_TUNING_BAR, 0);
@@ -3966,7 +5304,7 @@ static void draw_result(const menu_state *m, int t) {
 void menu_finish_draw(const menu_state *m) {
   if (!m->finish || m->finish <= m->finish_wait) return;
   int t = m->finish - 1 - m->finish_wait;
-  if (!m->finish_goal) {
+  if (!m->finish_goal && !m->finish_ghost) {
     anm_fill(0, 0, 0, t < TIMEUP_FADE ? (float)(t + 1) / TIMEUP_FADE : 1.0f);
     if (t >= TIMEUP_FADE && t < TIMEUP_FADE + TIMEUP_LEN) anm_draw(ID.finish[0], t - TIMEUP_FADE, 1);
     return;
@@ -3985,9 +5323,11 @@ void menu_finish_draw(const menu_state *m) {
       hud_ui_text(rank, 512.0f - 0.5f * hud_ui_text_width(rank, 4.0f), 620.0f, 4.0f, 1, 1, 1, 1);
       hud_ui_end();
     }
-  } else if (m->finish_story == 1 || m->finish_story == 2) {
-    int a = m->finish_story == 1 ? ID.win : ID.lose, len = m->finish_story == 1 ? anm_frames(a) : ST_LOSE_LEN;
-    anm_draw(a, t < len ? t : len - 1, 1);
+  } else if (m->finish_story == 1 || m->finish_story == 2 || m->finish_ghost) {
+    int won = m->finish_story == 1 || m->finish_ghost == MENU_GHOST_RESULT_WIN;
+    int a = won ? ID.win : m->finish_goal ? ID.lose : ID.ten_timeup;
+    int len = won ? anm_frames(a) : ST_LOSE_LEN;
+    if (a >= 0 && len > 0) anm_draw(a, t < len ? t : len - 1, 1);
     draw_st_result(m, t);
   } else if (m->finish_story == 4) draw_ten_result();
   else draw_result(m, t);
@@ -4091,6 +5431,45 @@ enum { T_ST_PICTURE = 0x1e10, T_ST_TITLE = 0x1295, T_ST_CAR = 0x1e0d, T_ST_CAR_S
        T_ST_WA = 0xdb0 };
 #define STORY_NUMBER_DX 66.0f
 
+/* Passive race-title compositions, not a global sprite-ID heuristic: the same
+ * templates also occur in car select and other menus. Groups follow the OWN
+ * template before replacements. Keep original record order, affine, UV, alpha
+ * and animation (including the loading overshoot); only translate the groups
+ * onto the actual wide canvas. Images may contain transparent author padding. */
+typedef struct { int sprite, side; } pre_anchor;
+static const pre_anchor PRE_ST_ANCHOR[] = {
+  {T_ST_TITLE,-1}, {T_ST_DIGIT,-1}, {T_ST_DIGIT+1,-1}, {T_ST_DIGIT+2,-1},
+  {T_ST_DIGIT+3,-1}, {T_ST_DIGIT+4,-1}, {T_ST_WA,-1},
+  {T_ST_PICTURE,1}, {T_ST_CAR,1}, {T_ST_CAR+1,1}, {T_ST_CAR+2,1},
+};
+static const pre_anchor PRE_TA_ANCHOR[] = {
+  {T_PRE_TITLE_TA,-1}, {T_PRE_NAME,-1}, {T_PRE_TIME,-1},
+};
+static const pre_anchor PRE_TEN_ANCHOR[] = {
+  {0xb5c,-1}, {T_PRE_NAME,-1}, {T_PRE_TIME,-1}, {0x61b,-1}, {0x186f,-1}, {0x1870,1},
+};
+static const pre_anchor PRE_SOUND_ANCHOR[] = {
+  {0x75d,1}, {T_PRE_LOGO,1}, {T_BGM_FONT,1}, {0x75c,1},
+};
+static const pre_anchor PRE_LOADING_ANCHOR[] = {{0xfdc,-1}};
+
+static void draw_pre_layout(int anim, int frame, float alpha, float dx, const anm_swap *swap, int nswap,
+                            const pre_anchor *anchors, int nanchors) {
+  float edge = anm_edge() * (640.0f / 1024.0f);
+  if (!isfinite(edge) || edge <= 0.0f || !anchors || nanchors <= 0 || nanchors > 16) {
+    anm_draw_ex(anim, frame, alpha, dx, 0, swap, nswap);
+    return;
+  }
+  anm_layout_move moves[16];
+  for (int i = 0; i < nanchors; ++i)
+    moves[i] = (anm_layout_move){anm_sprite(anchors[i].sprite), edge * anchors[i].side, 0};
+  anm_draw_layout(anim, frame, alpha, dx, 0, swap, nswap, moves, nanchors);
+}
+
+static void draw_pre_loading(int frame, float alpha) {
+  draw_pre_layout(ID.loading, frame, alpha, LOADING_PRE_DX, NULL, 0, PRE_LOADING_ANCHOR, 1);
+}
+
 static int draw_pre_story(const menu_state *m, float fade) {
   if (m->game != MENU_GAME_STORY || m->story_sel < 0 || m->story_sel >= STORYPRE_N || ID.pre_st < 0) return 0;
   const storypre_select *s = &STORYPRE[m->story_sel];
@@ -4103,7 +5482,8 @@ static int draw_pre_story(const menu_state *m, float fade) {
   for (int k = 0; k < 3; ++k) sw[n++] = (anm_swap){ anm_sprite(T_ST_CAR + k), s->cars[k] > 1 ? anm_sprite(s->cars[k]) : -1 };
   sw[n++] = (anm_swap){ anm_sprite(T_ST_CAR_SPOT), -1 };
   for (int k = 0; k < 6; ++k) sw[n + k] = (anm_swap){ anm_sprite(k < 5 ? T_ST_DIGIT + k : T_ST_WA), -1 };
-  anm_draw_ex(ID.pre_st, 0, fade, 0, 0, sw, n + 6);
+  draw_pre_layout(ID.pre_st, 0, fade, 0, sw, n + 6, PRE_ST_ANCHOR,
+                  (int)(sizeof PRE_ST_ANCHOR / sizeof PRE_ST_ANCHOR[0]));
   /* The number: this data's title sprite reads "Chapter" where the arcade's digit places
    * begin, so the digits go after it (STORY_NUMBER_DX) and WA is left out. Drawn on its own,
    * everything but the digit places hidden. */
@@ -4115,7 +5495,8 @@ static int draw_pre_story(const menu_state *m, float fade) {
   for (int k = 0; k < 6; ++k)
     num[nd++] = (anm_swap){ anm_sprite(k < 5 ? T_ST_DIGIT + k : T_ST_WA), k < len && k < 5 ? anm_sprite(STORYPRE_DIGIT[text[k] - '0']) : -1 };
   for (int k = 0; k < n; ++k) num[nd++] = (anm_swap){ sw[k].from, -1 };
-  anm_draw_ex(ID.pre_st, 0, fade, STORY_NUMBER_DX, 0, num, nd);
+  draw_pre_layout(ID.pre_st, 0, fade, STORY_NUMBER_DX, num, nd, PRE_ST_ANCHOR,
+                  (int)(sizeof PRE_ST_ANCHOR / sizeof PRE_ST_ANCHOR[0]));
   return 1;
 }
 
@@ -4129,7 +5510,8 @@ static int draw_pre_ten(const menu_state *m, float fade) {
   draw_photo_bg(&bg, fade);
   anm_swap sw[4] = { { anm_sprite(T_PRE_NAME), anm_sprite(p[1]) }, { anm_sprite(T_PRE_TIME), anm_sprite(p[2]) },
                      { anm_sprite(0x186f), anm_sprite(TENDB_PRE_LV[m->ten_level]) }, { anm_sprite(0x1870), anm_sprite(p[3]) } };
-  anm_draw_ex(ID.pre_or, 0, fade, 0, 0, sw, 4);
+  draw_pre_layout(ID.pre_or, 0, fade, 0, sw, 4, PRE_TEN_ANCHOR,
+                  (int)(sizeof PRE_TEN_ANCHOR / sizeof PRE_TEN_ANCHOR[0]));
   return 1;
 }
 
@@ -4142,7 +5524,8 @@ static void draw_pre_as(const menu_state *m, float fade, int vs) {
     draw_photo_bg(&bg, fade);
     anm_swap ta[3] = { { anm_sprite(T_PRE_NAME), anm_sprite(PRE_NAME[k]) }, { anm_sprite(T_PRE_TIME), anm_sprite(PRE_TIME[z]) },
                        { anm_sprite(T_PRE_TITLE_TA), anm_sprite(S_PRE_TITLE_VS) } };
-    anm_draw_ex(ID.pre_ta, 0, fade, 0, 0, ta, vs ? 3 : 2);
+    draw_pre_layout(ID.pre_ta, 0, fade, 0, ta, vs ? 3 : 2, PRE_TA_ANCHOR,
+                    (int)(sizeof PRE_TA_ANCHOR / sizeof PRE_TA_ANCHOR[0]));
   }
   /* getBgmName / getBgmIcon of the song drawn (NO BGM has no logo) */
   int set = card_bgm_set(m);
@@ -4153,7 +5536,8 @@ static void draw_pre_as(const menu_state *m, float fade, int vs) {
   /* the name slides in once (30 frames) and stays */
   int sound = story && ID.pre_sound_st >= 0 ? ID.pre_sound_st : ID.pre_sound;
   int last = anm_frames(sound) - 1;
-  anm_draw_ex(sound, m->t < last ? m->t : last, fade, 0, 0, snd, 2);
+  draw_pre_layout(sound, m->t < last ? m->t : last, fade, 0, snd, 2, PRE_SOUND_ANCHOR,
+                  (int)(sizeof PRE_SOUND_ANCHOR / sizeof PRE_SOUND_ANCHOR[0]));
 }
 
 static void draw_pre(const menu_state *m, float fade) { draw_pre_as(m, fade, 0); }
@@ -5021,6 +6405,8 @@ static void draw_ten_level(const menu_state *m, int clock, float fade, int bars)
 }
 
 void menu_init(menu_state *m) {
+  memset(&m->ta_rank_snapshot,0,sizeof m->ta_rank_snapshot);
+  m->ta_rank_valid=0;m->ta_rank_status=MENU_TA_RANK_UNAVAILABLE;
   ID.title = anm_find("atract_layout_title");
   ID.bg = anm_find("menu_g_bg_image");
   ID.line = anm_find("menu_g_bg_line");
@@ -5033,9 +6419,7 @@ void menu_init(menu_state *m) {
   ID.game = anm_find("menu_layout_mode_sel");
   ID.game_image = anm_find("menu_layout_mode_image");
   ID.game_ring = anm_find("menu_layout_mode_ring");
-  ID.vs_sel = anm_find("menu_layout_mode_sel_3");
   ID.vs_sel_image = anm_find("menu_layout_mode_sel_3_image");
-  ID.vs_sel_ring = anm_find("menu_layout_mode_sel_3_ring");
   ID.vs_course = anm_find("menu_layout_vs_course1");
   ID.vs_icon = anm_find("menu_g_vs_icon");
   ID.vs_icon_omakase = anm_find("menu_g_vs_icon_omakase");
@@ -5065,6 +6449,7 @@ void menu_init(menu_state *m) {
   ID.pre_bg = anm_find("menu_g_pre_bg");
   ID.ranking_bg = anm_find("menu_g_ranking_bg2");
   ID.ranking = anm_find("menu_layout_ranking");
+  ID.ranking_step = anm_find("menu_layout_ranking_ph");
   ID.bg_carsel = anm_find("menu_g_bg_carsel_2");
   ID.maker_layout = anm_find("menu_layout_carsel_maker_");
   ID.maker_car = anm_find("menu_g_carsel_maker_car_image");
@@ -5230,6 +6615,8 @@ void menu_init(menu_state *m) {
   ID.st_waku = anm_find("menu_g_finish_point_waku");
   ID.st_bar = anm_find("menu_g_finish_st_bar");
   ID.st_moji = anm_find("menu_g_finish_st_moji");
+  ID.tg_result_bar = anm_find("menu_g_finish_tg_bar");
+  ID.tg_result_moji = anm_find("menu_g_finish_tg_moji");
   ID.res_course = anm_find("menu_g_finish_ta_course");
   ID.res_best[0] = anm_find("menu_g_finish_ta_total_best");
   ID.res_best[1] = anm_find("menu_g_finish_ta_car_best");
@@ -5278,6 +6665,7 @@ void menu_init(menu_state *m) {
   m->gyro = 0, m->gyro_sens = 5, m->over_on = 1, m->sharp_on = 1, m->ao_on = 1, m->bm_on = 1;
   /* (the SSAO off: its 20 ms on the Mi 6 cost the 60 fps) */
   m->hd_tex = 1, m->bloom_on = 1, m->ssao_on = 0, m->wet_on = 1, m->paint_on = 1, m->aa4 = 1;
+  m->frame_rate_limit = 0;
   m->garage_changed = 0;
   m->story_new_pending = 0;
   m->game = MENU_GAME_TA;
@@ -5288,12 +6676,20 @@ void menu_init(menu_state *m) {
   srand((unsigned)time(NULL));
   /* the arcade boots into the maker logos and the prologue; the attract movie follows them */
   m->demo = -1;
+  m->ta_rank_offset = m->ta_rank_touch_inside = 0;
+  m->ta_rank_touch = NULL;
   m->screen = MENU_LOGO;
   m->t = 0;
   m->tap = m->key = m->key_held = 0;
 }
 
 void menu_garage_reset(menu_state *m) {
+  memset(m->custom_color, 0, sizeof m->custom_color);
+  menu_body_color_clear_pages(m);
+  memset(&m->body_edit, 0, sizeof m->body_edit);
+  m->body_tab_focus = 0;
+  memset(&m->ta_rank_snapshot,0,sizeof m->ta_rank_snapshot);
+  m->ta_rank_valid=0;m->ta_rank_status=MENU_TA_RANK_UNAVAILABLE;
   m->story_new_pending = 0;
   /* every car stock, its full tune leaning to power (the port's tune before the setting) */
   memset(m->tune_full, 0, sizeof m->tune_full);
@@ -5307,6 +6703,7 @@ void menu_garage_reset(menu_state *m) {
   memset(m->st_handling, 0, sizeof m->st_handling);
   memset(m->st_gauge, 0, sizeof m->st_gauge);
   memset(m->dress_lv, 0, sizeof m->dress_lv);
+  memset(m->dress_points, 0, sizeof m->dress_points);
   memset(m->aero, 0, sizeof m->aero);
   memset(m->mirror, 0, sizeof m->mirror);
   memset(m->wing, 0, sizeof m->wing);
@@ -5330,6 +6727,8 @@ void menu_garage_reset(menu_state *m) {
 }
 
 static void go(menu_state *m, int screen) {
+  m->ta_rank_touch = NULL;
+  m->ta_rank_touch_inside = 0;
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
   m->pre_tune_car_touch = NULL;
   m->pre_tune_car_inside = 0;
@@ -5373,6 +6772,7 @@ void menu_movie_done(menu_state *m) {
 }
 
 void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
+  if (ranking_next_touch(m, id, phase, x, y)) return;
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
   if (pre_tune_context(m)) {
     float px = x * 640.0f / 1024.0f, py = y * 480.0f / 768.0f;
@@ -5407,6 +6807,9 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
     return;
   }
   if (phase == TOUCH_CANCELLED) {
+    if (id && id == m->ghost.touch) {
+      m->ghost.touch = NULL; m->ghost.touch_action = m->ghost.held = 0;
+    }
     if (id && id == m->card_touch) { m->card_touch = 0; m->card_touch_action = 0; m->key_held = 0; }
     if (id && id == m->back_touch) { m->back_touch = 0; m->key_held = 0; }
     if (id && id == m->key_touch) { m->key_touch = 0; m->key = 0; m->key_held = 0; }
@@ -5476,6 +6879,10 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
       return;
     }
   }
+  if (m->screen == MENU_GHOST && phase != TOUCH_BEGAN) {
+    ghost_touch(m, id, phase, x * (640.0f / 1024.0f), y * (480.0f / 768.0f));
+    return;
+  }
   if (phase == TOUCH_ENDED) m->vs.held = 0;
   if (phase == TOUCH_ENDED && id && id == m->key_touch) { m->key_touch = 0; if (!m->back_touch) m->key_held = 0; }
   else if (phase == TOUCH_ENDED && !m->back_touch && !m->key_touch) m->key_held = 0;
@@ -5487,6 +6894,10 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
   int key = hud_menu_key(x, y);
   if (key == HUD_MENU_BACK) {
     if (m->screen >= MENU_MAKER) m->back_touch = id, m->key_held = key;
+    return;
+  }
+  if (m->screen == MENU_GHOST) {
+    ghost_touch(m, id, phase, x * (640.0f / 1024.0f), y * (480.0f / 768.0f));
     return;
   }
   /* the versus screen's own buttons; the game mode select's VS key (the OPTION button's place) */
@@ -5558,27 +6969,20 @@ static float course_dx(const menu_state *m) {
   return -88.0f * to;
 }
 
+/* The two-card layout's icon templates also supply its touch targets. */
+static int vs_select_hit(const menu_state *m) {
+  static const int icons[MENU_VS_KINDS] = {2950, 4960};
+  for (int i = 0; i < MENU_VS_KINDS; ++i) {
+    float r[4];
+    if (anm_sprite_rect(ID.mode, m->sel * 100, anm_sprite(icons[i]), r) &&
+        m->tap_x >= r[0] && m->tap_x < r[2] && m->tap_y >= r[1] && m->tap_y < r[3]) return i;
+  }
+  return -1;
+}
+
 static int tap_dir(const menu_state *m) {
   if (m->screen == MENU_GAME) {
-    /* menu_layout_mode_sel at rest on mode sel: the discs' centres (layout px, y 192), the
-     * chosen one's 128 round, the others' 64; a tap on another disc moves one step its way */
-    static const float AT[GAME_SLOTS][GAME_SLOTS] = {
-      { 139, 326, 440, 554 }, { 84, 260, 440, 554 }, { 84, 198, 380, 554 }, { 84, 198, 312, 503 } };
-    if (m->tap_y > 300.0f) return 0;
-    const float *at = AT[m->sel >= 0 && m->sel < GAME_SLOTS ? m->sel : 0];
-    int hit = m->sel;
-    for (int k = 0; k < GAME_SLOTS; ++k)
-      if (fabsf(m->tap_x - at[k]) < (k == m->sel ? 128.0f : 64.0f)) hit = k;
-    return hit < m->sel ? -1 : hit > m->sel ? 1 : 0;
-  }
-  if (m->screen == MENU_VS_SEL) {
-    /* menu_layout_mode_sel_3 at rest: the discs' centres (as the game mode select's) */
-    static const float AT[3][3] = { { 139, 376, 554 }, { 84, 320, 554 }, { 84, 272, 503 } };
-    if (m->tap_y > 300.0f) return 0;
-    const float *at = AT[m->sel >= 0 && m->sel < 3 ? m->sel : 0];
-    int hit = m->sel;
-    for (int k = 0; k < 3; ++k)
-      if (fabsf(m->tap_x - at[k]) < (k == m->sel ? 128.0f : 64.0f)) hit = k;
+    int hit = game_hit(m); /* step() rejects empty space before asking direction. */
     return hit < m->sel ? -1 : hit > m->sel ? 1 : 0;
   }
   if (m->screen == MENU_MODE) {
@@ -5620,14 +7024,82 @@ static int tg_gem(const menu_state *m) {
   return p[0] == 'g' && p[1] == 'e' && p[2] == 'm';
 }
 
+/* User-confirmed restriction applies only to the original R35, not SpecV or gem cars.
+ * The first colour's pack is the generated car-folder identity, not a wheel alias. */
+static int tg_wheels_only(const menu_state *m) {
+  const cardb_car *c = chosen_car(m, m->car);
+  return c->ncolors > 0 && strcmp(CARDB_PACKS[c->colors[0].pack], "nis_R35") == 0;
+}
+
 void menu_dress_win(menu_state *m, int wins) {
   int mk = m->maker, c = m->car, gem = tg_gem(m);
+  if (m->n_dress_due && (m->dress_due_maker != mk || m->dress_due_car != c))
+    m->n_dress_due = 0;
+  if (!m->n_dress_due) m->dress_due_maker = mk, m->dress_due_car = c;
   for (int k = 0; k < wins && m->dress_lv[mk][c] < 63; ++k) {
     int lv = ++m->dress_lv[mk][c];
     /* every part but the gem cars' empty levels (kind 9) comes up on its GET screen */
-    if (DRESS_LADDER[gem][lv][0] != 9 && m->n_dress_due < MENU_DRESS_DUE) m->dress_due[m->n_dress_due++] = lv;
+    if (DRESS_LADDER[gem][lv][0] != 9 && (!tg_wheels_only(m) || DRESS_LADDER[gem][lv][0] == 0) &&
+        m->n_dress_due < MENU_DRESS_DUE) m->dress_due[m->n_dress_due++] = lv;
     /* a wheel won is chosen on its change screen after its GET (tg_wheel_open) */
     m->garage_changed = 1;
+  }
+}
+
+/* Ordinary Target point_calc at 0x85df20c and level_to_point at 0x88ea64c.
+ * Compare GetTargetLevelMenu ranks, not the native AI difficulty level. */
+static int ghost_result_points(int level, int gem, int won, int rank_gap) {
+  int base = level < 10 ? 1000 : level < 20 ? 500 : level < 30 ? 340 : level < 40 ? 250 : 200;
+  if (gem) {
+    switch (level) {
+      case 0: base = 1000; break;
+      case 1: base = 500; break;
+      case 15: case 20: case 25: base = 100; break;
+      case 30: case 46: case 50: base = 50; break;
+      case 35: base = 34; break;
+      case 40: base = 25; break;
+      default: base = 200; break;
+    }
+  }
+  if (!won) return rank_gap < 0 ? 0 : base / 2;
+  if (rank_gap > 0) return base * 3 / 2;
+  if (rank_gap == 0) return base;
+  return rank_gap >= -3 ? base / 2 : 0;
+}
+
+void menu_finish_ghost(menu_state *m, int result, int goal, float gap, int player_rank, int rival_rank) {
+  if (m->finish || (result != MENU_GHOST_RESULT_WIN && result != MENU_GHOST_RESULT_LOSE)) return;
+  menu_finish_open(m, goal, NULL);
+  m->finish_ghost = m->ghost.result = result;
+  m->st_gap = isfinite(gap) ? gap : 0;
+  m->st_show = m->st_prev = m->st_gain = 0;
+  int mk = m->maker, c = m->car;
+  int own = m->own_sel;
+  if (!goal || m->save_skip || own < 0 || own >= m->n_own ||
+      m->own[own].maker != mk || m->own[own].car != c ||
+      player_rank < 0 || player_rank > 8 || rival_rank < 0 || rival_rank > 8) return;
+
+  int level = m->dress_lv[mk][c];
+  if (level < 0 || level >= 63) return; /* all parts owned in the port's save schema */
+  int gem = tg_gem(m), won = result == MENU_GHOST_RESULT_WIN;
+  int points = m->dress_points[mk][c];
+  int gain = ghost_result_points(level, gem, won, rival_rank - player_rank);
+  m->st_show = !tg_wheels_only(m);
+  m->st_prev = points;
+  m->st_gain = gain < 1000 - points ? gain : 1000 - points;
+  if (!m->st_gain) return;
+  int total = points + m->st_gain;
+  m->dress_points[mk][c] = (unsigned short)(total == 1000 ? 0 : total);
+  m->garage_changed = 1;
+  if (total == 1000) {
+    static const int gem_levels[] = {1, 5, 10, 15, 20, 25, 30, 35, 40, 46, 50, 63};
+    int next = level + 1;
+    if (gem) {
+      for (size_t i = 0; i < sizeof gem_levels / sizeof *gem_levels; ++i) {
+        if (gem_levels[i] > level) { next = gem_levels[i]; break; }
+      }
+    }
+    menu_dress_win(m, next - level);
   }
 }
 
@@ -5715,6 +7187,14 @@ static void tg_aero_open(menu_state *m) {
 
 /* after a race (or the story's tuning screen): the dress-up screens due, else the mode select */
 static int tg_due(menu_state *m) {
+  if (m->n_dress_due && (m->dress_due_maker != m->maker || m->dress_due_car != m->car))
+    m->n_dress_due = 0;
+  /* Recheck at consumption as well: never open an ineligible old queued reward. */
+  while (m->n_dress_due && tg_wheels_only(m) &&
+         (m->dress_due[0] < 1 || m->dress_due[0] > 63 || DRESS_LADDER[0][m->dress_due[0]][0] != 0)) {
+    for (int i = 1; i < m->n_dress_due; ++i) m->dress_due[i - 1] = m->dress_due[i];
+    --m->n_dress_due;
+  }
   if (!m->n_dress_due) return 0;
   m->dress_free = 0;
   tg_get_open(m);
@@ -6408,6 +7888,7 @@ static void tg_free_leave(menu_state *m) {
 }
 
 static void tg_leave(menu_state *m) {
+  if (m->game == MENU_GAME_GHOST) { menu_ghost_open(m); return; }
   go(m, MENU_GAME);
   m->sel = game_slot(m->game);
   m->slide = m->card_t = 0;
@@ -6448,6 +7929,7 @@ static void tg_maker_open(menu_state *m);
  * SE 0x1b too */
 static int tg_sel_open_ok(const menu_state *m, int kind) {
   int mk = m->maker, c = m->car, lv = m->dress_lv[mk][c];
+  if (tg_wheels_only(m) && kind != 0 && kind != 9) return 0;
   if (!tg_sel_ported(kind)) return 0;
   if (kind != 0 && kind != 1 && kind != 2) return 1;
   int on = kind == 0 ? m->wheel[mk][c] : kind == 1 ? m->aero[mk][c] : m->bonnet[mk][c];
@@ -6469,11 +7951,14 @@ static int tg_kept(menu_state *m, int old, int now) {
 }
 
 static void tg_select_open(menu_state *m) {
+  m->body_tab_focus = 0;
   int gem = tg_gem(m);
   go(m, MENU_TG_SELECT);
   m->tg.gem = gem;
   for (int i = 0; i < TG_SEL_PLACES[gem]; ++i)
     if (TG_SEL_KIND[gem][i] == m->dress_kind) m->sel = i;
+  /* Use the two original resting frames, not a slide through hidden options. */
+  if (tg_wheels_only(m)) m->sel = !tg_sel_open_ok(m, 0) || m->dress_kind == 9 ? 0 : 2;
   m->from = m->sel;
   m->tg.move = m->tg.move_t = m->tg.decided = m->tg.rest_t = 0;
   m->card_t = 0;
@@ -6493,14 +7978,20 @@ static int tg_sel_frame(const menu_state *m) {
 
 /* the place a tap is on (the chosen one's picture is big: the others' first), else -1 */
 static int tg_sel_hit(const menu_state *m) {
-  int gem = m->tg.gem, f = tg_sel_frame(m), hit = -1;
+  int gem = m->tg.gem, f = tg_sel_frame(m);
+  float scale = body_row_scale(m), dx = body_row_x(m, scale);
+  float dy = 343.0f * (1.0f - scale);
   for (int i = 0; i < TG_SEL_PLACES[gem]; ++i) {
     float r[4];
-    if (anm_sprite_rect(ID.tg_all[gem], f, anm_sprite(TG_SEL_ICON[gem][i]), r) && near_rect(m, r, 0, 6.0f) &&
-        (hit < 0 || i != m->sel))
-      hit = i;
+    if (tg_wheels_only(m) && (i != 0 && (i != 2 || !tg_sel_open_ok(m, 0)))) continue;
+    if (!anm_sprite_rect(ID.tg_all[gem], f, anm_sprite(TG_SEL_ICON[gem][i]), r)) continue;
+    /* The native 256px textures' visible cards occupy the middle 94x79. */
+    float w = (r[2] - r[0]) / 256.0f, h = (r[3] - r[1]) / 256.0f;
+    float card[4] = {dx+(r[0]+80*w)*scale,dy+(r[1]+88*h)*scale,
+                     dx+(r[0]+176*w)*scale,dy+(r[1]+169*h)*scale};
+    if (near_rect(m, card, 0, 2.0f)) return i;
   }
-  return hit;
+  return -1;
 }
 
 /* a move under way (+1, -1) over TG_SEL_SLIDE frames, or a tap or key's step or decision */
@@ -6528,7 +8019,41 @@ static int tg_sel_move(menu_state *m, int places, int tap, int key, int (*hit)(c
 }
 
 static void tg_select_step(menu_state *m, int tap, int key) {
-  if (!tg_sel_move(m, TG_SEL_PLACES[m->tg.gem], tap, key, tg_sel_hit)) return;
+  /* An additional PORT tab; m->sel stays inside the original native places. */
+  if (m->dress_free && !m->tg.move && m->card_t >= TG_FADE) {
+    int tab = tap && body_tab_hit(m);
+    if (tab) {
+      if (!body_available(m)) { snd_menu(SND_CANCEL); return; }
+      if (!m->body_tab_focus) { m->body_tab_focus = 1; snd_menu(SND_CURSOR); }
+      else if (body_open(m)) snd_menu(SND_SELECT);
+      return;
+    }
+    if (m->body_tab_focus) {
+      if (key < 0) { m->body_tab_focus = 0; snd_menu(SND_CURSOR); ++m->card_t; return; }
+      if (tap && tg_sel_hit(m) >= 0) m->body_tab_focus = 0;
+      else { ++m->card_t; return; }
+    } else if (key > 0 && m->sel == TG_SEL_PLACES[m->tg.gem]-1 && body_available(m)) {
+      m->body_tab_focus = 1; snd_menu(SND_CURSOR); ++m->card_t; return;
+    }
+  }
+  if (tg_wheels_only(m)) {
+    ++m->card_t;
+    if (m->card_t < TG_FADE || (!tap && !key)) return;
+    int target = key < 0 ? 0 : key > 0 ? 2 : tg_sel_hit(m);
+    if (target < 0 || (target == 2 && !tg_sel_open_ok(m, 0))) return;
+    if (target != m->sel) {
+      snd_menu(SND_CURSOR);
+      m->from = m->sel = target;
+      m->tg.move = m->tg.move_t = 0;
+      m->tg.rest_t = m->card_t;
+      return;
+    }
+    /* Direction keys navigate only; a tap on the selected icon confirms. */
+    if (key) return;
+  } else {
+    if (tap && !key && !m->tg.move && tg_sel_hit(m) < 0) { ++m->card_t; return; }
+    if (!tg_sel_move(m, TG_SEL_PLACES[m->tg.gem], tap, key, tg_sel_hit)) return;
+  }
   if (!tg_sel_open_ok(m, TG_SEL_KIND[m->tg.gem][m->sel])) {
     snd_menu(SND_CANCEL);
     return;
@@ -6542,8 +8067,24 @@ static void draw_tg_select(const menu_state *m, int bars, void (*draw3d)(void *)
   anm_draw(ID.tg_bg1, 0, 1);
   anm_draw_xy(ID.tg_bg3, 0, 1, 20, 130, 1, 0.5f, 0, 0);
   if (draw3d) draw3d(ctx);
-  anm_swap dodai = { anm_sprite(T_SEL_DODAI), -1 };
-  anm_draw_ex(ID.tg_all[m->tg.gem], tg_sel_frame(m), 1, 0, 0, &dodai, 1);
+  anm_swap sw[14] = { { anm_sprite(T_SEL_DODAI), -1 } };
+  int n = 1;
+  if (tg_wheels_only(m)) {
+    for (int i = 0; i < TG_SEL_PLACES[0]; ++i)
+      if (i != 0 && (i != 2 || !tg_sel_open_ok(m, 0)))
+        sw[n++] = (anm_swap){ anm_sprite(TG_SEL_ICON[0][i]), -1 };
+    /* The native arrows describe all nine positions, so would be misleading. */
+    sw[n++] = (anm_swap){ anm_sprite(T_ARROW), -1 };
+  }
+  if (m->body_tab_focus) {
+    sw[n++] = (anm_swap){ anm_sprite(4954), -1 };
+    sw[n++] = (anm_swap){ anm_sprite(7355), -1 };
+    sw[n++] = (anm_swap){ anm_sprite(T_ARROW), -1 };
+  }
+  float scale = body_row_scale(m);
+  anm_draw_xy(ID.tg_all[m->tg.gem], tg_sel_frame(m), 1, body_row_x(m, scale),
+              343.0f * (1.0f - scale), scale, scale, sw, n);
+  body_tab_draw(m);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_SEL_MES) };
   draw_topbar(bars, 1, &mes);
   anm_draw(ID.bottom, bars, 1);
@@ -6553,6 +8094,7 @@ static void draw_tg_select(const menu_state *m, int bars, void (*draw3d)(void *)
  * set's, the bonnet's, wing's or mirror's change; Refuse to change: the game mode select */
 static void tg_select_done(menu_state *m) {
   int kind = TG_SEL_KIND[m->tg.gem][m->sel];
+  if (tg_wheels_only(m) && (kind != 9 && (kind != 0 || !tg_sel_open_ok(m, 0)))) { tg_select_open(m); return; }
   m->dress_kind = kind;
   m->tg.kind = kind;
   if (kind == 9) {
@@ -7712,12 +9254,8 @@ static void draw_tg_aero(const menu_state *m, int clock, float fade, int bars, v
   anm_draw(ID.bottom, bars, fade);
 }
 
-/* ---- the versus (MENU_VS, the port's own screen, no arcade sprites but its top bar's title:
- * hud.c's panels and 5x7 text), for the kind the versus select chose (MENU_VS_SEL). Left over
- * Bluetooth or the LAN the games found nearby (a tap joins) and HOST A GAME; over a server its
- * address with a keypad and CONNECT. Right the lobby's players, then the host's start ramp
- * (the arcade's join ramps, clRaceThread::initJoin's table) and distance, and START. Taps in
- * the menus' points (1024 x 768). */
+/* MENU_VS shows nearby rooms and hosting controls for LAN, or a managed
+ * connection for online play. The right side lists players and host controls. */
 static const char *const VS_RAMPS[MENU_VS_RAMPS] = {
   "C1 INNER - KANDABASHI", "C1 OUTER - KANDABASHI", "C1 INNER - SHIODOME", "C1 OUTER - SHIBAKOEN",
   "NEW BELT IN - ARIAKE", "NEW BELT OUT - KIBA", "WANGAN OUT - 13GOCHI", "WANGAN IN - DAIKOKU",
@@ -7779,35 +9317,31 @@ void menu_name_ascii(const menu_state *m, char *out, int n) {
   out[k < n ? k : n - 1] = 0;
 }
 
-/* menupack.py's VS_TEXT_BASE (the top bar's VERSUS, then BLUETOOTH, LAN and ONLINE VERSUS),
+/* menupack.py's VS_TEXT_BASE (VERSUS at +0, LAN and ONLINE at +2/+3),
  * VS_ICON_BASE and VS_LINE_BASE (the versus select's discs, tools/vsdiscs.py) */
 #define VS_TEXT 107000
 #define VS_ICON 107010
 #define VS_LINE 107020
-enum { VS_KEYS = 12, VS_CONNECT = VS_KEYS, VS_RAMP_L, VS_RAMP_R, VS_KM_L, VS_KM_R, VS_START, VS_BUTTONS };
+enum { VS_CONNECT = MENU_VS_FOUND, VS_RAMP_L, VS_RAMP_R, VS_KM_L, VS_KM_R, VS_START, VS_BUTTONS };
 #define VS_LEFT 60.0f
 #define VS_RIGHT 520.0f
 #define VS_RIGHT_W 460.0f
 #define VS_ROW_Y 165.0f
 #define VS_ROW_H 54.0f
 
-/* a button's place: under VS_KEYS the server's keypad, or the games found nearby's rows */
-static void vs_button(const menu_state *m, int b, float r[4]) {
-  if (b < VS_KEYS && m->vs.kind != MENU_VS_NET) {
+/* Nearby LAN rooms occupy the rows before the fixed room controls. */
+static void vs_button(int b, float r[4]) {
+  if (b < VS_CONNECT) {
     r[0] = VS_LEFT, r[1] = 186.0f + (float)b * 64.0f, r[2] = 410.0f, r[3] = 56.0f;
     return;
   }
-  if (b < VS_KEYS) {
-    r[0] = VS_LEFT + (float)(b % 3) * 140.0f, r[1] = 250.0f + (float)(b / 3) * 64.0f, r[2] = 130.0f, r[3] = 56.0f;
-    return;
-  }
-  static const float R[VS_BUTTONS - VS_KEYS][4] = {
+  static const float R[VS_BUTTONS - VS_CONNECT][4] = {
     { VS_LEFT, 512, 410, 56 },        /* CONNECT */
     { VS_RIGHT, 436, 64, 52 }, { VS_RIGHT + VS_RIGHT_W - 64, 436, 64, 52 }, /* the ramp */
     { VS_RIGHT, 500, 64, 52 }, { VS_RIGHT + VS_RIGHT_W - 64, 500, 64, 52 }, /* the distance */
     { VS_RIGHT, 568, VS_RIGHT_W, 58 }, /* START */
   };
-  memcpy(r, R[b - VS_KEYS], sizeof R[0]);
+  memcpy(r, R[b - VS_CONNECT], sizeof R[0]);
 }
 
 /* a lobby row's name in the arcade's glyphs (from a build that sends them, a menu.bin with them) */
@@ -7820,47 +9354,28 @@ static int vs_host(const menu_state *m) { return m->vs.state == MENU_VS_LOBBY &&
 /* which of the screen's buttons is at (x, y) and on now: its number, -1 none */
 static int vs_hit(const menu_state *m, float x, float y) {
   for (int b = 0; b < VS_BUTTONS; ++b) {
-    if (b < VS_KEYS && m->vs.state != MENU_VS_OFF) continue;
-    if (b < VS_KEYS && m->vs.kind != MENU_VS_NET && b >= m->vs.n_found) continue;
+    if (b < VS_CONNECT && (m->vs.state != MENU_VS_OFF ||
+        m->vs.kind != MENU_VS_LAN || b >= m->vs.n_found)) continue;
     if (b > VS_CONNECT && !vs_host(m)) continue;
     if (b == VS_RAMP_L || b == VS_RAMP_R) continue; /* the area is voted (MENU_VS_AREA) */
     float r[4];
-    vs_button(m, b, r);
+    vs_button(b, r);
     if (x >= r[0] - 6 && x < r[0] + r[2] + 6 && y >= r[1] - 4 && y < r[1] + r[3] + 4) return b;
   }
   return -1;
 }
 
-static void vs_step(menu_state *m, int back) {
+static void vs_step(menu_state *m) {
   int tap = m->vs.tap;
   m->vs.tap = 0;
-  if (m->vs.state >= MENU_VS_LOADING) return; /* the race is on its way */
-  if (back) {
-    snd_menu(SND_CANCEL);
-    m->vs.connect = -1;
-    go(m, MENU_VS_SEL);
-    return;
-  }
-  if (!tap) return;
+  if (m->vs.state >= MENU_VS_LOADING || !tap) return;
   int b = vs_hit(m, m->vs.tap_x, m->vs.tap_y);
   if (b < 0) return;
-  size_t len = strlen(m->vs.ip);
-  if (b < VS_KEYS && m->vs.kind != MENU_VS_NET) {
-    /* a game found nearby: join it */
+  if (b < VS_CONNECT) {
     m->vs.join = b + 1;
     snd_menu(SND_SELECT);
-  } else if (b < VS_KEYS) {
-    static const char KEY[VS_KEYS] = { '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', 0 };
-    if (!KEY[b]) {
-      if (len) m->vs.ip[len - 1] = 0;
-    } else if (len < sizeof m->vs.ip - 1) {
-      m->vs.ip[len] = KEY[b];
-      m->vs.ip[len + 1] = 0;
-    }
-    snd_menu(SND_CURSOR);
   } else if (b == VS_CONNECT) {
-    if (m->vs.state == MENU_VS_OFF && !len && m->vs.kind == MENU_VS_NET) return;
-    m->vs.connect = m->vs.state == MENU_VS_OFF ? 1 : -1;
+    m->vs.connect = m->vs.state == MENU_VS_OFF ? 1 : MENU_VS_DISCONNECT;
     snd_menu(m->vs.connect > 0 ? SND_SELECT : SND_CANCEL);
   } else if (b == VS_RAMP_L || b == VS_RAMP_R) {
     m->vs.ramp = (m->vs.ramp + (b == VS_RAMP_L ? MENU_VS_RAMPS - 1 : 1)) % MENU_VS_RAMPS;
@@ -7889,13 +9404,31 @@ static const char *vs_place_name(int place) {
   return s;
 }
 
+/* clSeqJoWaitThread (0x105/0x106): menu_layout_wait_2 contains a single
+ * unchanged 512x128 sprite at (64,176) in menu coordinates. */
+static void draw_vs_wait(float screen_w, float screen_h) {
+  anm_fill(0, 0, 0, 1);
+  int wait = anm_sprite(0x3a7);
+  if (wait >= 0) {
+    anm_draw_sprite(wait, 64, 176, 1);
+    return;
+  }
+  /* Prepared menu packs from before the wait sprite was imported. */
+  hud_ui_begin(screen_w, screen_h);
+  const char *label = "PLEASE WAIT";
+  const float px = 3.0f;
+  vs_label(label, (screen_w - hud_ui_text_width(label, px)) * 0.5f,
+           (screen_h - 7.0f * px) * 0.5f, px, 1);
+  hud_ui_end();
+  draw_pre_loading(LOADING_POP, 1);
+}
+
 /* The race's loading after the votes (the arcade goes from them to the race's loading, the
  * lobby not again): the race's title page as the time attack's (the course, the time zone,
  * this player's song), NOW LOADING bottom left; loaded first, waiting for the others' */
 static void draw_vs_loading(const menu_state *m, int clock, float screen_w, float screen_h) {
-  /* (black while the cars flying in first come in) */
   if (m->vs.match_n >= 2 && !m->vs.match_played) {
-    anm_fill(0, 0, 0, 1);
+    draw_vs_wait(screen_w, screen_h);
     return;
   }
   float fade = m->t < FADE ? (float)(m->t + 1) / FADE : 1.0f;
@@ -7903,7 +9436,7 @@ static void draw_vs_loading(const menu_state *m, int clock, float screen_w, floa
   if (!m->vs.loaded) {
     int f = m->t + 1;
     float a = f > LOADING_POP ? 0.725f + 0.275f * cosf((float)(f - LOADING_POP) * (2.0f * (float)M_PI / 60.0f)) : 1.0f;
-    anm_draw_xf(ID.loading, f < LOADING_POP ? f : LOADING_POP, a * fade, LOADING_PRE_DX, 0, 1, NULL, 0);
+    draw_pre_loading(f < LOADING_POP ? f : LOADING_POP, a * fade);
   } else if (m->vs.wait_others) {
     static const char *const WAIT[4] = { "WAITING FOR THE OTHER PLAYER", "WAITING FOR THE OTHER PLAYER.",
                                          "WAITING FOR THE OTHER PLAYER..", "WAITING FOR THE OTHER PLAYER..." };
@@ -7920,10 +9453,14 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
     draw_vs_loading(m, clock, screen_w, screen_h);
     return;
   }
+  if (menu_vs_round_active(m) && m->vs.flow_stage == MENU_VS_FLOW_READY && !m->vs.round_cancel) {
+    draw_vs_wait(screen_w, screen_h);
+    return;
+  }
   float fade = m->t < FADE ? (float)(m->t + 1) / FADE : 1.0f;
   draw_back(ID.bg, clock % 600, 1);
   anm_draw(ID.line, 0, 1);
-  anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(VS_TEXT + 1 + m->vs.kind) };
+  anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(VS_TEXT + 2 + m->vs.kind) };
   draw_topbar(bars, 1, &title);
   anm_draw(ID.bottom, bars, 1);
   hud_ui_begin(screen_w, screen_h);
@@ -7931,27 +9468,12 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
   float r[4];
   int off = m->vs.state == MENU_VS_OFF;
   if (m->vs.kind == MENU_VS_NET) {
-    /* the server */
-    vs_label("SERVER ADDRESS", VS_LEFT, 160, 2.5f, 0.85f);
-    hud_ui_rect(VS_LEFT, 182, 410, 56, 0, 0, 0, 0.55f);
-    char ip[24];
-    int caret = off && (clock / 30) % 2;
-    snprintf(ip, sizeof ip, "%s_", m->vs.ip);
-    /* as big as fits the box, the caret's room kept (a long address overflowed it: Allan, 10-26) */
-    float px = fminf(5.0f, (410.0f - 28.0f) / hud_ui_text_width(ip, 1.0f));
-    if (!caret) ip[strlen(ip) - 1] = 0;
-    hud_ui_text(ip[0] ? ip : " ", VS_LEFT + 14, 182.0f + (56.0f - 7.0f * px) * 0.5f, px, 1, 1, 1, off ? 1.0f : 0.7f);
-    for (int b = 0; b < VS_KEYS && off; ++b) {
-      static const char *const LABEL[VS_KEYS] = { "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "DEL" };
-      vs_button(m, b, r);
-      hud_ui_button(r[0], r[1], r[2], r[3], m->vs.held == b + 1);
-      vs_centred(LABEL[b], r, b == 11 ? 3.5f : 4.5f, 1, 1, 1, 0.95f);
-    }
+    vs_label("ONLINE MATCHMAKING", VS_LEFT, 160, 2.5f, 0.85f);
+    if (off) vs_label("CONNECT TO FIND PLAYERS", VS_LEFT, 202, 2.5f, 0.7f);
   } else {
-    /* the games nearby (Bluetooth: the devices hosting one), a tap joins; or host one */
     vs_label(off ? "GAMES NEARBY" : m->vs.hosting ? "HOSTING A GAME" : "JOINED A GAME", VS_LEFT, 160, 2.5f, 0.85f);
     for (int b = 0; b < MENU_VS_FOUND && off; ++b) {
-      vs_button(m, b, r);
+      vs_button(b, r);
       if (b < m->vs.n_found) {
         hud_ui_button(r[0], r[1], r[2], r[3], m->vs.held == b + 1);
         hud_ui_text(m->vs.found[b], r[0] + 16, r[1] + 17, 3.0f, 1, 1, 1, 0.95f);
@@ -7963,9 +9485,9 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
       }
     }
     if (off)
-      hud_ui_text(m->vs.kind == MENU_VS_BT ? "BLUETOOTH ON BOTH DEVICES" : "THE SAME WI-FI ON EVERY DEVICE", VS_LEFT, 448, 2.0f, 1, 1, 1, 0.6f);
+      hud_ui_text("THE SAME WI-FI ON EVERY DEVICE", VS_LEFT, 448, 2.0f, 1, 1, 1, 0.6f);
   }
-  vs_button(m, VS_CONNECT, r);
+  vs_button(VS_CONNECT, r);
   hud_ui_button(r[0], r[1], r[2], r[3], m->vs.held == VS_CONNECT + 1);
   const char *act = m->vs.kind == MENU_VS_NET ? (off ? "CONNECT" : "DISCONNECT")
                     : off                     ? "HOST A GAME"
@@ -7993,12 +9515,12 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
     }
     if (!vs_glyphs(m, i)) hud_ui_text(m->vs.name[i], VS_RIGHT + 60, y + 7, 3.5f, 1, 1, 1, 1);
     hud_ui_text(m->vs.car[i], VS_RIGHT + 60, y + 35, 2.0f, 0.8f, 0.85f, 0.95f, 0.9f);
-    const char *tag = m->vs.racing[i] ? "RACING" : i == m->vs.host ? "HOST" : "READY";
+    const char *tag = m->vs.racing[i] ? "RACING" : i == m->vs.host ? "HOST" : "IN ROOM";
     hud_ui_text(tag, VS_RIGHT + VS_RIGHT_W - 12 - hud_ui_text_width(tag, 2.5f), y + 19, 2.5f,
                 m->vs.racing[i] ? 1.0f : 0.5f, m->vs.racing[i] ? 0.5f : 1.0f, 0.4f, 1);
   }
-  /* the race: the host chooses */
-  int host = vs_host(m);
+  /* Room distance is configurable before matching; round selection freezes it. */
+  int host = vs_host(m) && !menu_vs_round_active(m);
   vs_label("COURSE / DISTANCE", VS_RIGHT, 414, 2.5f, 0.85f);
   float row[2][4] = { { VS_RIGHT, 436, VS_RIGHT_W, 52 }, { VS_RIGHT, 500, VS_RIGHT_W, 52 } };
   char km[16];
@@ -8008,12 +9530,12 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
     vs_centred(k ? km : "AREA CHOSEN BY MAJORITY", row[k], k ? 3.5f : 2.5f, 1, 1, 1, host || m->vs.state == MENU_VS_LOBBY ? 1 : 0.5f);
     for (int s = 0; host && k && s < 2; ++s) {
       int b = VS_RAMP_L + 2 * k + s;
-      vs_button(m, b, r);
+      vs_button(b, r);
       hud_ui_button(r[0], r[1], r[2], r[3], m->vs.held == b + 1);
       vs_centred(s ? ">" : "<", r, 4.0f, 1, 1, 1, 0.95f);
     }
   }
-  vs_button(m, VS_START, r);
+  vs_button(VS_START, r);
   if (host) {
     int ready = m->vs.n >= 2;
     for (int i = 0; i < m->vs.n; ++i) ready &= !m->vs.racing[i] && !m->vs.mismatch[i];
@@ -8021,7 +9543,9 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
     vs_centred(ready ? "START" : m->vs.n < 2 ? "WAITING FOR PLAYERS" : "WAITING FOR THE RACE", r, ready ? 5.0f : 3.0f, 1, 1, 1,
                ready ? 0.95f : 0.5f);
   } else if (m->vs.state == MENU_VS_LOBBY) {
-    vs_centred("WAITING FOR THE HOST", r, 3.0f, 1, 1, 1, 0.7f);
+    const char *wait = !menu_vs_round_active(m) ? "WAITING FOR MATCHING" : m->vs.round_cancel ?
+                      "CANCELING SELECTION" : "STARTING COURSE VOTE";
+    vs_centred(wait, r, 3.0f, 1, 1, 1, 0.7f);
   }
   hud_ui_end();
   /* the names as the card has them, in font 5's glyphs (over the rows the UI drew; the UI's
@@ -8110,6 +9634,12 @@ int menu_vs_status(const menu_state *m) {
 }
 
 void menu_vs_loading(menu_state *m) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  /* Defense in depth only: APP still requires every frozen participant's
+   * matching READY/profile and a validated current-round GO. */
+  if (m->game == MENU_GAME_VS && !menu_vs_tune_ready(m, m->vs.round, NULL, NULL)) return;
+#endif
+  if (m->vs.round) m->vs.flow_stage = MENU_VS_FLOW_LOADING;
   if (m->screen == MENU_VS_AREA || m->screen == MENU_VS_MATCH || (m->screen == MENU_BGM && m->vs.day)) go(m, MENU_VS);
   m->vs.state = MENU_VS_LOADING;
   m->vs.day = m->vs.loaded = m->vs.wait_others = m->vs.match_played = 0;
@@ -8161,10 +9691,10 @@ int menu_vs_random_card(void) {
 static void area_vote(menu_state *m) {
   snd_menu(SND_SELECT);
   if (m->vs.item == 0) {
-    /* the arcade's omakase is a random area; here it leaves the choice to the others (the
-     * host counts it so: random only when every vote is omakase) */
+    /* Resolve once per player. Count this concrete vote normally; voted==2
+     * changes the original omakase marker animation, not selection authority. */
     m->vs.voted = 2;
-    m->vs.vote = 0;
+    m->vs.vote = vs_omakase_card(m);
   } else {
     m->vs.voted = 1;
     m->vs.vote = m->vs.item;
@@ -8417,7 +9947,7 @@ static int match_scene3d(const menu_state *m, menu_scene *s) {
   memcpy(s->at, bf->at, sizeof s->at);
   for (int i = 0; i < m->vs.match_n && i < MENU_VS_PLAYERS; ++i) {
     int mk = m->vs.match[i].maker, cr = m->vs.match[i].car, co = m->vs.match[i].color;
-    if (mk < 0 || mk >= CARDB_ALL || cr < 0 || cr >= CARDB_NCARS[mk]) mk = m->maker, cr = m->car, co = m->color;
+    if (mk < 0 || mk >= CARDB_ALL || cr < 0 || cr >= CARDB_NCARS[mk] || co<0 || co>=CARDB_CARS[mk][cr].ncolors) { s->n=0;return 0; }
     const cardb_car *c = &CARDB_CARS[mk][cr];
     const cardb_color *col = &c->colors[co >= 0 && co < c->ncolors ? co : 0];
     menu_car *mc = &s->cars[s->n++];
@@ -8426,6 +9956,10 @@ static int match_scene3d(const menu_state *m, menu_scene *s) {
     mc->aero = m->vs.match[i].aero, mc->mirror = m->vs.match[i].mirror, mc->wing = m->vs.match[i].wing;
     mc->bonnet = m->vs.match[i].bonnet, mc->wheel = m->vs.match[i].wheel, mc->neon = m->vs.match[i].neon;
     mc->vinyl = m->vs.match[i].vinyl;
+    if (!m->vs.match[i].base_valid ||
+        !menu_story_body_for_profile(mk,cr,co,m->vs.match[i].base_power,m->vs.match[i].base_handling,0,&mc->story_body.view)) { s->n=0;return 0; }
+    mc->story_body_valid=1;mc->story_body.kind=2;mc->story_body.peer=i;
+    mc->story_body.context=m->screen;mc->story_body.maker=mk;mc->story_body.car=cr;mc->story_body.color=co;
     match_car_matrix(m, i, bf->body, mc->model);
     /* the corners' spin and steer (TIRE_ROT_k * TIRE_k), mirrored with the car */
     mc->turned = 1;
@@ -8563,12 +10097,53 @@ static void step(menu_state *m) {
     }
     return;
   }
+  if (m->screen == MENU_GHOST_PRE) {
+    if (back) {
+      snd_menu(SND_CANCEL);
+      if (m->ghost.choose_race_options) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+        pre_race_tune_clear(&m->pre_tune);
+#endif
+        ghost_cancel_options(m);
+      } else menu_ghost_open(m); /* invalidates the prepared request and any claim */
+    }
+    return; /* the app supplies readiness; this is not the TA PRE state */
+  }
+  if (m->screen == MENU_GHOST) {
+    if(back) {
+      if(!ghost_back_page(m)) {
+        m->ghost.claim_eligible=m->ghost.claim_pending=0;
+        m->tap=m->key=m->key_held=0;
+        snd_menu(SND_CANCEL);car_select_enter(m,MENU_GAME);
+      }
+      return;
+    }
+    if(m->ghost.status!=MENU_GHOST_BUSY && !m->ghost.active_request) {
+      if(key)ghost_input(m,key<0?1000:1001);
+      else if(tap) {
+        if(m->ghost.ui.page==GHOST_UI_RESULT)menu_ghost_open(m);
+        else if(m->ghost.ui.page==GHOST_UI_NAME)ghost_name_input(m,ghost_name_touch_code(m,m->tap_x,m->tap_y));
+        else ghost_choose(m);
+      }
+    }
+    ghost_step(m);
+    return; /* APP consumes asks; never legacy PRE/TA or a VS lobby */
+  }
+  if (back && m->screen == MENU_VS) {
+    m->vs.connect = MENU_VS_LEAVE;
+    snd_menu(SND_CANCEL);
+    return;
+  }
+  if (back && vs_flow_request_cancel(m)) { snd_menu(SND_CANCEL); return; }
+  if (m->screen == MENU_VS && menu_vs_round_active(m)) {
+    if (m->vs.round_cancel || !m->vs.area_go) return;
+  }
   if (m->screen == MENU_VS && m->vs.area_go) {
     vs_area_enter(m);
     return;
   }
   if (m->screen == MENU_VS) {
-    vs_step(m, back);
+    if (m->vs.connect >= 0) vs_step(m);
     return;
   }
   if (m->screen == MENU_VS_AREA) {
@@ -8588,15 +10163,17 @@ static void step(menu_state *m) {
     }
     return;
   }
+  if (m->screen == MENU_BODY_COLOR) {
+    body_step(m, tap, key, back);
+    return;
+  }
   if (m->deciding) {
     m->deciding--;
     return;
   }
   if (m->screen == MENU_INFO) {
-    if (back || tap) {
-      snd_menu(SND_CANCEL);
-      go(m, MENU_SAVE);
-    }
+    /* Old transient UI state cannot reopen the removed port-information page. */
+    save_enter(m);
     return;
   }
   if (m->screen == MENU_SAVE) {
@@ -8842,12 +10419,24 @@ static void step(menu_state *m) {
     m->spin -= 0.3f;
     if (key && pre_race_tune_step(&m->pre_tune, -key)) snd_menu(SND_CURSOR);
     if (tap && m->tap_x >= SET_CAR_X0 && m->tap_x < SET_CAR_X1 &&
-        m->tap_y >= SET_CAR_Y0 && m->tap_y < SET_CAR_Y1 && pre_race_tune_confirm(&m->pre_tune)) {
-      snd_menu(SND_SELECT); m->deciding = FADE;
+        m->tap_y >= SET_CAR_Y0 && m->tap_y < SET_CAR_Y1) {
+      if (m->pre_tune_origin == MENU_VS) {
+        int p, h;
+        if (menu_vs_tune_draft(m, m->vs.round, &p, &h) &&
+            menu_vs_tune_accept(m, m->vs.round, p, h)) snd_menu(SND_SELECT);
+      } else if (pre_race_tune_confirm(&m->pre_tune)) {
+        snd_menu(SND_SELECT);
+        m->deciding = FADE;
+      }
     }
     return;
   }
 #endif
+  if (back && m->screen==MENU_BGM && menu_ghost_choosing_options(m)) {
+    snd_menu(SND_CANCEL);
+    ghost_cancel_options(m);
+    return;
+  }
   if (back && m->screen == MENU_BGM && m->story_day_select && m->from < 0 && !m->slide) {
     snd_menu(SND_CANCEL);
     m->story_day_select = 0;
@@ -8970,8 +10559,9 @@ static void step(menu_state *m) {
   }
   if (m->screen == MENU_TEN_COURSE) m->card_t++;
   int ten = m->screen == MENU_TEN_COURSE;
+  if (m->screen == MENU_GAME && !menu_mode_index_valid(m->sel)) return;
   int spin = m->screen == MENU_MODE || m->screen == MENU_GAME || m->screen == MENU_VS_SEL;
-  int move_len = spin ? MOVE_MODE : MOVE_COURSE;
+  int move_len = m->screen == MENU_GAME ? MENU_MODE_SLIDE : spin ? MOVE_MODE : MOVE_COURSE;
   int count = m->screen == MENU_GAME     ? GAME_SLOTS
               : m->screen == MENU_VS_SEL ? MENU_VS_KINDS
               : m->screen == MENU_MODE   ? 2
@@ -8982,7 +10572,13 @@ static void step(menu_state *m) {
     return;
   }
   if (!tap && !key) return;
-  int d = key ? key : tap_dir(m);
+  if (m->screen == MENU_GAME && !key && game_hit(m) < 0) return;
+  int d = key;
+  if (!key && m->screen == MENU_VS_SEL) {
+    int hit = vs_select_hit(m);
+    if (hit < 0) return;
+    d = hit - m->sel;
+  } else if (!key) d = tap_dir(m);
   if (d == 0) {
     snd_menu(SND_SELECT);
     m->deciding = (m->screen == MENU_COURSE || ten ? DECIDE_COURSE : DECIDE_MODE) + FADE;
@@ -9004,13 +10600,22 @@ static void step(menu_state *m) {
   }
 }
 
+static int menu_visual_clock;
+
 int menu_update(menu_state *m, float dt) {
   m->acc += dt;
   if (m->acc > 0.25f) m->acc = 0.25f;
   while (m->acc >= 1.0f / 60.0f) {
     m->acc -= 1.0f / 60.0f;
+    if (m->screen != MENU_TITLE && m->screen != MENU_RANKING &&
+        m->screen != MENU_LOGO && m->screen != MENU_PROLOGUE &&
+        m->screen != MENU_START && m->screen != MENU_MOVIE) ++menu_visual_clock;
     int was_deciding = m->deciding;
     step(m);
+    if (menu_ghost_preparing(m) && m->ready && !m->ghost.pre_go) {
+      m->ghost.pre_go = 1;
+      return 1; /* caller also requires its validated Ghost engine capability */
+    }
     if (was_deciding == 1 && m->deciding == 0) {
       if (m->leaving) {
         /* out of the white, the attract loop again from its title screen */
@@ -9093,9 +10698,10 @@ int menu_update(menu_state *m, float dt) {
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
         if (m->pre_tune_setting) {
           int origin = m->pre_tune_origin;
+          int ghost_options=menu_ghost_choosing_options(m);
           m->pre_tune_setting = 0;
-          go(m, origin == MENU_VS_SEL ? MENU_VS : MENU_PRE);
-          if (origin == MENU_VS_SEL) { m->bars = 1; m->vs.held = 0; }
+          if (origin == MENU_VS) vs_flow_request_cancel(m);
+          else go(m, ghost_options ? MENU_GHOST_PRE : MENU_PRE);
         }
         else
 #endif
@@ -9106,28 +10712,23 @@ int menu_update(menu_state *m, float dt) {
           car_select_enter(m, MENU_GAME);
         }
       } else if (m->screen == MENU_GAME) {
-        m->game = GAME_AT[m->sel];
-        /* the versus shows the save's name, as its card does (a save from before the names
-         * stays PLAYER n there: nothing asked, Allan 10-26) */
-        if (m->game == MENU_GAME_VS) {
-          go(m, MENU_VS_SEL);
-        } else if (m->game == MENU_GAME_STORY) {
-          st_level_enter(m);
-        } else if (m->game == MENU_GAME_TEN) {
-          ten_course_enter(m);
-        } else {
-          car_select_enter(m, MENU_MODE);
+        if (!menu_mode_index_valid(m->sel)) { car_select_enter(m, MENU_GAME); continue; }
+        m->game = GAME_MODE[m->sel].game;
+        switch (m->game) {
+        case MENU_GAME_VS: go(m, MENU_VS_SEL); break;
+        case MENU_GAME_STORY: st_level_enter(m); break;
+        case MENU_GAME_TEN: ten_course_enter(m); break;
+        case MENU_GAME_TA: car_select_enter(m, MENU_MODE); break;
+        case MENU_GAME_GHOST: menu_ghost_open(m); break;
+        default: car_select_enter(m, MENU_GAME); break;
         }
       } else if (m->screen == MENU_VS_SEL) {
         m->vs.kind = m->sel;
-#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
-        if (!pre_tune_enter(m, MENU_VS_SEL, 0, 0))
-#endif
-        {
-          go(m, MENU_VS);
-          m->bars = 1;
-          m->vs.held = 0;
-        }
+        /* Matching/room FIRST; no pre-match power gate. */
+        vs_flow_clear(m);
+        go(m, MENU_VS);
+        m->bars = 1;
+        m->vs.held = 0;
       } else if (m->screen == MENU_MODE) {
         m->official = m->sel;
         go(m, MENU_COURSE);
@@ -9248,7 +10849,7 @@ int menu_update(menu_state *m, float dt) {
         if (!m->vs.day && pre_tune_enter(m, MENU_BGM, bgm_sel, story_day)) { /* edit before PRE */ }
         else
 #endif
-          go(m, MENU_PRE);
+          go(m, menu_ghost_choosing_options(m) ? MENU_GHOST_PRE : MENU_PRE);
       } else if (m->screen == MENU_PRE) {
         return 1;
       }
@@ -9260,7 +10861,7 @@ int menu_update(menu_state *m, float dt) {
 /* frame of the layout animation for the current state */
 static int layout_frame(const menu_state *m, int *arrow) {
   *arrow = -1;
-  if (m->screen == MENU_MODE || m->screen == MENU_GAME || m->screen == MENU_VS_SEL) {
+  if (m->screen == MENU_MODE || m->screen == MENU_VS_SEL) {
     if (m->from >= 0)
       return m->from < m->sel ? m->from * 100 + 91 + m->t : m->sel * 100 + 94 - m->t;
     if (m->deciding) {
@@ -9283,6 +10884,348 @@ static int layout_frame(const menu_state *m, int *arrow) {
   return k * 100 + (m->screen == MENU_TEN_COURSE); /* menu_layout_or_course rests on k*100 + 1 */
 }
 
+/* Draw a natural-aspect sprite inside an author-space rectangle. */
+static void game_sprite(int id, menu_mode_rect r, float alpha) {
+  int sprite = anm_sprite(id);
+  float w = anm_sprite_width(sprite), h = anm_sprite_height(sprite);
+  if (w <= 0.0f || h <= 0.0f || alpha <= 0.0f) return;
+  float k = fminf(r.w / w, r.h / h), dw = w * k, dh = h * k;
+  float src[4] = {0, 0, w, h};
+  float dst[4] = {r.x + (r.w - dw) * 0.5f, r.y + (r.h - dh) * 0.5f,
+                  r.x + (r.w + dw) * 0.5f, r.y + (r.h + dh) * 0.5f};
+  anm_draw_part(sprite, src, dst, alpha);
+}
+
+static void game_text(const char *text, float cx, float y, float px, float alpha) {
+  /* HUD geometry uses 1024x768; every public menu layout here uses 640x480. */
+  const float k = 1024.0f / 640.0f;
+  hud_ui_text(text, cx * k - hud_ui_text_width(text, px) * 0.5f, y * k, px, 1, 1, 1, alpha);
+}
+
+static void game_picture(int id, const float crop[4], float edge, float alpha) {
+  int sprite = anm_sprite(id);
+  float w = anm_sprite_width(sprite), h = anm_sprite_height(sprite);
+  if (alpha <= 0 || crop[0] < 0 || crop[1] < 0 || crop[0] + crop[2] > w || crop[1] + crop[3] > h) return;
+  float src[4]; menu_mode_rect r;
+  if (!menu_mode_picture(crop[2], crop[3], edge, src, &r)) return;
+  src[0] += crop[0]; src[2] += crop[0];
+  src[1] += crop[1]; src[3] += crop[1];
+  float dst[4] = {r.x, r.y, r.x + r.w, r.y + r.h};
+  anm_draw_part(sprite, src, dst, alpha);
+}
+
+static void game_mode_label(int id, menu_mode_rect r, float alpha) {
+  int sprite = anm_sprite(id);
+  /* All three authored mode descriptions share this alpha-content rectangle.
+   * Keeping transparent atlas padding made Japanese text needlessly tiny. */
+  const float src[4] = {86, 2, 426, 62};
+  if (anm_sprite_width(sprite) < src[2] || anm_sprite_height(sprite) < src[3] || alpha <= 0) return;
+  float k = fminf(r.w / (src[2] - src[0]), r.h / (src[3] - src[1]));
+  float w = (src[2] - src[0]) * k, h = (src[3] - src[1]) * k;
+  float x = r.x + (r.w - w) * 0.5f, y = r.y + (r.h - h) * 0.5f;
+  float dst[4] = {x, y, x + w, y + h};
+  anm_draw_part(sprite, src, dst, alpha);
+}
+
+static void draw_game_modes(const menu_state *m, float fade, float screen_w, float screen_h) {
+  menu_mode_rect r[GAME_SLOTS];
+  if (!game_rects(m, r)) return;
+  int selected = m->sel;
+  float edge = anm_edge() * (640.0f / 1024.0f);
+  if (GAME_MODE[selected].picture) game_picture(GAME_MODE[selected].picture, GAME_MODE[selected].picture_crop, edge, fade);
+  for (int k = 0; k < GAME_SLOTS; ++k) {
+    float a = fade;
+    if (k == selected && m->deciding && m->deciding >= FADE) a *= (m->t & 1) ? 0.65f : 1.0f;
+    game_sprite(950, r[k], a);
+    if (GAME_MODE[k].game == MENU_GAME_VS)
+      anm_draw_builtin(ANM_BUILTIN_VS_MODE, r[k].x, r[k].y, r[k].w, r[k].h, a);
+    else game_sprite(GAME_MODE[k].icon, r[k], a);
+  }
+  if (m->from < 0 && !m->deciding && m->t < 60) {
+    float grow = 1.0f + 0.06f * sinf((float)m->t * (float)M_PI / 60.0f);
+    menu_mode_rect ring = r[selected];
+    ring.x -= ring.w * (grow - 1.0f) * 0.5f;
+    ring.y -= ring.h * (grow - 1.0f) * 0.5f;
+    ring.w *= grow; ring.h *= grow;
+    game_sprite(949, ring, fade * (1.0f - (float)m->t / 60.0f));
+  }
+  menu_mode_rect detail = menu_mode_detail(edge);
+  if (GAME_MODE[selected].label) game_mode_label(GAME_MODE[selected].label, detail, fade);
+  else {
+    float cx = detail.x + detail.w * 0.5f;
+    hud_ui_begin(screen_w, screen_h);
+    if (GAME_MODE[selected].game == MENU_GAME_GHOST) {
+      game_text("GHOST BATTLE", cx, detail.y + 12, 2.8f, fade);
+      game_text("CHALLENGE RECORDED RIVALS", cx, detail.y + 40, 1.8f, fade);
+    } else {
+      game_text("VS MODE", cx, detail.y + 8, 3.2f, fade);
+      game_text("RACE LIVE PLAYERS", cx, detail.y + 36, 2.0f, fade);
+      game_text("LAN / ONLINE", cx, detail.y + 58, 1.7f, fade);
+    }
+    hud_ui_end();
+  }
+}
+
+static void ghost_name_template(int anim,int frame,int tmpl,const uint16_t name[5],float fade) {
+  short glyph[5];float r[4];
+  if(!menu_ghost_name_glyphs(glyph,name) || !anm_sprite_rect(anim,frame,anm_sprite(tmpl),r))return;
+  float h=anm_sprite_height(anm_sprite(NAME_GLYPH5)),scale=h>0?(r[3]-r[1])/h:0;
+  if(scale<=0)return;
+  float width=0;for(int i=0;i<5&&glyph[i]>=0;++i)width+=anm_sprite_width(anm_sprite(NAME_GLYPH5+glyph[i]))*scale;
+  float x=(r[0]+r[2]-width)*.5f;
+  for(int i=0;i<5&&glyph[i]>=0;++i) {
+    int sp=anm_sprite(NAME_GLYPH5+glyph[i]);float w=anm_sprite_width(sp),gh=anm_sprite_height(sp);
+    const float src[4]={0,0,w,gh},dst[4]={x,r[1],x+w*scale,r[1]+gh*scale};
+    anm_draw_part(sp,src,dst,fade);x+=w*scale;
+  }
+}
+static const cardb_car *ghost_bound_car(const menu_ghost_directory_area *a) {
+  if (!ghost_profile_area(a)) return NULL;
+  for (int maker=0;maker<CARDB_ALL;++maker) for (int car=0;car<CARDB_NCARS[maker];++car) {
+    const cardb_car *c=&CARDB_CARS[maker][car];
+    for (int color=0;color<c->ncolors;++color)
+      if (c->colors[color].pack==a->pack && c->colors[color].paint==a->base_paint) return c;
+  }
+  return NULL;
+}
+/* CARDB carries the original large car-select logo. Rival template4283 is
+ * 128x32, so contain that real bound identity in its authored bounds rather
+ * than replacing it at the large sprite's native dimensions. No new art/box. */
+static void ghost_logo_template(int anim,int frame,int logo,float fade) {
+  if(logo<0)return;
+  float r[4],w=anm_sprite_width(logo),h=anm_sprite_height(logo);
+  if(w<=0||h<=0||!anm_sprite_rect(anim,frame,anm_sprite(4283),r))return;
+  float z=fminf((r[2]-r[0])/w,(r[3]-r[1])/h);
+  if(z<=0)return;
+  float x=(r[0]+r[2]-w*z)*.5f,y=(r[1]+r[3]-h*z)*.5f;
+  const float src[4]={0,0,w,h},dst[4]={x,y,x+w*z,y+h*z};
+  anm_draw_part(logo,src,dst,fade*anm_sprite_alpha(anim,frame,anm_sprite(4283)));
+}
+/* clSpinBoxRivalStd::init uses template 6673 and switches to raw P/H if
+ * either car is an R35. The packed title font supplies fullwidth glyphs
+ * at the original Font 0 cell size and advance. */
+static void ghost_card_power(const menu_state *m,const menu_ghost_directory_area *area,
+                             const cardb_car *car,int anim,int frame,float fade) {
+  static const char *const grade[]={"DG","D","B","G","HG"};
+  int tmpl=anm_sprite(6673);
+  float r[4],alpha;
+  if (!car || area->power<0 || area->power>CAR_TUNE_MAX ||
+      area->handling<0 || area->handling>CAR_TUNE_MAX ||
+      !anm_sprite_rect_at(anim,frame,tmpl,0,r,&alpha) || alpha<=0) return;
+  int steps=ta_ui_is_r35(area->raw_model) || ta_ui_is_r35(title_model(m->maker,m->car,m->color));
+  char ascii[20];
+  uint16_t text[20];
+  int n=0;
+  if (steps) {
+    snprintf(ascii,sizeof ascii,"P:%2d/H:%2d",area->power,area->handling);
+  } else {
+    snprintf(ascii,sizeof ascii,"%3d",car_tune_hp(car->hp,area->power));
+    for (const char *c=ascii;*c;++c) text[n++]=*c==' '?0:(unsigned char)*c+0xfee0u;
+    text[n++]=0x99ac; /* 馬 */
+    text[n++]=0x529b; /* 力 */
+    snprintf(ascii,sizeof ascii,"/%s",grade[car_tune_grade(area->power,area->handling)]);
+  }
+  for (const char *c=ascii;*c;++c) text[n++]=*c==' '?0:(unsigned char)*c+0xfee0u;
+  float z=(r[2]-r[0])/16.0f,x=(r[0]+r[2]-(15+(n-1)*11)*z)*.5f;
+  float zy=(r[3]-r[1])/16.0f;
+  if (z<=0 || zy<=0) return;
+  for (int i=0;i<n;++i,x+=11*z) {
+    if (!text[i]) continue;
+    int glyph=title_glyph_index(text[i]);
+    int sprite=glyph>=0?anm_sprite(TITLE_GLYPH1+glyph):text[i]==0xff1a?anm_sprite(3795):-1;
+    float w=anm_sprite_width(sprite),h=anm_sprite_height(sprite);
+    if (w<=0 || h<=0) continue;
+    const float src[4]={0,0,w,h},dst[4]={x,r[1],x+15*z,r[1]+15*zy};
+    anm_draw_part(sprite,src,dst,fade*alpha);
+  }
+}
+
+static const int GHOST_DATE_SLOTS[]={6726,6727,6728,6729,6730,6731,6732,6733,6734,6735,6985,6986};
+
+static void ghost_date_digit(int digit,const float dst[4],float fade) {
+  int sprite=anm_sprite(digit<0?4585:1752+digit); /* original 16px date digit table 0x93de3e0 */
+  if (sprite<0 && digit>=0) sprite=anm_sprite(CARD_GLYPH2+digit);
+  float w=anm_sprite_width(sprite),h=anm_sprite_height(sprite);
+  if (w<=0 || h<=0) return;
+  const float src[4]={0,0,w,h};
+  anm_draw_part(sprite,src,dst,fade);
+}
+
+static void ghost_card_date(const menu_ghost_directory_area *area,int anim,int frame,float fade) {
+  if (!area) return;
+  const menu_ghost_record_date *date=&area->recorded;
+  if (!date->year) {
+    /* Centre the requested 1997.1.1 in the authored date line. */
+    static const int fallback[]={1,9,9,7,-1,1,-1,1};
+    float first[4],last[4],alpha;
+    if (!anm_sprite_rect_at(anim,frame,anm_sprite(GHOST_DATE_SLOTS[0]),0,first,&alpha) || alpha<=0 ||
+        !anm_sprite_rect(anim,frame,anm_sprite(6986),last)) return;
+    float w=first[2]-first[0],step=w*.5f;
+    float x=(first[0]+last[2]-(w+7*step))*.5f;
+    for (unsigned i=0;i<sizeof fallback/sizeof *fallback;++i,x+=step) {
+      const float dst[4]={x,first[1],x+w,first[3]};
+      ghost_date_digit(fallback[i],dst,fade*alpha);
+    }
+    return;
+  }
+  unsigned y=date->year,m=date->month,d=date->day;
+  unsigned digit[]={y/1000,y/100%10,y/10%10,y%10,m/10,m%10,d/10,d%10,
+                   date->hour/10,date->hour%10,date->minute/10,date->minute%10};
+  for (unsigned i=0;i<sizeof digit/sizeof *digit;++i) {
+    float dst[4],alpha;
+    if (anm_sprite_rect_at(anim,frame,anm_sprite(GHOST_DATE_SLOTS[i]),0,dst,&alpha) && alpha>0)
+      ghost_date_digit(digit[i],dst,fade*alpha);
+  }
+}
+
+static void draw_ghost_carousel(const menu_state *m,ghost_original_assets assets,float fade) {
+  const ghost_original_ui *u=&m->ghost.ui;
+  static const int level_images[10][3]={{915,3374,6326},{916,3375,6327},{917,3377,6328},
+    {918,3378,6329},{919,3380,6331},{920,3382,6334},{921,3384,6336},
+    {922,3386,6338},{923,2951,2951},{2513,1,1}};
+  int anim=u->page==GHOST_UI_LEVEL?assets.level:assets.rival;
+  if(anim<0)return;
+  int center=u->from>=0?u->from:u->sel;
+  /* Neighbours first, centre last, exactly the source's independent-card layout. */
+  for(int pass=0;pass<2;++pass)for(int item=center-3;item<=center+3;++item) {
+    if(item<0||item>=u->count||(item==u->sel)!=(pass==1))continue;
+    int frame=ghost_original_card_frame(u,item);if(frame<0||frame>=anm_frames(anim))continue;
+    if(u->page==GHOST_UI_LEVEL) {
+      int enabled=ghost_directory_count(m,-1,item)>0;
+      int hp=level_images[item][tg_wheels_only(m)?2:1];
+      anm_swap sw[2]={{anm_sprite(4172),anm_sprite(level_images[item][0])},
+                      {anm_sprite(6635),hp>3?anm_sprite(hp):-1}};
+      anm_draw_ex(anim,frame,enabled?fade:fade*.35f,0,0,sw,2);
+    } else {
+      int index=ghost_directory_index(m,item);if(index<0)continue;
+      const menu_ghost_directory_row *row=&m->ghost.directory.rows[index];
+      const menu_ghost_directory_area *area=m->ghost.area_slot>=0?&row->areas[m->ghost.area_slot]:NULL;
+      const cardb_car *car=ghost_bound_car(area);
+      anm_swap sw[18];int n=0;
+      const int hide[]={892,898,6673,4283};
+      for (unsigned j=0;j<sizeof hide/sizeof *hide;++j) sw[n++]=(anm_swap){anm_sprite(hide[j]),-1};
+      for (unsigned j=0;j<sizeof GHOST_DATE_SLOTS/sizeof *GHOST_DATE_SLOTS;++j)
+        sw[n++]=(anm_swap){anm_sprite(GHOST_DATE_SLOTS[j]),-1};
+      if (!area || !area->recorded.year) {
+        sw[n++]=(anm_swap){anm_sprite(3795),-1};
+        sw[n++]=(anm_swap){anm_sprite(4585),-1};
+      }
+      anm_draw_ex(anim,frame,fade,0,0,sw,n);
+      ghost_logo_template(anim,frame,car?anm_sprite(car->logo):-1,fade);
+      ghost_name_template(anim,frame,898,row->name,fade);
+      ghost_card_power(m,area,car,anim,frame,fade);
+      ghost_card_date(area,anim,frame,fade);
+      if (m->ghost.search_kind==0 && m->ghost.level==9) {
+        const ghost_crown_art *crown=ghost_original_crown((unsigned)m->ghost.area_slot);
+        float name[4];
+        if (crown && anm_sprite_rect(anim,frame,anm_sprite(898),name)) {
+          /* Leave the tune and date rows below the name unobstructed. */
+          float size=fminf(46.0f,name[1]-88.0f);
+          if (size>0)
+            game_sprite(crown->menu,(menu_mode_rect){(name[0]+name[2]-size)*.5f,name[1]-2-size,size,size},fade);
+        }
+      }
+    }
+  }
+  if(u->from<0&&!u->deciding) {
+    int arrow=u->page==GHOST_UI_LEVEL?assets.level_arrows:assets.rival_arrows;
+    int frame=ghost_rival_arrow_frame(u);
+    if(arrow>=0&&frame>=0)anm_draw(arrow,frame,fade);
+  }
+  if(u->page==GHOST_UI_LEVEL && m->ghost.directory.player_level>=0 && assets.your_level>=0) {
+    int d=m->ghost.directory.player_level-u->sel;
+    static const int f[5]={25,45,65,85,105};
+    if(d>=-2&&d<=2)anm_draw(assets.your_level,f[d+2],fade);
+  }
+}
+static void draw_ghost_course(const menu_state *m,ghost_original_assets assets,float fade) {
+  if(assets.course<0 || anm_frames(assets.course)<800)return;
+  anm_swap sw[80];int n=0;
+  /* Whole-area pictures are original run0x8857012..70fd replacements. */
+  for(int i=0;i<8;++i) {
+    int unavailable=anm_sprite(GHOST_COURSE_ART[i].unavailable);
+    sw[n++]=(anm_swap){anm_sprite(GHOST_COURSE_ART[i].picture),anm_sprite(GHOST_COURSE_ART[i].whole_area)};
+    sw[n++]=(anm_swap){unavailable,ghost_course_available(m,i)?-1:unavailable};
+  }
+  /* No crown/history/time/class inference from the archive. These font/crown
+   * templates require separate APP authority and stay absent, not white blocks. */
+  for(int i=1408;i<=1415;++i)sw[n++]=(anm_swap){anm_sprite(i),-1};
+  for(int i=1705;i<=1714;++i)sw[n++]=(anm_swap){anm_sprite(i),-1};
+  for(int i=2646;i<=2652;++i)sw[n++]=(anm_swap){anm_sprite(i),-1};
+  for(int i=1737;i<=1744;++i)sw[n++]=(anm_swap){anm_sprite(i),-1};
+  anm_draw_ex(assets.course,ghost_original_frame(&m->ghost.ui),fade,ghost_original_scroll(&m->ghost.ui),0,sw,n);
+}
+static void draw_ghost_hub(const menu_state *m,int clock,int bars,float screen_w,float screen_h,
+                           void (*draw3d)(void *),void *ctx) {
+  float fade=m->t<FADE?(float)(m->t+1)/FADE:1;
+  draw_back(ID.bg,clock%600,1);anm_draw(ID.line,0,1);
+  const ghost_original_ui *u=&m->ghost.ui;ghost_original_assets a=ghost_original_bind();
+  int title_id=u->page==GHOST_UI_SEARCH?7147:u->page==GHOST_UI_LEVEL?5893:
+               u->page==GHOST_UI_COURSE?6640:u->page==GHOST_UI_NAME?S_NAME_TOPBAR:
+               u->page==GHOST_UI_RIVAL?(m->ghost.search_kind==1?7146:m->ghost.search_kind==2?7373:6839):0x1beb;
+  anm_swap title={anm_sprite(0x1ab5),anm_sprite(title_id)};
+  draw_topbar(bars,1,&title);anm_draw(ID.bottom,bars,1);
+  int frame=ghost_original_frame(u);
+  if(u->page==GHOST_UI_SEARCH && ghost_original_available(a)) {
+    anm_swap unavailable[4];int n=0;
+    int history=ghost_root_available(m,1),revenge=ghost_root_available(m,2);
+    unavailable[n++]=(anm_swap){anm_sprite(0x1cbf),history?-1:anm_sprite(0x767)};
+    unavailable[n++]=(anm_swap){anm_sprite(0x1cbe),revenge?-1:anm_sprite(0x767)};
+    if(!history)unavailable[n++]=(anm_swap){anm_sprite(0x104d),anm_sprite(0x136b)};
+    if(!revenge)unavailable[n++]=(anm_swap){anm_sprite(0x104e),anm_sprite(0x136c)};
+    anm_draw_ex(a.search,frame,fade,0,0,unavailable,n);
+    int arrow=ghost_original_arrow_frame(u);
+    if(arrow>=0)anm_draw(a.arrows,arrow,fade);
+    if(u->from<0&&!u->deciding)anm_draw(a.ring,u->sel*100+1+u->tick%59,fade);
+  } else if(u->page==GHOST_UI_NAME_TYPE) {
+    if(a.name_type>=0)anm_draw(a.name_type,frame,fade);
+    if(a.name_ring>=0&&u->from<0&&!u->deciding)anm_draw(a.name_ring,u->sel*100+1+u->tick%59,fade);
+  } else if(u->page==GHOST_UI_NAME)draw_ghost_name(m,clock,bars);
+  else if(u->page==GHOST_UI_LEVEL||u->page==GHOST_UI_RIVAL) {
+    draw_ghost_carousel(m,a,fade);
+    if(u->page==GHOST_UI_RIVAL && draw3d) draw3d(ctx);
+  }
+  else if(u->page==GHOST_UI_COURSE)draw_ghost_course(m,a,fade);
+  else if(u->page==GHOST_UI_RESULT) {
+    int result=m->ghost.result==MENU_GHOST_RESULT_WIN?ID.win:ID.lose;
+    int len=m->ghost.result==MENU_GHOST_RESULT_WIN?anm_frames(result):ST_LOSE_LEN;
+    int f=m->t;if(result>=0&&len>0)anm_draw(result,f<len?f:len-1,fade);
+  }
+  hud_ui_begin(screen_w,screen_h);
+  if(!ghost_original_available(a))game_text("ORIGINAL GHOST UI RESOURCE UNAVAILABLE",320,210,2.4f,fade);
+  if(u->page==GHOST_UI_RIVAL && m->ghost.directory_row>=0 &&
+     (unsigned)m->ghost.directory_row<m->ghost.directory.count &&
+     m->ghost.directory.rows[m->ghost.directory_row].source_kind==MENU_GHOST_SOURCE_CLOUD)
+    game_text(m->ghost.directory.rows[m->ghost.directory_row].record_index<MENU_GHOST_CLOUD_RECORDS ?
+              "CLOUD REPLAY" : "LOCAL PLAYER REPLAY",320,365,1.8f,fade);
+  if(m->ghost.note[0]) {
+    float width=hud_ui_text_width(m->ghost.note,1);
+    game_text(m->ghost.note,320,410,width>0?fminf(1.9f,568.0f*(1024.0f/640.0f)/width):1.9f,fade);
+  }
+  hud_ui_end();
+  int held=m->ghost.held==1000?-1:m->ghost.held==1001?1:m->key_held;
+  hud_draw_menu_keys(screen_w,screen_h,held,1,1);
+}
+
+static void draw_ghost_pre(const menu_state *m, int clock, float screen_w, float screen_h) {
+  float fade = m->t < FADE ? (float)(m->t + 1) / FADE : 1.0f;
+  draw_back(ID.bg, clock % 600, 1);
+  anm_draw(ID.line, 0, 1);
+  draw_topbar(0, 1, NULL);
+  anm_draw(ID.bottom, 0, 1);
+  game_sprite(2827, (menu_mode_rect){240, 100, 160, 160}, fade);
+  hud_ui_begin(screen_w, screen_h);
+  game_text(m->ghost.completed_action == MENU_GHOST_RECORD_LOCAL ? "RECORD LOCAL GHOST" : "GHOST CHALLENGE", 320, 78, 3.2f, fade);
+  char map[64];
+  snprintf(map, sizeof map, "RAMP %02d / ROUTE %d", m->ghost.request_ramp, m->ghost.request_route);
+  game_text(map, 320, 284, 2.8f, fade);
+  game_text("LOADING VALIDATED GHOST RACE", 320, 316, 2.4f, fade);
+  hud_ui_end();
+  int f = m->t + 1;
+  draw_pre_loading(f < LOADING_POP ? f : LOADING_POP, fade);
+  hud_draw_menu_keys(screen_w, screen_h, m->key_held, 0, 1);
+}
+
 void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3d)(void *), void *ctx,
                void (*mini3d)(void *, float)) {
   photo_bg = 0;
@@ -9296,7 +11239,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     return;
   }
   case MENU_RANKING:
-    draw_ranking(m);
+    draw_ranking(m, screen_w, screen_h);
     return;
   case MENU_LOGO:
     anm_draw(ID.maker[m->t / LOGO_LEN < 3 ? m->t / LOGO_LEN : 2], m->t % LOGO_LEN, 1.0f);
@@ -9311,9 +11254,16 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   float fade = 1.0f;
   if (m->deciding && m->deciding < FADE) fade = (float)m->deciding / FADE;
   /* the backgrounds keep running across screens; the bars slide in when the menus open */
-  static int clock;
-  clock++;
+  int clock = menu_visual_clock;
   int bars = m->bars ? 188 + m->bars : 0;
+  if (m->screen == MENU_BODY_COLOR) {
+    draw_body_color(m, draw3d, ctx);
+    anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(7767) };
+    draw_topbar(bars, 1, &mes); anm_draw(ID.bottom, bars, 1);
+    hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (m->body_edit.confirm > 30) anm_fill(0,0,0,(m->body_edit.confirm-30)/10.0f);
+    return;
+  }
   if (m->screen <= MENU_COLOR) {
     /* the car select fades as the arcade's clMenuFade does, to black over everything */
     draw_car_select(m, clock, draw3d, ctx);
@@ -9378,8 +11328,8 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     return;
   }
   if (m->screen == MENU_INFO) {
-    draw_info(clock, bars);
-    hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    draw_save(m, clock, bars); /* Reserved legacy state renders no declaration. */
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
@@ -9399,6 +11349,9 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     draw_option(m, clock, bars);
     draw_option_layout_key(m, screen_w, screen_h);
     if (m->res_row) draw_option_res(m, screen_w, screen_h);
+#ifdef __ANDROID__
+    draw_option_fps(m, screen_w, screen_h);
+#endif
     hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->gyro == HUD_STEER_GYRO, 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
@@ -9408,7 +11361,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     if (m->t < FADE && !m->deciding) fade = (float)(m->t + 1) / FADE;
     draw_setting(m, clock, draw3d, ctx, bars);
     if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held,
-                                        pre_tune_context(m) || m->tune_full[m->maker][m->car], 1);
+                                        setting_power_selectable(m), 1);
     if (!m->deciding && !m->new_card && !pre_tune_context(m)) hud_draw_menu_dress(screen_w, screen_h, m->key_held == HUD_MENU_OPTION);
     anm_fill(0, 0, 0, 1.0f - fade);
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
@@ -9421,6 +11374,9 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     draw_day_select(m, clock, fade, bars);
     if (!m->deciding && !(m->vs.day && m->vs.day_voted)) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, !m->vs.day);
     if (m->vs.day) draw_vs_omakase(m, screen_w, screen_h);
+#ifdef __ANDROID__
+    draw_vs_day_wait_note(m, screen_w, screen_h);
+#endif
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN); /* back from the race's pause menu */
     return;
   }
@@ -9534,8 +11490,16 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     if (f) {
       float a = m->loading ? 1.0f : 1.0f - (float)m->load_out / LOADING_OUT;
       if (f > LOADING_POP) a *= 0.725f + 0.275f * cosf((float)(f - LOADING_POP) * (2.0f * (float)M_PI / 60.0f));
-      anm_draw_xf(ID.loading, f < LOADING_POP ? f : LOADING_POP, a * fade, LOADING_PRE_DX, 0, 1, NULL, 0);
+      draw_pre_loading(f < LOADING_POP ? f : LOADING_POP, a * fade);
     }
+    return;
+  }
+  if (m->screen == MENU_GHOST_PRE) {
+    draw_ghost_pre(m, clock, screen_w, screen_h);
+    return;
+  }
+  if (m->screen == MENU_GHOST) {
+    draw_ghost_hub(m, clock, bars, screen_w, screen_h, draw3d, ctx);
     return;
   }
   if (m->screen == MENU_VS) {
@@ -9553,26 +11517,28 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   draw_back(ID.bg, clock % 600, fade);
   anm_draw(ID.line, 0, fade);
   draw_bg_logo(chosen_car(m, m->car), clock % 240, fade);
+  if (m->screen == MENU_GAME) {
+    draw_game_modes(m, fade, screen_w, screen_h);
+    draw_topbar(bars, fade, NULL);
+    anm_draw(ID.bottom, bars, fade);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
+    return;
+  }
   int arrow;
   int f = layout_frame(m, &arrow);
-  if (m->screen == MENU_GAME) {
-    anm_draw(ID.game_image, f, fade);
-    anm_draw(ID.game, f, fade);
-    if (m->from < 0 && !m->deciding && m->t < 60) anm_draw(ID.game_ring, m->sel * 100 + m->t, fade);
-  } else if (m->screen == MENU_VS_SEL) {
-    /* the versus' discs in the story's, 10 out run's and time attack's places, the ghost
-     * versus battle's picture behind each, the port's lines under it */
-    static const int ICON[MENU_VS_KINDS] = { 2825, 2824, 2826 }, PIC[MENU_VS_KINDS] = { 3224, 3223, 3225 },
-                     LINE[MENU_VS_KINDS] = { 2317, 2316, 2318 };
-    anm_swap sw[2 * MENU_VS_KINDS];
-    for (int k = 0; k < MENU_VS_KINDS; ++k) {
-      sw[2 * k] = (anm_swap){ anm_sprite(PIC[k]), anm_sprite(3226) };
-      sw[2 * k + 1] = (anm_swap){ anm_sprite(LINE[k]), anm_sprite(VS_LINE + k) };
-    }
-    anm_draw_ex(ID.vs_sel_image, f, fade, 0, 0, sw, 2 * MENU_VS_KINDS);
-    for (int k = 0; k < MENU_VS_KINDS; ++k) sw[k] = (anm_swap){ anm_sprite(ICON[k]), anm_sprite(VS_ICON + k) };
-    anm_draw_ex(ID.vs_sel, f, fade, 0, 0, sw, MENU_VS_KINDS);
-    if (m->from < 0 && !m->deciding && m->t < 60) anm_draw(ID.vs_sel_ring, m->sel * 100 + m->t, fade);
+  if (m->screen == MENU_VS_SEL) {
+    const anm_swap preview[] = {
+      {anm_sprite(3224), anm_sprite(3226)}, {anm_sprite(2317), anm_sprite(VS_LINE + 1)},
+      {anm_sprite(3223), anm_sprite(3226)}, {anm_sprite(2316), anm_sprite(VS_LINE + 2)},
+    };
+    const anm_swap cards[] = {
+      {anm_sprite(2950), anm_sprite(VS_ICON + 1)}, {anm_sprite(4960), anm_sprite(VS_ICON + 2)},
+      {anm_sprite(1716), -1}, {anm_sprite(1717), -1},
+    };
+    anm_draw_ex(ID.vs_sel_image, f, fade, 0, 0, preview, 4);
+    anm_draw_ex(ID.mode, f, fade, 0, 0, cards, 4);
+    if (m->from < 0 && !m->deciding && m->t < 60) anm_draw(ID.mode_ring, m->sel * 100 + m->t, fade);
   } else if (m->screen == MENU_MODE) {
     anm_draw_ex(ID.mode, f, fade, 0, 0, mode_cars, 2);
     if (m->from < 0 && !m->deciding && m->t < 60) anm_draw(ID.mode_ring, m->sel * 100 + m->t, fade);

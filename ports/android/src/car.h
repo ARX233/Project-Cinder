@@ -7,6 +7,9 @@
 #define CAR_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include "ghost_format.h"
+#include "tire_smoke.h"
 
 typedef struct {
   float steer;    /* -1 left .. +1 right */
@@ -14,6 +17,7 @@ typedef struct {
   float brake;    /* 0..1 */
   int shift_up, shift_down; /* edge-triggered requests */
   int analog;     /* steer is the iPad's tilt (the gyro's), not the buttons' */
+  int passing;    /* arcade intrusion button's rising edge, VS only */
 } car_input;
 
 /* the traffic (yt::COtherGen): its four models, in the order of data/othercar's path tables */
@@ -132,6 +136,12 @@ void car_clear_junction(car_race *r);
 typedef struct {
   int valb, backfire;
   float valb_vol, backfire_vol, backfire_hz;
+  int road_hz; /* pending CInfoSEMc road-strip / road-joint one-shot */
+  float road_vol;
+  /* Latest physics snapshot: +0x1d is capability, +0x84 its envelope. */
+  int rev_enabled;
+  unsigned rev_sequence;
+  float rev_vol;
 } car_se;
 
 typedef struct {
@@ -192,6 +202,12 @@ typedef struct {
   unsigned char spot, rival_spot[CAR_RIVALS];
   car_effect effect, rival_effect[CAR_RIVALS];
   car_race race;
+  /* Read-only own-car RollUp inputs from the existing SInfoCarEffect snapshot.
+   * Appended to preserve all preceding host wrapper field offsets. Never sent
+   * back into the native machine or consumed from the native RNG. */
+  TireSmokeInput tire_smoke;
+  uint64_t tire_smoke_tick;
+  int tire_smoke_valid;
 } car_state;
 
 /* the corners: +x is the car's left */
@@ -234,6 +250,172 @@ typedef struct {
   int power, handling;
 } car_spec;
 extern const car_spec CAR_SPEC_FD3S;
+
+/* Game/engine thread only, like the surrounding global RC/car API.
+ * Independent original CTarget Ghost session; never a live VS PCB or an AI
+ * fallback. The app owns UI/cloud authority and must keep this result separate
+ * from story, TA records and VS stars. Native fields below are a reviewed local
+ * ABI binding, NOT a wire format accepted directly from the server. */
+enum { CAR_GHOST_CHALLENGE = 1, CAR_GHOST_QUALIFICATION = 2, CAR_GHOST_DEFAULT = 3 };
+enum { CAR_GHOST_OFF, CAR_GHOST_PREPARED, CAR_GHOST_RUNNING, CAR_GHOST_FINISHED, CAR_GHOST_FAILED };
+#define CAR_GHOST_ABI_VERSION 1u
+
+typedef struct {
+  uint32_t abi_version;
+  uint64_t session_token; /* nonzero, caller's immutable challenge/qualification binding */
+  int kind;
+  car_spec rival; /* challenge only: authentic record owner's car/tune/tyres */
+  const void *trail;
+  size_t trail_bytes; /* copied by prepare; mandatory for CHALLENGE */
+  /* Exact reviewed SConfigRaceField words (stage, native word, area,
+   * start-mm float bits, goal-mm float bits, native on word). prepare rejects
+   * unsupported bindings; an all-zero/default guessed field never starts TA. */
+  uint32_t race_field[6];
+  int trail_band[3]; /* original cfg+c0/c4/c8: target power, handling, age-hours */
+  unsigned char native_flags[2]; /* cfg+d0/d1: hasCrown, firstTutorial; reviewed local binding */
+  /* Recording is independent of loading an opponent: challenge defaults off.
+   * Qualification requires record_player=1 and a supported explicit binding. */
+  int record_player;
+} car_ghost_config;
+
+#define CAR_GHOST_CROWN_RUNOUT_TICKS 90u
+
+typedef struct {
+  int status, kind;
+  uint64_t session_token;
+  int native_target_valid; /* verified non-null Target+valid sampler; never generic rival fallback */
+  int display_valid, result_valid;
+  int place, goal_reached, won; /* zero-based finish order; valid only with result_valid */
+  float gap_m; /* signed advantage in meters; local Crown freezes it at first crossing */
+  float live_gap_mm; /* current Get2DInfoTarget advantage, NAN when no sample was read */
+  uint32_t collision_registrations, native_ticks, finish_tick;
+  int recording, export_ready;
+  int native_default_ai_valid; /* ONLY explicit compiled-default kind3; NOT a sampler or fallback */
+} car_ghost_observation;
+
+/* 1 accepted, 0 fail-closed. Configuration is for the next car_start only;
+ * a rejected Ghost session may not silently start one of the original modes.
+ * call clear before returning to a normal four-mode race. */
+/* ERamp is the original enum 1..22, not the menu's zero-based index.
+ * Only route==0 (native fraction 0) is enabled in this reviewed ABI; every
+ * other route fails closed. Requires car_init; obtains all six words from the
+ * original helper and never synthesizes an arbitrary TA race field. */
+int car_ghost_race_field(int ramp, int route, int tutorial, uint32_t output[6]);
+/* Reviewed native source/ELF/patch-ABI + floating-point cohort, 64 lowercase hex.
+ * NULL for an old/unsupported physics translation. This is not cloud authority. */
+const char *car_ghost_physics_id(void);
+/* Coarse scene/resource selection ONLY. Returns a compatible existing course
+ * index for this native field's city, or -1. Never substitutes a TA race field. */
+int car_ghost_render_course(const uint32_t race_field[6]);
+int car_ghost_prepare(const car_ghost_config *config);
+
+/* Separately approved LOCAL shipped-record binding. Never pass server fields
+ * directly here or promote its result to a cloud crown/qualification. The caller
+ * retains the full immutable cosmetics/profile and supplies their model/tune
+ * fields here; player car/style is still supplied separately to car_start.
+ * Header stage is mandatory, and must agree with raw-ramp/route ORIGINAL helper.
+ * bind needs car_init (loads phys.img on demand), not a renderer/GPU scene. */
+typedef struct {
+  uint32_t raw_model_id; /* emCarModelID (color), NOT ECarType */
+  int power, handling;
+  uint32_t dress, dress_x, player_win_count; /* serialized profile; not difficulty comment/class */
+  int raw_ramp, raw_route; /* frontend table index 0..21 and original route number */
+  uint32_t header_stage;
+  uint64_t source_id, session_token; /* local frozen catalogue/selection provenance, not authentication */
+  const void *trail;
+  size_t trail_bytes;
+  int has_crown, first_tutorial, age_hours; /* native gameplay flags, NOT cloud authority */
+  uint32_t raw_custom_color, raw_aero, raw_wheel; /* original palette/body/emTireModelID; stock wheel143 */
+} car_ghost_arcade_spec;
+typedef struct {
+  car_spec rival;
+  uint32_t race_field[6];
+  int maker, car, color, pack, paint, render_course, city, route_count;
+  int target_level, target_rank; /* original zero-based native indices */
+  uint64_t source_id;
+  int raw_ramp, raw_route, first_tutorial; /* exact native policy revalidation */
+  int ramp; /* actual ERamp from frontend table +8; raw_ramp+1 is NOT equivalent */
+  int base_paint, custom_color;
+  /* paint is desired PACKED palette: base palettes followed by original custom
+   * palettes. Nonzero custom_color requires separately approved palette assets;
+   * renderer readiness MUST verify/load that paint, NEVER silently use base. */
+} car_ghost_arcade_binding;
+int car_ghost_arcade_bind(const car_ghost_arcade_spec *spec, car_ghost_arcade_binding *binding);
+/* Fills an actual native StageAry/pAreaAry policy, including full ordered road
+ * sequence validation. Single engine thread; use immediately. Context expires
+ * on the next policy call or car_ghost_clear; prepare independently rechecks. */
+int car_ghost_arcade_policy(const car_ghost_arcade_binding *binding, ghost_format_policy *policy);
+int car_ghost_arcade_validate_trail(const car_ghost_arcade_binding *binding, const void *trail, size_t bytes);
+/* Always non-recording original CTarget mode8. Copies bytes before returning.
+ * Rejection clears stale readiness, and cannot fall into TA/AI/ordinary VS. */
+int car_ghost_arcade_prepare(const car_ghost_arcade_spec *spec, car_ghost_arcade_binding *binding);
+int car_ghost_arcade_info(car_ghost_arcade_binding *binding);
+/* Marks a prepared mode-8 local Crown challenge. When requested, the existing
+ * native sampler records the run, including its post-goal automatic drive. */
+int car_ghost_arm_local_crown(uint64_t session_token, int record_player);
+/* Player-generated non-crown trails may also stop right at the goal. */
+int car_ghost_arm_rival_runout(uint64_t session_token);
+int car_ghost_arm_cloud_recording(uint64_t session_token);
+int car_ghost_crown_area_matches(unsigned area,int raw_ramp);
+/* A finished Time Attack can be replayed as a regular Ghost on its exact
+ * native field. The profile's reserved raw-ramp key is this base plus course. */
+#define CAR_GHOST_TA_RAMP_BASE CAR_LINK_RAMPS
+int car_ghost_time_attack_area(int course);
+/* Optional capture for the next ordinary Time Attack only. Does not change
+ * race mode or scoring, and fails without affecting the live race. */
+int car_ghost_arm_time_attack_recording(uint64_t session_token);
+int car_ghost_time_attack_recording_info(uint64_t session_token, int *course,
+                                         uint32_t field[6], car_spec *owner);
+int car_ghost_time_attack_recording_export(uint64_t session_token, void *output,
+                                           size_t capacity, size_t *bytes);
+/* Original clCarStyle normal serialized tune path + 0x932a280 table and win
+ * promotions. Transient native override flag/alternate tune is NOT serialized
+ * by TargetDataReader and is not inferred from dress or dress_x. */
+int car_ghost_arcade_difficulty(int power, int handling, uint32_t wins, int *level, int *rank);
+/* Compiled clTargetDefault metadata is a DISTINCT original mode8 target-AI
+ * source, NEVER a fallback for an absent/corrupt recorded trail. Enumeration
+ * consumes no RNG and leaves car.{raw_ramp,ramp,raw_route,city,render_course}=-1.
+ * 120 source rows; original manager skips eleven nonzero GUEST placeholders. */
+#define CAR_GHOST_DEFAULT_RECORDS 120u
+#define CAR_GHOST_DEFAULT_SOURCE_BASE UINT64_C(0x8000000000000000)
+typedef struct {
+  uint32_t index, manager_eligible, id_devel, id1, id2, name[5];
+  uint32_t raw_model_id, raw_custom_color, raw_vinyl, raw_bonnet, raw_wing,
+           raw_aero, raw_mirror, raw_wheel, raw_neon, dress, dress_x;
+  uint32_t player_win_count, title, class_id, odo_count, cool_wild, smooth_rough;
+  int crown_area; /* 0..7 only that source area; 8 means no crown; local gameplay only */
+  car_ghost_arcade_binding car; /* source-owned profile/model/tune; no chosen course yet */
+} car_ghost_default_view;
+typedef struct {
+  uint32_t index, area;
+  uint64_t session_token;
+  int first_tutorial;
+} car_ghost_default_spec;
+typedef struct {
+  car_ghost_default_view record;
+  car_ghost_arcade_binding car; /* original random ramp/route and field frozen ONCE */
+  uint32_t area;
+  uint64_t session_token, choice_cookie; /* native monotonic choice; never recycled by clear */
+} car_ghost_default_binding;
+int car_ghost_default_available(void); /* zero on v6/old engine; metadata may still enumerate */
+int car_ghost_default_record(uint32_t index, car_ghost_default_view *view);
+/* Call ONLY for actual user confirmation, not directory/render enumeration.
+ * Original getRandomRamp/getRandomRoute consume original MT RNG once; preparing
+ * and info NEVER reroll. New choice / clear invalidates a previous binding. */
+int car_ghost_default_select(const car_ghost_default_spec *spec, car_ghost_default_binding *binding);
+int car_ghost_default_prepare(const car_ghost_default_binding *binding);
+int car_ghost_default_info(car_ghost_default_binding *binding);
+void car_ghost_clear(void);
+/* Nonzero means a Ghost request exists (including FAILED), not GhostReady.
+ * Inspect status/kind/native_target_valid/result_valid separately. */
+int car_ghost_status(car_ghost_observation *observation);
+/* End recording through the original native Save, then read back validated
+ * payload bytes. NULL output queries size; no pointers/heap objects are exported.
+ * Call while the exact Ghost race still owns the native image, before car_start.
+ * If finish lands between the original step-3 samples, export_ready stays false;
+ * keep the normal fixed-step engine ticking through its post-goal frames and
+ * retry (do not synthesize/duplicate a final sample or change frozen rank). */
+int car_ghost_export(void *output, size_t capacity, size_t *bytes);
 /* GetHorsePower (0x8568a44): the horsepower at a power tune, the car's stock figure
  * (src/cardb.h, GetCarData +0x20) at power 0. */
 int car_tune_hp(int stock_hp, int power);
@@ -320,9 +502,30 @@ const char *car_link_ramp_name(int ramp);
  * put the car on its start line, rolling like the arcade's time attack start. The arcade
  * keeps the time: its limit, the checkpoints' extensions and the goal (car_state.race).
  * Returns 0 on success. */
+
+/* Read-only last-completed native TA step; game-thread only. No simulation/RNG calls.
+ * Separate positive APP TA/attempt/identity/official/reset/abort gates remain mandatory.
+ * Native state 0/1/2/7/8 can be sampled; only goal==1 is a terminal Goal.
+ * Up to 8 scored sections plus their native start-zero checkpoint (9 entries).
+ * Only split_bits[0..split_count-1] are copied native passed checkpoints; the
+ * zeroed unused tail is not a measured/manufactured split. No raw model ID is inferred.
+ * Bind the immutable process cohort separately with car_ghost_physics_id(). */
+#define CAR_TA_RANKING_ABI_VERSION 1u
+typedef struct {
+  uint32_t abi_version, native_mode, native_state, goal;
+  int course, course_id, ta_slot, city, traffic, manual;
+  car_spec owner;
+  uint32_t race_field[6];
+  uint32_t elapsed_bits, countdown_bits, time_left_bits;
+  uint32_t checkpoint_count, checkpoint_next, split_count;
+  uint32_t split_bits[CAR_SECTIONS + 1];
+} car_ta_ranking_observation;
+/* Returns 0 and zeroes output for unavailable/stale/non-TA/timeout/corrupt state.
+ * Does not load an image, refresh the world, consume a result, or grant ranking authority. */
+int car_ta_ranking_info(car_ta_ranking_observation *out);
+
 int car_start(car_state *c, int course, int manual, const car_spec *spec);
 /* Switch between the automatic and manual gearbox on the move. */
-void car_set_manual(car_state *c, int manual);
 /* Put the car back on the road where it is, facing the course in the start's lane (the
  * reset key; the race and its time go on). */
 void car_reset(car_state *c);

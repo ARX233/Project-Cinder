@@ -86,8 +86,14 @@ PART = re.compile(r"^(MIRROR|MUFFLER|WING|BONNET|WINKER|GLASS)(\d+)$")
 WORN = {"MIRROR": (pack.MIRROR, 2), "WING": (pack.WING, 4), "BONNET": (pack.BONNET, 4)}
 
 
-def stock(m, wings=(0, 0)):
-    """wings: the brake lamp model's STOP_HIGH and STOP_WING2 masks (brake_lamp)"""
+def stock(m, wings=(0, 0), story_assembly=False):
+    """wings: brake-lamp wing masks; story_assembly retains original forced variants."""
+    if story_assembly:
+        from story_part_groups import story_part_group
+        group = story_part_group(m)
+        if group is not None:
+            m["group"] = group
+            return True
     for name in m["path"]:
         p = PART.match(name)
         if p and p.group(1) in WORN and 1 <= int(p.group(2)) <= WORN[p.group(1)][1]:
@@ -115,13 +121,37 @@ def stock(m, wings=(0, 0)):
     return True
 
 
-BRAKE_LAMPS = json.load(open(os.path.join(HERE, "..", "brakelamps.json")))
-CAR_IDS = {k.lower(): v for k, v in BRAKE_LAMPS["cars"].items()}
+# Wheel-only conversion must not require unrelated generated car metadata at import.
+# A signed-recipe executor may explicitly supply its verified, original-derived table.
+# Historical command-line car packing retains its lazy local-file behavior.
+BRAKE_LAMPS = None
+CAR_IDS = None
+
+
+def configure_brake_lamps(db):
+    global BRAKE_LAMPS, CAR_IDS
+    if not isinstance(db, dict) or set(db) != {"cars", "lamps"}:
+        raise ValueError("invalid brake-lamp support table")
+    if not isinstance(db["cars"], dict) or not isinstance(db["lamps"], dict):
+        raise ValueError("invalid brake-lamp support maps")
+    if any(not isinstance(k, str) or type(v) is not int or not 0 <= v < 120
+           for k, v in db["cars"].items()):
+        raise ValueError("invalid brake-lamp car identity")
+    for key, row in db["lamps"].items():
+        if (not isinstance(key, str) or not isinstance(row, list) or len(row) != 3 or
+                not isinstance(row[0], str) or not re.fullmatch(r"[A-Za-z0-9_]+", row[0]) or
+                any(type(v) is not int or not 0 <= v <= 31 for v in row[1:])):
+            raise ValueError("invalid brake-lamp entry")
+    BRAKE_LAMPS = db
+    CAR_IDS = {k.lower(): v for k, v in db["cars"].items()}
 
 
 def brake_lamp(folder, body):
     """the brake lamp model's path in the arcade's data and its STOP_HIGH and STOP_WING2
     masks for the car of pack `folder` with body normal or aero_a..aero_c"""
+    if BRAKE_LAMPS is None:
+        with open(os.path.join(HERE, "..", "brakelamps.json")) as source:
+            configure_brake_lamps(json.load(source))
     car = CAR_IDS.get(folder.lower())
     row = BRAKE_LAMPS["lamps"].get("%s %d" % (car, 0 if body == "normal" else " abc".index(body[-1])))
     return ("data/car/brakelamp/brakelamp_%s.igb" % row[0], (row[1], row[2])) if row else (None, (0, 0))
@@ -253,8 +283,54 @@ def read_textures(path):
     return out
 
 
-def pack_car(root, folder, npaint, wheel_list, out, kind="car", body="normal"):
+# These stock wheel images are DXT1 component-order 100 in the arcade assets.  The
+# original loader converts them to platform order 107 (swapping red and blue).
+# Restrict the correction to the exact car, original wheel and diffuse image; do
+# not apply it to other Subaru images or the independently packed dress-up wheels.
+STOCK_WHEEL_BGR = {
+    "sub_gc8": ("sub_gc8_wheel", "gc8_wheel01_mid.dds"),
+    "sub_gc8_ra": ("sub_gc8_wheel", "gc8_wheel01_mid.dds"),
+    "sub_gdb": ("sub_gdb_wheel", "gdb_wheel01_mid.dds"),
+    "sub_gdb_specc": ("sub_gdb_wheel", "gdb_wheel01_mid.dds"),
+    "sub_gdbf": ("sub_gdbf_wheel", "gdbf_wheel01_mid.dds"),
+}
+
+
+def fix_stock_wheel_bgr(folder, kind, wheel, textures, meshes):
+    """Swap RGB565 channels only for the verified stock wheel diffuse texture.
+
+    DXT1 endpoint swapping needs index remapping when endpoint order reverses;
+    swapping decoded pixels instead preserves the decoded palette and alpha.
+    Fail before writing if an alternative encoding or image source is in use.
+    """
+    target = STOCK_WHEEL_BGR.get(folder.lower()) if kind == "car" else None
+    if not target:
+        return
+    if not wheel or wheel.get("name", "").lower() != target[0]:
+        raise ValueError("unexpected stock wheel for " + folder)
+    matches = [n for n in textures if n.replace("\\", "/").rsplit("/", 1)[-1].lower() == target[1]]
+    if len(matches) != 1:
+        raise ValueError("expected one stock wheel diffuse texture for " + folder)
+    name = matches[0]
+    if pack.TEX_UPSCALED:
+        raise ValueError("stock wheel correction cannot verify upscaled image source")
+    refs = [m for m in meshes if m[1] == name]
+    if not refs or any(not (pack.WHEEL <= m[0] < pack.WHEEL + 4) for m in refs):
+        raise ValueError("stock wheel image also used outside its wheel meshes")
+    if any(m[5] is not None and name in (m[5][1], m[5][2]) for m in meshes):
+        raise ValueError("stock wheel image also used as a material map")
+    w, h, fmt, data = textures[name]
+    if fmt != 0 or w <= 0 or h <= 0 or len(data) != w * h * 2:
+        raise ValueError("stock wheel requires complete opaque RGB565 texture")
+    px = np.frombuffer(data, dtype="<u2")
+    swapped = ((px & 0x001f) << 11) | (px & 0x07e0) | ((px >> 11) & 0x001f)
+    textures[name] = (w, h, fmt, swapped.astype("<u2").tobytes())
+
+
+def pack_car(root, folder, npaint, wheel_list, out, kind="car", body="normal", story_assembly=False):
     """body: normal, or the dress-up aero set aero_a, aero_b, aero_c (car.lua's keys)"""
+    if type(story_assembly) is not bool or (story_assembly and kind != "car"):
+        raise ValueError("story_assembly is an opt-in player-car-only boolean")
     car = lualite.load(f"{root}/data/{kind}/{folder}/car.lua")
     if body not in car["BodyIGB"]:
         print(folder, "has no", body, "(the gem cars only have aero A)")
@@ -286,8 +362,9 @@ def pack_car(root, folder, npaint, wheel_list, out, kind="car", body="normal"):
     else:
         print(folder, "no brake lamp model", lamp)
     textures, order, meshes, _ = pack.collect(models, None, (MAX_TEX,) * 3,
-                                              places, swaps, keep=lambda m: stock(m, wings), lit=True,
+                                              places, swaps, keep=lambda m: stock(m, wings, story_assembly), lit=True,
                                               opaque=lambda m: any(n.startswith("WHEEL_") for n in m["path"]))
+    fix_stock_wheel_bgr(folder, kind, wheel, textures, meshes)
     # name the textures as car.lua does, so the paint names fit the 47 characters a pack keeps
     short = {n: n.replace("\\", "/").rsplit("/", 1)[-1] for n in order}
     textures = {short.get(n, n): t for n, t in textures.items()}

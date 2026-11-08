@@ -8,11 +8,11 @@ m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
 class Tests(unittest.TestCase):
     def setUp(self):
-        # The caller chooses where tiny synthetic fixtures may be created.
-        fixture_root = os.environ.get('EXTERNAL_SNAPSHOT_TEST_TMPDIR', tempfile.gettempdir())
-        if not fixture_root or not Path(fixture_root).is_absolute() or not Path(fixture_root).is_dir():
-            raise RuntimeError('EXTERNAL_SNAPSHOT_TEST_TMPDIR must name an existing absolute directory')
-        self.tmp=tempfile.TemporaryDirectory(dir=fixture_root)
+        # Keep even simulated package fixtures in the requested external workspace.
+        fixture_parent=Path(os.environ.get('TMPDIR','/Volumes/CodexWork')).resolve()
+        if not fixture_parent.is_relative_to(Path('/Volumes/CodexWork').resolve()):
+            raise RuntimeError('Set TMPDIR under /Volumes/CodexWork for host fixtures')
+        self.tmp=tempfile.TemporaryDirectory(dir=fixture_parent)
         self.p=Path(self.tmp.name).resolve(); self.src=self.p/'snapshot'; self.src.mkdir()
         (self.src/'build_android.sh').write_text('#!/bin/sh\nprintf x > "$APK_OUT"\nprintf "%s\\n%s\\n%s\\n%s\\n%s\\n%s" "$BUILD_OUT" "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$JAVA_TOOL_OPTIONS" "$VERSION_CODE" > "$HOME/observed"\nprintf changed > build_android.sh\n')
         (self.src/'input.c').write_text('source')
@@ -57,20 +57,29 @@ class Tests(unittest.TestCase):
         root=self.p; workspace=self.p/'work'; workspace.mkdir(); bundle=self.p/'disk.sparsebundle'; bundle.mkdir()
         external_manifest=self.mp; self.mp=workspace/'manifest.json'; shutil.copy2(external_manifest,self.mp)
         sdk=self.p/'sdk'; java=self.p/'java'; sdk.mkdir(); java.mkdir()
-        icon=self.p/'icon'; card=self.p/'card'; key=self.p/'keystore'; data=self.p/'data.zip'
-        for f in (icon,card,key,data): f.write_text('dummy')
+        icon=self.p/'icon'; card=self.p/'card'; key=self.p/'keystore'; data=self.p/'data.zip'; baseline=self.p/'data-baselines.zip'
+        for f in (icon,card,key,data,baseline): f.write_text('dummy')
         class Args: pass
         a=Args(); a.action='build'; a.snapshot=str(self.src); a.manifest=str(self.mp); a.root=str(root); a.bundle=str(bundle); a.workspace=str(workspace); a.reserve_gib=1; a.version_code='42'; a.version_name='v1'; a.expected_cert_sha256='a'*64; a.expected_game_data_sha256=hashlib.sha256(data.read_bytes()).hexdigest()
         with self.assertRaisesRegex(m.Refusal,'game-data SHA-256 differs'): m.verified_game_data(data,'0'*64)
         with self.assertRaisesRegex(m.Refusal,'expected game-data SHA-256'): m.verified_game_data(data,'')
         self.assertEqual(m.verified_game_data(data,a.expected_game_data_sha256),a.expected_game_data_sha256)
-        env={'ANDROID_HOME':str(sdk),'JAVA_HOME':str(java),'APP_ICON':str(icon),'CARD_RESOURCES':str(card),'SIGNING_KEYSTORE':str(key),'GAME_DATA_ZIP':str(data)}
+        a.expected_baselines_sha256=hashlib.sha256(baseline.read_bytes()).hexdigest()
+        env={'ANDROID_HOME':str(sdk),'JAVA_HOME':str(java),'APP_ICON':str(icon),'CARD_RESOURCES':str(card),'SIGNING_KEYSTORE':str(key),'GAME_DATA_ZIP':str(data),'GAME_DATA_BASELINES_ZIP':str(baseline)}
         with patch.dict(os.environ,env,clear=True), patch.object(m,'validate_volume'):
+            catalog_pin=a.expected_baselines_sha256
+            a.expected_baselines_sha256=''
+            with self.assertRaisesRegex(m.Refusal,'expected baseline-catalog'): m.run(a)
+            a.expected_baselines_sha256='0'*64
+            with self.assertRaisesRegex(m.Refusal,'SHA-256 differs'): m.run(a)
+            a.expected_baselines_sha256=catalog_pin
+            with patch.dict(os.environ,{'GAME_DATA_BASELINES_ZIP':''}):
+                with self.assertRaisesRegex(m.Refusal,'GAME_DATA_BASELINES_ZIP is required'): m.run(a)
             # Caller-authored build script is not in the reviewed allowlist.
             with self.assertRaises(m.Refusal): m.run(a)
             original=(self.src/'build_android.sh').read_bytes()
-            # A second, independently unreviewed script must also be rejected.
-            (self.src/'build_android.sh').write_bytes(b'#!/bin/sh\nprintf second-unreviewed-script\\n\n')
+            old_script=Path(__file__).resolve().parents[3]/'build_android.sh'
+            (self.src/'build_android.sh').write_bytes(old_script.read_bytes())
             old_files=m.inventory(self.src)
             self.mp.write_text(json.dumps({'schema':1,'version_code':'42','version_name':'v1','files':old_files}))
             with self.assertRaisesRegex(m.Refusal,'reviewed script'): m.run(a)
@@ -92,6 +101,7 @@ class Tests(unittest.TestCase):
                 with zipfile.ZipFile(out,'w') as z:
                     z.writestr('assets/re3dxplus-data.zip',Path(e['GAME_DATA_ZIP']).read_bytes())
                     z.writestr('assets/card-resources-v1.zip',Path(e['CARD_RESOURCES']).read_bytes())
+                    z.writestr('assets/data-baselines.zip',Path(e['GAME_DATA_BASELINES_ZIP']).read_bytes())
                 (Path(e['HOME'])/'observed').write_text('\n'.join(e[k] for k in ('BUILD_OUT','TMPDIR','HOME','XDG_CACHE_HOME','JAVA_TOOL_OPTIONS','VERSION_CODE')))
                 (Path(kw['cwd'])/'build_android.sh').write_text('changed')
                 return SimpleNamespace(returncode=0)

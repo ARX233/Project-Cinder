@@ -115,7 +115,8 @@ int title_judge(const title_play *p, int current, int out[3]) {
   for (int i = 0; i < n; ++i) put32(all, 0x3b8 + 12 + 4 * i, wname[i]);
   put32(all, 0x3b8 + 12 + 4 * n, 0);
   put32(all, 0x34, (int)(0x09e40000u - 0x800u + 0x3b8u + 12u)); /* RC_STACK_TOP - 0x800 */
-  int got[3];
+  /* Loading the physics image can fail; treat an unwritten list as empty. */
+  int got[3] = {0, 0, 0};
   car_title_list(all, (int)sizeof all, got);
   int k = 0;
   for (int i = 0; i < 3; ++i) {
@@ -136,6 +137,16 @@ int title_glyphs(int id, const unsigned short **glyphs) {
 }
 
 int title_glyph_half(int g) { return g >= 0 && g < TITLEDB_CHARS && TITLEDB_CHAR[g] <= 0x7f; }
+
+int title_glyph_index(unsigned codepoint) {
+  int lo=0,hi=TITLEDB_CHARS;
+  while (lo<hi) {
+    int mid=lo+(hi-lo)/2;
+    if (TITLEDB_CHAR[mid]<codepoint) lo=mid+1;
+    else hi=mid;
+  }
+  return lo<TITLEDB_CHARS && TITLEDB_CHAR[lo]==codepoint ? lo : -1;
+}
 
 int title_model(int maker, int car, int color) {
   if (maker < 0 || maker >= (int)(sizeof TITLEDB_MODEL / sizeof TITLEDB_MODEL[0]) || car < 0 || car >= 12 || color < 0 || color >= 8)

@@ -1,17 +1,21 @@
-/* The versus host in the app (Bluetooth and LAN versus): tools/vs_server.py's lobby and the
- * race packets' relay on UDP NET_PORT (every interface) and on GameKit's peers. Everything
- * runs on the caller's thread: vs_host_poll reads what has arrived, never blocking. */
+/* CinderVS4 embedded UDP authority; caller-thread bounded polling. */
 #ifndef VS_HOST_H
 #define VS_HOST_H
-
-#include <stdint.h>
-
-/* open the host (gk: also GameKit's peers, gk_host already advertising); owner: the host's
- * own player's id, the lobby's host whenever it is in; 0 on success */
-int vs_host_open(int gk, uint32_t owner);
+#include "vs_session.h"
+/* Bind LAN authority. port0 requests ephemeral port (fixture-friendly).
+ * Fresh128-bit OS-random incarnation; no entropy fallback. */
+int vs_host_open(int port);
+int vs_host_open_on(int port,const char *bind_ipv4); /* loopback fixture option */
 void vs_host_close(void);
 int vs_host_is_open(void);
-/* serve what has arrived; `name`: the game's name in the LAN's answers */
-void vs_host_poll(double now, const char *name);
-
+int vs_host_port(void);
+void vs_host_poll(uint64_t now_ms,const char *name);
+const vs4_state *vs_host_state(void);
+void vs_host_set_decision_validator(vs4_decision_fn,void *ctx);
+void vs_host_set_registration_validator(vs4_registration_fn,void *ctx);
+/* Same-source-endpoint migration: adopted socket stays net-owned. No close on
+ * vs_host_close; no implicit migration without verified election certificate. */
+int vs_host_adopt(int fd,const vs4_state *frozen,vs4_nonce incarnation,uint64_t term,uint64_t now_ms);
+/* Internal transport entry: net owns recvfrom on adopted socket. */
+int vs_host_ingest(uint64_t endpoint,const unsigned char *,size_t,uint64_t now_ms);
 #endif

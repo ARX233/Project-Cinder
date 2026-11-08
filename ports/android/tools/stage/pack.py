@@ -530,7 +530,8 @@ def write(path, textures, order, cells, chunk, lit=False, cubes=None, cube_order
              (data_off + len(blob)) / 1e6))
 
 
-def main():
+def main(argv=None):
+    """CLI-compatible entry also callable in the Android conversion process."""
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("scenes", nargs="*")
@@ -549,7 +550,7 @@ def main():
     ap.add_argument("--chunk", type=float, default=4000.0, help="0: one chunk per group")
     ap.add_argument("--max-tex", type=int, default=512)
     ap.add_argument("--max-tex-build", type=int, default=256, help="for --short/--long textures not used by the ground")
-    a = ap.parse_intermixed_args()
+    a = ap.parse_intermixed_args(argv)
     library = load_library(a.textures) if a.textures else None
     cubes = load_cubes(a.textures) if a.textures and not a.lit else None
     cube_order = []

@@ -1,4 +1,8 @@
 #include "render.h"
+#include "render_story_assembly.h"
+#ifdef __ANDROID__
+#include "ghost_catalog.h"
+#endif
 
 #include <fcntl.h>
 #include <math.h>
@@ -10,12 +14,26 @@
 #include <unistd.h>
 
 #include "gl.h"
-#ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+#include "native_vk.h"
+typedef struct { uint32_t target; int w, h; } native_scene_view;
+static native_scene_view native_scene;
+static uint32_t native_frame_texture, native_over_texture;
+/* Explicit render_scene_clear background for this frame's final composite.
+ * Other render passes and loader material parameters never change it. */
+static float native_post_clear_color[4];
+#endif
+#if defined(WMMT_VK) && !defined(WMMT_NATIVE_VK)
 /* Implemented by the Vulkan GL adapter; capability does not change the user setting. */
 extern int vkgl_ssao_depth_supported(int w, int h);
+#ifndef WMMT_NATIVE_VK
 extern int vkgl_program_usable(GLuint id);
+#endif
 extern int vkgl_error_pending(void);
 extern uint64_t vkgl_error_epoch(void);
+/* Existing adapter scope: includes actual VAO/attribute state, unlike its GL queries. */
+extern void *vkgl_preview_save(GLuint program);
+extern void vkgl_scope_restore_preserve_error(void *snapshot);
 #endif
 #ifdef WMMT_EGL
 #include <EGL/egl.h>
@@ -253,7 +271,9 @@ static const char *FS_SHADOW =
   "precision mediump float; uniform lowp vec4 uColor;\n"
   "void main() { gl_FragColor = uColor; }\n";
 static GLuint shadow_prog;
+#ifndef WMMT_NATIVE_VK
 static GLint shadow_mvp, shadow_color;
+#endif
 /* the arcade's final pass darkens the marked pixels with black at alpha 0.5 */
 #define SHADOW_ALPHA 0.5f
 
@@ -332,7 +352,9 @@ static const char *FS_BLUR =
   "  gl_FragColor = vec4(c.rgb, 1.0);\n"
   "}\n";
 static GLuint blur_progs[6]; /* the middle's, the bands', the middle's sharpened; +3: render_hq's */
+#ifndef WMMT_NATIVE_VK
 static GLint sharp_texel[2], sharp_amount[2], bloom_k[3];
+#endif
 static struct {
   GLuint fbo, tex, depth;
   int w, h, deep; /* deep: RGBA8 (sharpening: 16 bits' steps would show), else RGB565 */
@@ -350,18 +372,22 @@ static scene_prog progs[2], gloss_progs[2];
 static GLuint white_tex;
 /* The shader samples uFrame even at frame_k==0: always supply a safe texture. */
 static void frame_sampler(GLuint tex) {
+#ifdef WMMT_NATIVE_VK
+  native_frame_texture = tex;
+#else
   GLint active;
   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
   glActiveTexture(GL_TEXTURE0 + FRAME_UNIT);
   glBindTexture(GL_TEXTURE_2D, tex);
   glActiveTexture((GLenum)active);
+#endif
 }
 static void frame_sampler_off(void) {
   frame_k = 0.0f; frame_wet = 0;
   frame_sampler(white_tex);
 }
 
-#ifdef WMMT_EGL
+#if defined(WMMT_EGL) && !defined(WMMT_NATIVE_VK)
 PFNGLGENVERTEXARRAYSOESPROC wmmt_glGenVertexArraysOES;
 PFNGLBINDVERTEXARRAYOESPROC wmmt_glBindVertexArrayOES;
 PFNGLDELETEVERTEXARRAYSOESPROC wmmt_glDeleteVertexArraysOES;
@@ -412,6 +438,7 @@ static int wpk_indices_valid(const uint16_t *idx, uint32_t count, uint32_t verti
   return 1;
 }
 
+#ifndef WMMT_NATIVE_VK
 GLuint gl_compile_program(const char *vs, const char *fs, const char **attribs, int n_attribs) {
 #ifdef WMMT_DUMP_PROGS
   {
@@ -461,10 +488,49 @@ GLuint gl_compile_program(const char *vs, const char *fs, const char **attribs, 
 #endif
 }
 
+#endif
+
+#ifdef WMMT_NATIVE_VK
+/* Catalog identity uses the exact shared shader/attribute bytes below. Native
+ * programs have immutable reflection and NO legacy uniform shadow. */
+static GLuint native_program_create(const char *vs, const char *fs, const char **attribs, int n) {
+  GLuint id = cinder_vk_program_create(vs, fs, attribs, n);
+  if (!cinder_vk_program_ready(id)) {
+    if (id) cinder_vk_program_destroy(id);
+    return 0;
+  }
+  return id;
+}
+static void native_program_release(GLuint *id) {
+  if (*id) cinder_vk_program_destroy(*id);
+  *id = 0;
+}
+static void native_render_programs_release(void) {
+  for (int i = 0; i < 2; ++i) {
+    native_program_release(&progs[i].id);
+    native_program_release(&gloss_progs[i].id);
+  }
+  for (int i = 0; i < 3; ++i) native_program_release(&blur_progs[i]);
+  native_program_release(&shadow_prog);
+  for (int i = 0; i < 2 * WPK_LIT_PROGS; ++i) {
+    GLuint id = lit_progs[i].id;
+    for (int j = i + 1; j < 2 * WPK_LIT_PROGS; ++j)
+      if (lit_progs[j].id == id) lit_progs[j].id = 0;
+    native_program_release(&lit_progs[i].id);
+  }
+}
+#endif
+
 static int prog_init(scene_prog *p, const char *fs) {
   const char *attribs[] = { "aPos", "aUV", "aColor" };
+#ifdef WMMT_NATIVE_VK
+  memset(p, 0, sizeof *p);
+  p->id = native_program_create(VS, fs, attribs, 3);
+#else
   p->id = gl_compile_program(VS, fs, attribs, 3);
+#endif
   if (!p->id) return -1;
+#ifndef WMMT_NATIVE_VK
   p->mvp = glGetUniformLocation(p->id, "uMVP");
   p->eye = glGetUniformLocation(p->id, "uEye");
   p->fog = glGetUniformLocation(p->id, "uFog");
@@ -477,6 +543,7 @@ static int prog_init(scene_prog *p, const char *fs) {
   glUseProgram(p->id);
   glUniform1i(glGetUniformLocation(p->id, "uFrame"), FRAME_UNIT);
   if (p->wet >= 0) glUniform1f(p->wet, 0.0f);
+#endif
   return 0;
 }
 
@@ -487,8 +554,14 @@ static int lit_init(lit_prog *p, int prog, int cutout) {
   snprintf(vs, sizeof vs, "%s%s", head, VS_LIT);
   snprintf(fs, sizeof fs, "%s%s", head, FS_LIT);
   const char *attribs[] = { "aPos", "aUV", "aColor", "aNormal" };
+#ifdef WMMT_NATIVE_VK
+  memset(p, 0, sizeof *p);
+  p->id = native_program_create(vs, fs, attribs, 4);
+#else
   p->id = gl_compile_program(vs, fs, attribs, 4);
+#endif
   if (!p->id) return -1;
+#ifndef WMMT_NATIVE_VK
   GLint *loc[] = { &p->mvp, &p->mv, &p->eye, &p->l0, &p->l1, &p->d0, &p->d1, &p->amb, &p->power, &p->fog, &p->fog_color, &p->over, &p->over_dir };
   const char *names[] = { "uMVP", "uMV", "uEye", "uL0", "uL1", "uD0", "uD1", "uAmb", "uPower", "uFog", "uFogColor", "uOver", "uOverDir" };
   for (int i = 0; i < 13; ++i) *loc[i] = glGetUniformLocation(p->id, names[i]);
@@ -502,6 +575,7 @@ static int lit_init(lit_prog *p, int prog, int cutout) {
   p->frame_k = glGetUniformLocation(p->id, "uFrameK");
   glUniform2f(p->over, 0, 1);
   glUniform2f(p->over_dir, sinf(OVER_PITCH), cosf(OVER_PITCH));
+#endif
   return 0;
 }
 
@@ -509,8 +583,14 @@ static int gloss_init(scene_prog *p, int cutout) {
   char fs[2048];
   snprintf(fs, sizeof fs, "#define CUTOUT %d\n%s", cutout, FS_GLOSS);
   const char *attribs[] = { "aPos", "aUV", "aColor", "aNormal" };
+#ifdef WMMT_NATIVE_VK
+  memset(p, 0, sizeof *p);
+  p->id = native_program_create(VS_GLOSS, fs, attribs, 4);
+#else
   p->id = gl_compile_program(VS_GLOSS, fs, attribs, 4);
+#endif
   if (!p->id) return -1;
+#ifndef WMMT_NATIVE_VK
   p->mvp = glGetUniformLocation(p->id, "uMVP");
   p->eye = glGetUniformLocation(p->id, "uEye");
   p->fog = glGetUniformLocation(p->id, "uFog");
@@ -523,52 +603,113 @@ static int gloss_init(scene_prog *p, int cutout) {
   glUniform1i(p->tex, 0);
   glUniform1i(glGetUniformLocation(p->id, "uGloss"), 1);
   glUniform1i(glGetUniformLocation(p->id, "uCube"), 2);
+#endif
   return 0;
 }
 
 int render_init(void) {
+  /* render_init starts a renderer context; stale IDs may belong to a lost one.
+   * For same-context reinitialization, release tail resources before this call. */
+  render_tail_context_lost();
+  render_tire_smoke_context_lost();
+#ifdef WMMT_NATIVE_VK
+  /* As with tail context loss, old-context names must not be destroyed in the
+   * replacement context. Failure cleanup below owns only this attempt's IDs. */
+  memset(progs, 0, sizeof progs);
+  memset(gloss_progs, 0, sizeof gloss_progs);
+  memset(lit_progs, 0, sizeof lit_progs);
+  memset(blur_progs, 0, 3 * sizeof blur_progs[0]);
+  shadow_prog = 0;
+#endif
+#ifdef WMMT_NATIVE_VK
+  if (prog_init(&progs[0], FS) || prog_init(&progs[1], FS_CUTOUT)) goto native_bad;
+#else
   if (prog_init(&progs[0], FS) || prog_init(&progs[1], FS_CUTOUT)) return -1;
+#endif
+#ifdef WMMT_NATIVE_VK
+  if (gloss_init(&gloss_progs[0], 0) || gloss_init(&gloss_progs[1], 1)) goto native_bad;
+#else
   if (gloss_init(&gloss_progs[0], 0) || gloss_init(&gloss_progs[1], 1)) return -1;
+#endif
   for (int k = 0; k < 3; ++k) {
     char vs[2048], fs[4096];
     snprintf(vs, sizeof vs, "#define BLUR_TAPS %d\n#define SHARPEN %d\n%s", k == 1 ? 8 : 1, k == 2, VS_BLUR);
     snprintf(fs, sizeof fs, "#define BLUR_TAPS %d\n#define SHARPEN %d\n#define HQ 0\n%s", k == 1 ? 8 : 1, k == 2, FS_BLUR);
     const char *attribs[] = { "aPos", "aUV", "aAlpha" };
+#ifdef WMMT_NATIVE_VK
+    blur_progs[k] = native_program_create(vs, fs, attribs, 3);
+#else
     blur_progs[k] = gl_compile_program(vs, fs, attribs, 3);
+#endif
+#ifdef WMMT_NATIVE_VK
+    if (!blur_progs[k]) goto native_bad;
+#else
     if (!blur_progs[k]) return -1;
+#endif
+#ifndef WMMT_NATIVE_VK
     glUseProgram(blur_progs[k]);
     glUniform1i(glGetUniformLocation(blur_progs[k], "uTex"), 0);
+#endif
   }
+#ifndef WMMT_NATIVE_VK
   sharp_texel[0] = glGetUniformLocation(blur_progs[2], "uTexel");
   sharp_amount[0] = glGetUniformLocation(blur_progs[2], "uSharp");
+#endif
   const char *shadow_attr[] = { "aPos" };
+#ifdef WMMT_NATIVE_VK
+  shadow_prog = native_program_create(VS_SHADOW, FS_SHADOW, shadow_attr, 1);
+#else
   shadow_prog = gl_compile_program(VS_SHADOW, FS_SHADOW, shadow_attr, 1);
+#endif
+#ifdef WMMT_NATIVE_VK
+  if (!shadow_prog) goto native_bad;
+#else
   if (!shadow_prog) return -1;
+#endif
+#ifndef WMMT_NATIVE_VK
   shadow_mvp = glGetUniformLocation(shadow_prog, "uMVP");
   shadow_color = glGetUniformLocation(shadow_prog, "uColor");
+#endif
   for (int k = 0; k < WPK_LIT_PROGS; ++k)
     for (int c = 0; c < 2; ++c) {
       if (k == WPK_LIT_CAR && c) {
         lit_progs[2 * k + 1] = lit_progs[2 * k];
         continue;
       }
+#ifdef WMMT_NATIVE_VK
+      if (lit_init(&lit_progs[2 * k + c], k, c)) goto native_bad;
+#else
       if (lit_init(&lit_progs[2 * k + c], k, c)) return -1;
+#endif
     }
-#ifdef WMMT_EGL
+#if defined(WMMT_EGL) && !defined(WMMT_NATIVE_VK)
   wmmt_glGenVertexArraysOES = (PFNGLGENVERTEXARRAYSOESPROC)eglGetProcAddress("glGenVertexArraysOES");
   wmmt_glBindVertexArrayOES = (PFNGLBINDVERTEXARRAYOESPROC)eglGetProcAddress("glBindVertexArrayOES");
   wmmt_glDeleteVertexArraysOES = (PFNGLDELETEVERTEXARRAYSOESPROC)eglGetProcAddress("glDeleteVertexArraysOES");
   if (!wmmt_glGenVertexArraysOES || !wmmt_glBindVertexArrayOES || !wmmt_glDeleteVertexArraysOES) return -1;
 #endif
   static const uint8_t px[4] = { 255, 255, 255, 255 };
+#ifdef WMMT_NATIVE_VK
+  const cinder_vk_sampler white_sampler = { .use_state=1,.min_filter=VK_FILTER_NEAREST,.mag_filter=VK_FILTER_NEAREST,
+    .mipmap_mode=VK_SAMPLER_MIPMAP_MODE_NEAREST,.address_u=VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .address_v=VK_SAMPLER_ADDRESS_MODE_REPEAT,.anisotropy=1 };
+  white_tex=cinder_vk_texture_rgba8(1,1,px,sizeof px,&white_sampler);
+  if (!white_tex) goto native_bad;
+#else
   glGenTextures(1, &white_tex);
   glBindTexture(GL_TEXTURE_2D, white_tex);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+#endif
   frame_history_valid = 0;
   frame_sampler_off();
   return 0;
+#ifdef WMMT_NATIVE_VK
+native_bad:
+  native_render_programs_release();
+  return -1;
+#endif
 }
 
 static int is_pot(int v) { return v > 0 && (v & (v - 1)) == 0; }
@@ -615,6 +756,14 @@ static int gloss_open(wpk_scene *s) {
   uint32_t off, n[2];
   memcpy(&off, foot, 4);
   if (read_at(s->fd, n, sizeof n, off) != 0) return -1;
+#ifdef WMMT_NATIVE_VK
+  /* These legacy table expressions use 32-bit file offsets. Validate before
+   * their multiplication/addition, allocation or any face-record indexing. */
+  uint64_t cube_bytes=(uint64_t)n[0]*72u,gloss_bytes=(uint64_t)n[1]*12u;
+  uint64_t table_end=(uint64_t)off+8u+cube_bytes+gloss_bytes;
+  if (cube_bytes>UINT32_MAX || gloss_bytes>UINT32_MAX || table_end>UINT32_MAX ||
+      table_end>(uint64_t)st.st_size-8u) return -1;
+#endif
   s->n_cube = n[0];
   s->cubes = calloc(n[0] ? n[0] : 1, sizeof(uint32_t));
   s->cube_warm = calloc(n[0] ? n[0] : 1, 1);
@@ -641,8 +790,16 @@ static int gloss_open(wpk_scene *s) {
   return 0;
 }
 
+#ifdef WMMT_NATIVE_VK
+static size_t native_wpk_cube_upload(wpk_scene *s, uint32_t i);
+static size_t native_wpk_ao_upload(wpk_scene *s);
+#endif
+
 /* cube i's six faces from the file to GL; its bytes, 0 if unreadable */
 static size_t cube_upload(wpk_scene *s, uint32_t i) {
+#ifdef WMMT_NATIVE_VK
+  return native_wpk_cube_upload(s, i);
+#else
   static const GLenum types[3] = { GL_UNSIGNED_SHORT_5_6_5, GL_UNSIGNED_SHORT_4_4_4_4,
                                    GL_UNSIGNED_SHORT_5_5_5_1 };
   size_t done = 0;
@@ -673,6 +830,7 @@ static size_t cube_upload(wpk_scene *s, uint32_t i) {
   glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
   return done;
+#endif
 }
 
 /* a car's ambient occlusion maps (bake_ao.c: "WAO1", n, then {name[48], u16 w, h, u8 [w h]}),
@@ -700,6 +858,9 @@ static void ao_open(wpk_scene *s) {
 
 /* the maps to GL (luminance, with their mipmaps: the 2 x 2 means), by the texture each darkens */
 static size_t ao_upload(wpk_scene *s) {
+#ifdef WMMT_NATIVE_VK
+  return native_wpk_ao_upload(s);
+#else
   const uint8_t *f = s->ao_file, *end = f + s->ao_size;
   const wpk_tex *tex = s->tex_tbl;
   size_t done = 0;
@@ -748,6 +909,7 @@ static size_t ao_upload(wpk_scene *s) {
   free(s->ao_file);
   s->ao_file = NULL;
   return done + 1;
+#endif
 }
 
 /* The file is read a piece at a time (pread): its tables here, each texture and buffer as
@@ -956,9 +1118,14 @@ void render_aniso(float degree) {
     aniso = 1;
     return;
   }
+#ifdef WMMT_NATIVE_VK
+  float most=cinder_vk_anisotropy_limit();
+  if (most <= 1) {
+#else
   GLfloat most = 1;
   glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &most);
-  if (glGetError() != GL_NO_ERROR || most <= 1) { /* no extension: trilinear alone */
+  if (glGetError() != GL_NO_ERROR || most <= 1) {
+#endif /* no extension: trilinear alone */
     aniso = 1.5f;
     return;
   }
@@ -966,10 +1133,12 @@ void render_aniso(float degree) {
 }
 
 /* the minifying filter for a texture with mipmaps, and the degree with it */
+#ifndef WMMT_NATIVE_VK
 static GLint mip_filter(void) { return aniso > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST; }
 static void tex_aniso(void) {
   if (aniso > 1.5f) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, aniso);
 }
+#endif
 
 /* texture i from the file to GL; its size, or 0 if it could not be read. A power-of-two
  * texture gets its mipmaps from mip_down, here on the loading thread: glGenerateMipmap left
@@ -978,8 +1147,62 @@ static void tex_aniso(void) {
 /* ASTC textures (a pack made for Android, tools/stage: wpk fmt WPK_ASTC + 2 * block + alpha,
  * block 0 4x4, 1 6x6, 2 8x8): each level's blocks of 16 bytes, from the base down to 1 x 1
  * (the base alone for a texture not a power of two), handed to GL as they are */
+#ifdef __ANDROID__
+/* Both approved legacy inventories still contain these DEFAULT-order textures.
+ * The signed original conversion does the component swap before DDS decode.
+ * For these exact packed payloads, swapping the packed channels yields exactly
+ * the same bytes, leaving the old resource on disk and alpha/green untouched. */
+static void wpk_restore_course_arrow_order(const wpk_tex *t, uint16_t *pixels) {
+  static const struct {
+    const char *name;
+    uint16_t w, h, fmt;
+    uint8_t digest[32];
+  } legacy[] = {
+    { "course_arrow_stepanim_01.tga", 256, 256, 1,
+      { 0x5c, 0x85, 0x68, 0xd3, 0x64, 0x53, 0x41, 0x62, 0xee, 0x60, 0xae, 0xe1, 0x31, 0x7f, 0xc3, 0xa2, 0x6f, 0x7b, 0x85, 0xd9, 0xd5, 0x55, 0xd6, 0xbb, 0xe5, 0xb3, 0x71, 0x07, 0x02, 0xdc, 0xa8, 0x14 } },
+    { "coursearrow.tga", 256, 256, 1,
+      { 0x5a, 0xf2, 0x24, 0x61, 0x3a, 0xfa, 0xeb, 0x04, 0x2d, 0x92, 0xb8, 0xe2, 0x02, 0x9b, 0x6c, 0x63, 0x60, 0xeb, 0x30, 0x4d, 0x88, 0x15, 0xdd, 0x94, 0xcb, 0x8c, 0x49, 0x00, 0x7d, 0x64, 0x4c, 0xa0 } },
+    { "coursearrow02.dds", 256, 128, 0,
+      { 0xbe, 0x45, 0x7a, 0x2a, 0x38, 0x24, 0x1a, 0x74, 0xe5, 0x42, 0xcc, 0x84, 0xb3, 0x9b, 0x56, 0xf3, 0x76, 0x56, 0xd0, 0xc9, 0x55, 0x17, 0xaa, 0x9a, 0xed, 0xc7, 0xb5, 0x8c, 0x48, 0x59, 0xf4, 0xea } },
+  };
+  for (unsigned i = 0; i < sizeof legacy / sizeof legacy[0]; ++i) {
+    if (t->w != legacy[i].w || t->h != legacy[i].h || t->fmt != legacy[i].fmt ||
+        t->size != (uint32_t)t->w * t->h * 2 || strncmp(t->name, legacy[i].name, sizeof t->name))
+      continue;
+    uint8_t digest[32];
+    ghost_catalog_sha256_bytes(pixels, t->size, digest);
+    if (memcmp(digest, legacy[i].digest, sizeof digest)) return;
+    unsigned r = t->fmt == 0 ? 0xf800 : 0xf000;
+    unsigned b = t->fmt == 0 ? 0x001f : 0x00f0;
+    unsigned shift = t->fmt == 0 ? 11 : 8;
+    for (uint32_t j = 0; j < t->size / 2; ++j) {
+      unsigned x = pixels[j];
+      pixels[j] = (uint16_t)((x & ~(r | b)) | ((x & r) >> shift) | ((x & b) << shift));
+    }
+    return;
+  }
+}
+#endif
+
+static int wpk_read_packed_texture(wpk_scene *s, const wpk_tex *t, uint16_t *pixels) {
+  if (read_at(s->fd, pixels, t->size, t->off) != 0) return -1;
+#ifdef __ANDROID__
+  if (s->course_arrows) wpk_restore_course_arrow_order(t, pixels);
+#endif
+  return 0;
+}
+
+#ifdef WMMT_NATIVE_VK
+#include "render_native_textures.inc"
+#endif
+
+#ifndef WMMT_NATIVE_VK
 static const struct { GLenum gl; int b; } ASTC[3] = { { 0x93B0, 4 }, { 0x93B4, 6 }, { 0x93B7, 8 } };
+#endif
 static size_t astc_upload(wpk_scene *s, uint32_t i) {
+#ifdef WMMT_NATIVE_VK
+  return native_wpk_astc_upload(s, i);
+#else
   const wpk_tex *t = (const wpk_tex *)s->tex_tbl + i;
   int pot = is_pot(t->w) && is_pot(t->h), k = (int)(t->fmt - WPK_ASTC) / 2, b = ASTC[k].b;
   unsigned char *px = scratch(s, t->size);
@@ -1011,9 +1234,13 @@ static size_t astc_upload(wpk_scene *s, uint32_t i) {
   s->textures[i] = s->loaded[i];
   s->tex_warm[i] = 0;
   return t->size;
+#endif
 }
 
 static size_t tex_upload(wpk_scene *s, uint32_t i) {
+#ifdef WMMT_NATIVE_VK
+  return native_wpk_tex_upload(s, i);
+#else
   static const GLenum types[3] = { GL_UNSIGNED_SHORT_5_6_5, GL_UNSIGNED_SHORT_4_4_4_4,
                                    GL_UNSIGNED_SHORT_5_5_5_1 };
   const wpk_tex *t = (const wpk_tex *)s->tex_tbl + i;
@@ -1021,7 +1248,7 @@ static size_t tex_upload(wpk_scene *s, uint32_t i) {
   int pot = is_pot(t->w) && is_pot(t->h);
   /* the levels after the base take a third of its size (all but its size, one side 1 wide) */
   uint16_t *px = scratch(s, t->size + (pot ? t->size + 16 : 0));
-  if (!px || t->fmt > 2 || t->size < (size_t)t->w * t->h * 2 || read_at(s->fd, px, t->size, t->off) != 0) {
+  if (!px || t->fmt > 2 || t->size < (size_t)t->w * t->h * 2 || wpk_read_packed_texture(s, t, px) != 0) {
     fprintf(stderr, "%s: texture %u unreadable\n", s->path, i);
     return 0;
   }
@@ -1057,6 +1284,7 @@ static size_t tex_upload(wpk_scene *s, uint32_t i) {
   s->textures[i] = s->loaded[i];
   s->tex_warm[i] = 0;
   return t->size;
+#endif
 }
 
 int wpk_find_texture(const wpk_scene *s, const char *name) {
@@ -1113,6 +1341,11 @@ uint32_t wpk_texture_over(wpk_scene *s, int i, const uint8_t *over, int ow, int 
     }
   }
   /* up as tex_upload does it: its mipmaps from mip_down, from the second level under tex_half */
+#ifdef WMMT_NATIVE_VK
+  uint32_t texture=native_scene_packed_texture(px,(size_t)w*h*4+64,w,h,0,tex_half,1);
+  free(px);
+  return texture;
+#else
   GLuint name = 0;
   glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
   glGenTextures(1, &name);
@@ -1140,7 +1373,10 @@ uint32_t wpk_texture_over(wpk_scene *s, int i, const uint8_t *over, int ow, int 
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
   free(px);
   return name;
+#endif
 }
+
+#include "render_ghost_paint.inc"
 
 int wpk_upload(wpk_scene *s, size_t budget) {
   if (s->next_cube >= s->n_cube && s->next_tex >= s->n_tex && s->next_batch >= s->n_batch) return 1;
@@ -1234,6 +1470,56 @@ int wpk_upload(wpk_scene *s, size_t budget) {
       b->power = (float)m[2] / 10000.0f;
       if (b->prog == WPK_LIT_CAR) b->cutout = 0; /* car.cg writes alpha 1 */
     }
+#ifdef WMMT_NATIVE_VK
+    /* Append transaction: existing drawable ranges stay intact. Missing handles
+     * remain private until every vertex/normal/index span has been written. */
+    size_t nb = pl->nbytes ? (size_t)r->vtx_count * 8u : 0;
+    if (pl->vfill > pl->vbytes || vbytes > pl->vbytes - pl->vfill ||
+        pl->ifill > pl->ibytes || ibytes > pl->ibytes - pl->ifill ||
+        pl->nfill > pl->nbytes || nb > pl->nbytes - pl->nfill) {
+      fprintf(stderr, "WPK: batch %u exceeds pool capacity\n", s->next_batch);
+      done++;
+      continue;
+    }
+    uint32_t vbo = pl->vbo, ibo = pl->ibo, nbo = pl->nbo;
+    if (!vbo && pl->vbytes) vbo = cinder_vk_buffer_create(pl->vbytes, NULL);
+    if (!ibo && pl->ibytes) ibo = cinder_vk_buffer_create(pl->ibytes, NULL);
+    if (!nbo && pl->nbytes) nbo = cinder_vk_buffer_create(pl->nbytes, NULL);
+    int uploaded = (!pl->vbytes || vbo) && (!pl->ibytes || ibo) && (!pl->nbytes || nbo);
+    if (uploaded && vbytes) uploaded = cinder_vk_buffer_update(vbo, pl->vfill, vbytes, v);
+    if (uploaded && nb) {
+      uint32_t noff = s->gloss_noff ? s->gloss_noff[s->next_batch] : 0;
+      if (!noff || read_at(s->fd, v, nb, noff) != 0) memset(v, 0, nb);
+      uploaded = cinder_vk_buffer_update(nbo, pl->nfill, nb, v);
+    }
+    /* Keep the bounded re-read/validation: the file may change after its scan. */
+    for (size_t at = 0; uploaded && at < ibytes;) {
+      size_t n = ibytes - at < INDEX_CHUNK ? ibytes - at : INDEX_CHUNK;
+      if (read_at(s->fd, idx, n, (off_t)((uint64_t)r->idx_off + at)) != 0 ||
+          !wpk_indices_valid(idx, (uint32_t)(n / 2u), r->vtx_count, base)) {
+        uploaded = 0;
+        break;
+      }
+      for (size_t k = 0; k < n / 2u; ++k) idx[k] = (uint16_t)(idx[k] + base);
+      uploaded = cinder_vk_buffer_update(ibo, (size_t)pl->ifill + at, n, idx);
+      at += n;
+    }
+    if (!uploaded) {
+      if (vbo != pl->vbo) cinder_vk_buffer_destroy(vbo);
+      if (ibo != pl->ibo) cinder_vk_buffer_destroy(ibo);
+      if (nbo != pl->nbo) cinder_vk_buffer_destroy(nbo);
+      fprintf(stderr, "WPK: batch %u buffer upload failed or indices changed\n", s->next_batch);
+      done++;
+      continue;
+    }
+    pl->vbo = vbo; pl->ibo = ibo; pl->nbo = nbo;
+    b->ioff = pl->ifill;
+    pl->vfill += (uint32_t)vbytes;
+    pl->nfill += (uint32_t)nb;
+    pl->ifill += (uint32_t)ibytes;
+    b->count = r->idx_count;
+    done += nb;
+#else
     if (!pl->vbo) {
       glGenBuffers(1, &pl->vbo);
       glBindBuffer(GL_ARRAY_BUFFER, pl->vbo);
@@ -1281,6 +1567,7 @@ int wpk_upload(wpk_scene *s, size_t budget) {
     } else {
       fprintf(stderr, "WPK: batch %u indices changed or became unreadable\n", s->next_batch);
     }
+#endif
     if (ibytes > SIZE_MAX - vbytes || vbytes + ibytes > SIZE_MAX - done) done = SIZE_MAX;
     else done += vbytes + ibytes;
   }
@@ -1320,7 +1607,11 @@ void wpk_free_paints(wpk_scene *s) {
   wpk_paint(s, 0);
   for (uint32_t i = 0; i < s->n_paints; ++i) {
     uint16_t t = s->paints[i].src;
+#ifdef WMMT_NATIVE_VK
+    if (s->loaded[t]) cinder_vk_texture_destroy(s->loaded[t]);
+#else
     if (s->loaded[t]) glDeleteTextures(1, &s->loaded[t]);
+#endif
     s->loaded[t] = s->textures[t] = 0;
     s->tex_warm[t] = 0;
   }
@@ -1363,26 +1654,53 @@ int wpk_load(wpk_scene *s, const char *path) {
   return 0;
 }
 
+#ifdef __ANDROID__
+int wpk_load_course_arrows(wpk_scene *s, const char *path) {
+  if (wpk_open(s, path) != 0) return -1;
+  s->course_arrows = 1;
+  wpk_upload(s, (size_t)-1);
+  return 0;
+}
+#endif
+
 static void pool_free(wpk_pool *pl) {
+#ifdef WMMT_NATIVE_VK
+  if (pl->vbo) cinder_vk_buffer_destroy(pl->vbo);
+  if (pl->ibo) cinder_vk_buffer_destroy(pl->ibo);
+  if (pl->nbo) cinder_vk_buffer_destroy(pl->nbo);
+#else
   if (pl->vao) glDeleteVertexArraysOES(1, &pl->vao);
   if (pl->vbo) glDeleteBuffers(1, &pl->vbo);
   if (pl->ibo) glDeleteBuffers(1, &pl->ibo);
   if (pl->nbo) glDeleteBuffers(1, &pl->nbo);
+#endif
   pl->vao = pl->vbo = pl->ibo = pl->nbo = 0;
 }
 
 void wpk_free(wpk_scene *s) {
   for (uint32_t i = 0; s->pools && i < s->n_pools; ++i) pool_free(&s->pools[i]);
   for (uint32_t i = 0; s->loaded && i < s->n_tex; ++i)
+#ifdef WMMT_NATIVE_VK
+    if (s->loaded[i]) cinder_vk_texture_destroy(s->loaded[i]);
+#else
     if (s->loaded[i]) glDeleteTextures(1, &s->loaded[i]);
+#endif
   for (uint32_t i = 0; s->cubes && i < s->n_cube; ++i)
+#ifdef WMMT_NATIVE_VK
+    if (s->cubes[i]) cinder_vk_texture_destroy(s->cubes[i]);
+#else
     if (s->cubes[i]) glDeleteTextures(1, &s->cubes[i]);
+#endif
   free(s->cubes);
   free(s->cube_warm);
   free(s->cube_tbl);
   free(s->gloss_noff);
   for (uint32_t i = 0; s->ao_tex && i < s->n_ao; ++i)
+#ifdef WMMT_NATIVE_VK
+    if (s->ao_tex[i]) cinder_vk_texture_destroy(s->ao_tex[i]);
+#else
     if (s->ao_tex[i]) glDeleteTextures(1, &s->ao_tex[i]);
+#endif
   free(s->ao_tex);
   free(s->ao_file);
   file_close(s);
@@ -1409,7 +1727,11 @@ int wpk_free_step(wpk_scene *s, uint32_t budget) {
   for (; budget && s->n_pools; --budget) pool_free(&s->pools[--s->n_pools]);
   for (; budget && s->n_tex; --budget) {
     uint32_t i = --s->n_tex;
+#ifdef WMMT_NATIVE_VK
+    if (s->loaded && s->loaded[i]) cinder_vk_texture_destroy(s->loaded[i]);
+#else
     if (s->loaded && s->loaded[i]) glDeleteTextures(1, &s->loaded[i]);
+#endif
   }
   if (s->n_pools || s->n_tex) return 0;
   wpk_free(s);
@@ -1454,7 +1776,22 @@ static void enhance_grade(const render_params *p, int road, float out[3]) {
   }
 }
 
+void render_display_begin(int width, int height) {
+#ifdef WMMT_NATIVE_VK
+  native_scene = (native_scene_view){0, width, height};
+#else
+  (void)width; (void)height;
+#endif
+}
+
 void render_begin(const render_params *p) {
+#ifdef WMMT_NATIVE_VK
+  if (native_scene.w <= 0 || native_scene.h <= 0) {
+    native_scene.target = 0;
+    cinder_vk_screen_extent(&native_scene.w, &native_scene.h);
+  }
+#endif
+#ifndef WMMT_NATIVE_VK
   static const float none[3] = { 1.0f, 1.0f, 1.0f };
   float adjusted[3];
   const float *grade = p->grade[0] > 0.0f ? p->grade : none;
@@ -1468,6 +1805,8 @@ void render_begin(const render_params *p) {
     glUniform1i(pr->tex, 0);
     glUniform2f(pr->uv_off, 0, 0);
   }
+#endif
+#ifndef WMMT_NATIVE_VK
   glActiveTexture(GL_TEXTURE0);
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
@@ -1477,6 +1816,10 @@ void render_begin(const render_params *p) {
   glEnable(GL_CULL_FACE);
   glCullFace(GL_BACK);
   glFrontFace(GL_CCW);
+#else
+  /* Native draws name samplers and their complete pipeline in each packet. */
+  (void)p;
+#endif
 }
 
 /* ---- render_hq (a phone of today's, app_console): the 3D through a multisampled
@@ -1499,9 +1842,11 @@ static struct {
   /* EXT_multisampled_render_to_texture (Adreno's, Mali's): the samples live in the tile
    * memory alone and the frame lands resolved in its texture as each tile is stored, no
    * multisampled buffer in memory and no blit; the frame alternates between blur.tex and
-   * rt_tex (the paint and the wet road read the last one), swapped in render_blur_end.
-   * msrt_z: its "2", the depth too into a texture (render_ssao's z_tex, no blit) */
-  int msrt, msrt_z;
+   * rt_tex (the paint and the wet road read the last one), swapped in render_blur_end. */
+  int msrt;
+#ifndef WMMT_VK
+  int msrt_available;
+#endif
   /* render_hq_level's: what has been given up for the frame rate, and as asked: the share
    * of the screen's size the 3D is drawn at, the samples and the bloom */
   int level, samples0;
@@ -1624,11 +1969,13 @@ static const char *FS_AO_BLUR =
 #define GL_RGBA8_ 0x8058
 /* the targets' formats, best first: 32 bits of floats (the tiles hold as many pixels as
  * RGBA8's: 4x MSAA in RGBA16F cost the Mi 6 5 ms a frame), 64, then no floats */
+#ifndef WMMT_NATIVE_VK
 static const struct { GLenum internal, format, type; } HQ_FORMATS[3] = {
   { GL_R11F_G11F_B10F_, GL_RGB, GL_HALF_FLOAT_ },
   { GL_RGBA16F_, GL_RGBA, GL_HALF_FLOAT_ },
   { GL_RGBA8_, GL_RGBA, GL_UNSIGNED_BYTE },
 };
+#endif
 #define GL_READ_FRAMEBUFFER_ 0x8CA8
 #define GL_DRAW_FRAMEBUFFER_ 0x8CA9
 #define GL_MAX_SAMPLES_ 0x8D57
@@ -1637,6 +1984,9 @@ static const struct { GLenum internal, format, type; } HQ_FORMATS[3] = {
 #define GL_UNSIGNED_INT_24_8_ 0x84FA
 #define GL_DEPTH_STENCIL_ATTACHMENT_ 0x821A
 
+#ifdef WMMT_NATIVE_VK
+#include "render_native_targets.inc"
+#else
 /* a target's texture in hq.fmt, bound, linear and clamped (blur.tex's too) */
 static void hq_tex_image(int w, int h) {
   glTexImage2D(GL_TEXTURE_2D, 0, (GLint)HQ_FORMATS[hq.fmt].internal, w, h, 0, HQ_FORMATS[hq.fmt].format,
@@ -1713,9 +2063,9 @@ static GLuint z_texture(int w, int h) {
   return t;
 }
 
-/* (with msrt the targets' own depth texture is z_tex already, or there is none to read) */
+/* The optional single-sample Vulkan compatibility path already attaches z_tex. */
 static void ssao_targets(int w, int h) {
-  if (hq.ssao <= 0.0f || !hq.ao_prog) return;
+  if (hq.ssao <= 0.0f || !hq.ao_prog || !hq.opt_ao) return;
   int ok = hq.z_tex != 0;
   if (!hq.msrt
 #ifdef WMMT_VK
@@ -1749,34 +2099,19 @@ static void ssao_targets(int w, int h) {
 
 /* the targets for a w x h frame (blur's own texture and framebuffer being the resolve's);
  * 0 if this GPU can't */
-/* msrt's: blur's framebuffer and rt_fbo, each into its texture, the depth shared (z_tex, or
- * a renderbuffer whose samples are never stored); 0 if this GPU can't (blur's as it was) */
+/* MSRT writes colour into either texture and shares transient depth/stencil. */
 static int msrt_targets(int w, int h) {
-#ifdef WMMT_VK
-  /* Vulkan's single-sample path owns z_tex independently of MSRT. */
-  int z = 0;
-#else
-  int z = hq.ssao > 0.0f && hq.ao_prog && hq.msrt_z;
-#endif
-  if (z) {
-    hq.z_tex = z_texture(w, h);
-  } else {
-    glGenRenderbuffers(1, &hq.rt_depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, hq.rt_depth);
-    hq.storage_ms_ext(GL_RENDERBUFFER, hq.samples, GL_DEPTH24_STENCIL8_OES, w, h);
-  }
+  glGenRenderbuffers(1, &hq.rt_depth);
+  glBindRenderbuffer(GL_RENDERBUFFER, hq.rt_depth);
+  hq.storage_ms_ext(GL_RENDERBUFFER, hq.samples, GL_DEPTH24_STENCIL8_OES, w, h);
   hq.rt_tex = hq_texture(w, h);
   glGenFramebuffers(1, &hq.rt_fbo);
   int ok = 1;
   for (int k = 0; k < 2; ++k) {
     glBindFramebuffer(GL_FRAMEBUFFER, k ? hq.rt_fbo : blur.fbo);
     hq.tex_ms(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, k ? hq.rt_tex : blur.tex, 0, hq.samples);
-    if (z) {
-      hq.tex_ms(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT_, GL_TEXTURE_2D, hq.z_tex, 0, hq.samples);
-    } else {
-      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, hq.rt_depth);
-      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, hq.rt_depth);
-    }
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, hq.rt_depth);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, hq.rt_depth);
     ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
   }
   if (!ok) { /* blur's back as render_blur_begin made it */
@@ -1785,15 +2120,23 @@ static int msrt_targets(int w, int h) {
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, blur.depth);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, blur.depth);
   }
-  fprintf(stderr, "render_hq: %s\n", ok ? (z ? "rendered to texture, depth too" : "rendered to texture")
-                                          : "no rendering to texture, blits");
+  fprintf(stderr, "render_hq: %s\n", ok ? "rendered to texture" : "no rendering to texture, blits");
   return ok;
 }
 
 static int hq_targets(int w, int h, GLint screen) {
   hq_free();
+#ifndef WMMT_VK
+  /* MSRT2 permits depth texture attachments but discards them at resolve.
+   * Use core GLES3 blits for readable depth while keeping MSAA. */
+  int need_depth = hq.opt_ao && hq.ssao > 0.0f && hq.ao_prog;
+  hq.msrt = hq.msrt_available && !need_depth;
+#endif
   if (hq.msrt && !msrt_targets(w, h)) {
     hq_free();
+#ifndef WMMT_VK
+    hq.msrt_available = 0;
+#endif
     hq.msrt = 0;
   }
   if (hq.msrt) {
@@ -1839,14 +2182,33 @@ static int hq_targets(int w, int h, GLint screen) {
   return ok;
 }
 
+#endif /* reference resource graph */
 static int msrt_off;
 void render_hq_blits(void) { msrt_off = 1; }
+
+#ifdef WMMT_NATIVE_VK
+static void native_hq_programs_release(void) {
+  for (int i = 0; i < 2; ++i) native_program_release(&hq.down_prog[i]);
+  native_program_release(&hq.up_prog);
+  for (int i = 3; i < 6; ++i) native_program_release(&blur_progs[i]);
+}
+#endif
 
 int render_hq(int samples, float bloom) {
   frame_history_valid = 0;
   frame_sampler_off();
+#ifdef WMMT_NATIVE_VK
+  hq_free();
+#endif
   hq.on = 0;
   if (samples <= 0) return 0;
+#ifdef WMMT_NATIVE_VK
+  GLint most = cinder_vk_sample_limit();
+  if (most < 1) return 0;
+  samples = samples < most ? samples : most;
+  samples = samples >= 8 ? 8 : samples >= 4 ? 4 : samples >= 2 ? 2 : 1;
+  hq.msrt = !msrt_off;
+#else
 #ifdef WMMT_EGL
   hq.blit = (hq_blit_fn)eglGetProcAddress("glBlitFramebuffer");
   hq.storage_ms = (hq_rbms_fn)eglGetProcAddress("glRenderbufferStorageMultisample");
@@ -1857,61 +2219,105 @@ int render_hq(int samples, float bloom) {
     return 0;
   }
   const char *ext = (const char *)glGetString(GL_EXTENSIONS);
-  hq.msrt = hq.msrt_z = 0;
+  hq.msrt = 0;
   if (!msrt_off && ext && strstr(ext, "GL_EXT_multisampled_render_to_texture")) {
 #ifdef WMMT_EGL
     hq.tex_ms = (hq_tex_ms_fn)eglGetProcAddress("glFramebufferTexture2DMultisampleEXT");
     hq.storage_ms_ext = (hq_rbms_fn)eglGetProcAddress("glRenderbufferStorageMultisampleEXT");
 #endif
     hq.msrt = hq.tex_ms && hq.storage_ms_ext;
-    hq.msrt_z = hq.msrt && strstr(ext, "GL_EXT_multisampled_render_to_texture2") != NULL;
   }
+#ifndef WMMT_VK
+  hq.msrt_available = hq.msrt;
+#endif
   GLint most = 0;
   glGetIntegerv(GL_MAX_SAMPLES_, &most);
+#endif
   hq.samples = hq.samples0 = samples < most ? samples : most;
   hq.bloom = hq.bloom0 = bloom;
   hq.scale = 1.0f;
   hq.level = 0;
   hq.opt_bloom = hq.opt_ao = hq.opt_paint = hq.opt_wet = 1;
   const char *attribs[] = { "aPos" };
+#ifdef WMMT_NATIVE_VK
+  native_hq_programs_release();
+#endif
   for (int k = 0; k < 2; ++k) {
     char fs[2048];
     snprintf(fs, sizeof fs, "#define BRIGHT %d\n%s", k, FS_DOWN);
+#ifdef WMMT_NATIVE_VK
+    hq.down_prog[k] = native_program_create(VS_POST, fs, attribs, 1);
+#else
     hq.down_prog[k] = gl_compile_program(VS_POST, fs, attribs, 1);
+#endif
+#ifdef WMMT_NATIVE_VK
+    if (!hq.down_prog[k]) goto native_bad;
+#else
     if (!hq.down_prog[k]) return 0;
+#endif
+#ifndef WMMT_NATIVE_VK
     glUseProgram(hq.down_prog[k]);
     glUniform1i(glGetUniformLocation(hq.down_prog[k], "uTex"), 0);
     hq.down_texel[k] = glGetUniformLocation(hq.down_prog[k], "uTexel");
+#endif
   }
+#ifndef WMMT_NATIVE_VK
   hq.down_thresh = glGetUniformLocation(hq.down_prog[1], "uThresh");
+#endif
+#ifdef WMMT_NATIVE_VK
+  hq.up_prog = native_program_create(VS_POST, FS_UP, attribs, 1);
+#else
   hq.up_prog = gl_compile_program(VS_POST, FS_UP, attribs, 1);
-  if (!hq.up_prog) return 0;
+#endif
+#ifdef WMMT_NATIVE_VK
+    if (!hq.up_prog) goto native_bad;
+#else
+    if (!hq.up_prog) return 0;
+#endif
+#ifndef WMMT_NATIVE_VK
   glUseProgram(hq.up_prog);
   glUniform1i(glGetUniformLocation(hq.up_prog, "uTex"), 0);
   hq.up_texel = glGetUniformLocation(hq.up_prog, "uTexel");
+#endif
   for (int k = 0; k < 3; ++k) {
     char vs[2048], fs[4096];
     snprintf(vs, sizeof vs, "#define BLUR_TAPS %d\n#define SHARPEN %d\n%s", k == 1 ? 8 : 1, k == 2, VS_BLUR);
     snprintf(fs, sizeof fs, "#define BLUR_TAPS %d\n#define SHARPEN %d\n#define HQ 1\n%s", k == 1 ? 8 : 1, k == 2, FS_BLUR);
     const char *battr[] = { "aPos", "aUV", "aAlpha" };
+#ifdef WMMT_NATIVE_VK
+    GLuint p = native_program_create(vs, fs, battr, 3);
+#else
     GLuint p = gl_compile_program(vs, fs, battr, 3);
+#endif
+#ifdef WMMT_NATIVE_VK
+    if (!p) goto native_bad;
+#else
     if (!p) return 0;
+#endif
     blur_progs[3 + k] = p;
+#ifndef WMMT_NATIVE_VK
     glUseProgram(p);
     glUniform1i(glGetUniformLocation(p, "uTex"), 0);
     glUniform1i(glGetUniformLocation(p, "uBloom"), 1);
     glUniform1i(glGetUniformLocation(p, "uAO"), 2);
     bloom_k[k] = glGetUniformLocation(p, "uBloomK");
+#endif
   }
+#ifndef WMMT_NATIVE_VK
   sharp_texel[1] = glGetUniformLocation(blur_progs[5], "uTexel");
   sharp_amount[1] = glGetUniformLocation(blur_progs[5], "uSharp");
+#endif
   /* the maps' programs again, with WET for the roads */
   for (int k = 0; k < 2; ++k) {
     static char fs[2][4096];
     snprintf(fs[k], sizeof fs[k], "#define WET 1\n%s", k ? FS_CUTOUT : FS);
     scene_prog np;
     if (prog_init(&np, fs[k]) == 0) {
+#ifdef WMMT_NATIVE_VK
+      cinder_vk_program_destroy(progs[k].id);
+#else
       glDeleteProgram(progs[k].id);
+#endif
       progs[k] = np;
     }
   }
@@ -1919,7 +2325,11 @@ int render_hq(int samples, float bloom) {
   frame_env = 1;
   lit_prog np;
   if (lit_init(&np, WPK_LIT_CAR, 0) == 0) { /* (its output is opaque: one for both, as render_init) */
+#ifdef WMMT_NATIVE_VK
+    cinder_vk_program_destroy(lit_progs[2 * WPK_LIT_CAR].id);
+#else
     glDeleteProgram(lit_progs[2 * WPK_LIT_CAR].id);
+#endif
     lit_progs[2 * WPK_LIT_CAR] = lit_progs[2 * WPK_LIT_CAR + 1] = np;
   } else {
     frame_env = 0;
@@ -1929,26 +2339,60 @@ int render_hq(int samples, float bloom) {
   fprintf(stderr, "render_hq: %dx MSAA (of %d), bloom %.2f\n", hq.samples, most, bloom);
   hq_said = 0;
   return 1;
+#ifdef WMMT_NATIVE_VK
+native_bad:
+  native_hq_programs_release();
+  return 0;
+#endif
 }
 
 void render_ssao(float k) {
   hq.ssao = 0.0f;
   if (!hq.on || k <= 0.0f) return;
   const char *attribs[] = { "aPos" };
-  if (!hq.ao_prog) {
+  if (
+#ifdef WMMT_NATIVE_VK
+      !cinder_vk_program_ready(hq.ao_prog) || !cinder_vk_program_ready(hq.ao_blur_prog)
+#else
+      !hq.ao_prog
+#endif
+  ) {
+#ifdef WMMT_NATIVE_VK
+    native_program_release(&hq.ao_prog);
+    native_program_release(&hq.ao_blur_prog);
+#endif
+#ifdef WMMT_NATIVE_VK
+    hq.ao_prog = native_program_create(VS_POST, FS_SSAO, attribs, 1);
+#else
     hq.ao_prog = gl_compile_program(VS_POST, FS_SSAO, attribs, 1);
+#endif
+#ifdef WMMT_NATIVE_VK
+    hq.ao_blur_prog = hq.ao_prog ? native_program_create(VS_POST, FS_AO_BLUR, attribs, 1) : 0;
+#else
     hq.ao_blur_prog = hq.ao_prog ? gl_compile_program(VS_POST, FS_AO_BLUR, attribs, 1) : 0;
+#endif
     if (!hq.ao_blur_prog
-#ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+        || !cinder_vk_program_ready(hq.ao_prog) || !cinder_vk_program_ready(hq.ao_blur_prog)
+#elif defined(WMMT_VK)
         || !vkgl_program_usable(hq.ao_prog) || !vkgl_program_usable(hq.ao_blur_prog)
 #endif
     ) {
+#ifdef WMMT_NATIVE_VK
+      if (hq.ao_prog) cinder_vk_program_destroy(hq.ao_prog);
+#else
       if (hq.ao_prog) glDeleteProgram(hq.ao_prog);
+#endif
+#ifdef WMMT_NATIVE_VK
+      if (hq.ao_blur_prog) cinder_vk_program_destroy(hq.ao_blur_prog);
+#else
       if (hq.ao_blur_prog) glDeleteProgram(hq.ao_blur_prog);
+#endif
       hq.ao_prog = hq.ao_blur_prog = 0;
       fprintf(stderr, "render_ssao: no program, off\n");
       return;
     }
+#ifndef WMMT_NATIVE_VK
     glUseProgram(hq.ao_prog);
     glUniform1i(glGetUniformLocation(hq.ao_prog, "uTex"), 0);
     hq.ao_view = glGetUniformLocation(hq.ao_prog, "uView");
@@ -1957,9 +2401,14 @@ void render_ssao(float k) {
     glUseProgram(hq.ao_blur_prog);
     glUniform1i(glGetUniformLocation(hq.ao_blur_prog, "uTex"), 0);
     hq.ao_blur_texel = glGetUniformLocation(hq.ao_blur_prog, "uTexel");
+#endif
   }
   hq.ssao = k;
+#ifdef WMMT_NATIVE_VK
+  native_graph_dirty = 1; /* retain committed extents until the replacement succeeds */
+#else
   blur.w = blur.h = 0; /* the targets again, with the occlusion's */
+#endif
 }
 
 /* the levels' frame scale, samples (0 as asked), bloom (as asked or none), occlusion, the
@@ -1969,7 +2418,7 @@ static const struct { float scale; int samples, bloom, ao, env; } HQ_LEVEL[HQ_LE
   { 0.84f, 2, 1, 0, 1 },  { 0.75f, 2, 1, 0, 1 },  { 0.75f, 2, 0, 0, 1 },  { 0.75f, 2, 0, 0, 0 },
 };
 
-#ifdef WMMT_VK
+#if defined(WMMT_VK) && !defined(WMMT_NATIVE_VK)
 /* Build the optional pair without destroying the working MSAA targets or last frame.
  * A failed attempt is not retried until targets are recreated (resize/format change). */
 static void vk_single_targets(int w, int h) {
@@ -2039,13 +2488,20 @@ int render_hq_level(int level) {
   if (samples != hq.samples || HQ_LEVEL[level].scale != hq.scale) {
     hq.samples = samples;
     hq.scale = HQ_LEVEL[level].scale;
+#ifdef WMMT_NATIVE_VK
+    native_graph_dirty = 1;
+#else
     blur.w = blur.h = 0; /* the targets again, at the new size */
+#endif
   }
   hq.bloom = HQ_LEVEL[level].bloom && hq.opt_bloom ? hq.bloom0 : 0.0f;
   return level;
 }
 
 void render_hq_options(int bloom, int ao, int paint, int wet) {
+#ifndef WMMT_VK
+  if (ao != hq.opt_ao && hq.ssao > 0.0f) blur.w = blur.h = 0;
+#endif
   hq.opt_bloom = bloom, hq.opt_ao = ao, hq.opt_paint = paint, hq.opt_wet = wet;
   render_hq_level(hq.level);
 }
@@ -2055,6 +2511,10 @@ void render_hq_view(float near, float far, float tan_x, float tan_y) {
   hq.view_set = 1;
 }
 
+#include "render_native_post.inc"
+
+#ifndef WMMT_NATIVE_VK
+/* Reference path: uniforms and blend state are authored by the callers below. */
 /* a full-screen pass of prog into fbo's w x h, from tex */
 static void hq_pass(GLuint prog, GLuint fbo, int w, int h, GLuint tex) {
   static const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
@@ -2065,11 +2525,19 @@ static void hq_pass(GLuint prog, GLuint fbo, int w, int h, GLuint tex) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
+#endif
 
 /* the frame resolved into blur.tex, and the bloom's levels from it, the result in tex[0] */
 static int hq_resolve_bloom(void) {
+#ifdef WMMT_NATIVE_VK
+  return native_hq_resolve_bloom();
+#else
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  int history_ok = !cinder_vk_error_pending();
+#else
   int history_ok = !vkgl_error_pending();
+#endif
 #else
   int history_ok = 1;
 #endif
@@ -2090,12 +2558,23 @@ static int hq_resolve_bloom(void) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, blur.fbo);
     hq.blit(0, 0, blur.w, blur.h, 0, 0, blur.w, blur.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+    if (cinder_vk_error_pending()) history_ok = 0;
+#else
     if (vkgl_error_pending()) history_ok = 0;
+#endif
 #endif
   }
   if (ao && !direct) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, hq.z_fbo);
     hq.blit(0, 0, blur.w, blur.h, 0, 0, blur.w, blur.h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+#ifndef WMMT_VK
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+      ao = hq.ssao_ok = 0;
+      fprintf(stderr, "render_ssao: depth resolve error 0x%x, off\n", error);
+    }
+#endif
   }
   if (hq.invalidate && !direct) {
     const GLenum all[] = { GL_COLOR_ATTACHMENT0, GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT };
@@ -2169,6 +2648,7 @@ static int hq_resolve_bloom(void) {
   glDisable(GL_BLEND);
   glBlendFunc((GLenum)bsrc, (GLenum)bdst);
   return history_ok;
+#endif
 }
 
 static int sharp_deep;
@@ -2186,6 +2666,25 @@ static int render_blur_begin_inner(float amount, int w, int h) {
     h = (int)((float)h * hq.scale) & ~1;
   }
   int deep = sharp_deep || hq.on ? 1 + hq.on : 0; /* 2: render_hq's format (HQ_FORMATS) */
+#ifdef WMMT_NATIVE_VK
+  if (w <= 0 || h <= 0) { frame_history_valid = 0; return 0; }
+  if (native_graph_dirty || blur.w != w || blur.h != h || blur.deep != deep || !cinder_vk_target_ready(blur.fbo) ||
+      (hq.on && (native_graph_samples != hq.samples || native_graph_fmt != hq.fmt))) {
+    int made = 0;
+    if (hq.on) for (int fmt = hq.fmt; fmt < 3 && !made; ++fmt)
+      made = native_blur_allocate(w, h, deep, 1, fmt, hq.samples, hq.msrt);
+    else made = native_blur_allocate(w, h, deep, 0, hq.fmt, 1, 0);
+    if (!made && hq.on) {
+      /* All native HDR formats failed. The fallback is itself transactional. */
+      if (amount > 0.0f || blur.sharp > 0.0f) {
+        w = blur.out_w; h = blur.out_h;
+        deep = sharp_deep ? 1 : 0;
+        made = native_blur_allocate(w, h, deep, 0, 2, 1, 0);
+      } else { hq_free(); hq.on = 0; }
+    }
+    if (!made) { frame_history_valid = 0; frame_sampler_off(); return 0; }
+  }
+#else
   if (blur.w != w || blur.h != h || (blur.w > 0 && blur.deep != deep)) {
     frame_history_valid = 0;
     if (blur.fbo) {
@@ -2206,7 +2705,11 @@ static int render_blur_begin_inner(float amount, int w, int h) {
     glGenRenderbuffers(1, &blur.depth);
     glBindRenderbuffer(GL_RENDERBUFFER, blur.depth);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8_OES, w, h);
+#ifdef WMMT_NATIVE_VK
+    blur.screen = (GLint)native_scene.target;
+#else
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &blur.screen);
+#endif
     glGenFramebuffers(1, &blur.fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, blur.fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, blur.tex, 0);
@@ -2237,8 +2740,13 @@ static int render_blur_begin_inner(float amount, int w, int h) {
     blur.h = h;
     blur.deep = deep;
   }
+#endif
   if (blur.w <= 0) { frame_sampler_off(); return 0; }
+#ifdef WMMT_NATIVE_VK
+  blur.screen = (GLint)native_scene.target;
+#else
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &blur.screen);
+#endif
 #ifdef WMMT_VK
   hq.single_frame = 0;
   if (hq.on && hq.ssao > 0.0f && hq.ao_prog && hq.ao_blur_prog && hq.opt_ao && HQ_LEVEL[hq.level].ao) {
@@ -2246,6 +2754,9 @@ static int render_blur_begin_inner(float amount, int w, int h) {
     hq.single_frame = hq.single_ready;
   }
   if (hq.single_frame) {
+#ifdef WMMT_NATIVE_VK
+    if (!cinder_vk_target_ready(hq.single_fbo[1])) hq.single_frame = hq.single_ready = 0;
+#else
     GLenum prior = glGetError();
     if (prior != GL_NO_ERROR) fprintf(stderr, "render_ssao: prior GL error 0x%x\n", prior);
     glBindFramebuffer(GL_FRAMEBUFFER, hq.single_fbo[1]);
@@ -2255,10 +2766,32 @@ static int render_blur_begin_inner(float amount, int w, int h) {
       hq.single_frame = hq.single_ready = 0;
       fprintf(stderr, "render_ssao: scene framebuffer failed; returning to MSAA\n");
     }
+#endif
   }
+#ifdef WMMT_NATIVE_VK
+  if (!native_hq_copy_ready()) {
+    /* The shared resource bridge's raw MSAA RBO may not be transfer-capable.
+     * Decide before scene recording; ordinary blur/direct rendering must receive
+     * the scene, never a stale resolve texture. Preserve the outer error epoch. */
+    fprintf(stderr, "render_hq: native MSAA target cannot transfer; ordinary blur retained\n");
+    hq_free();
+    hq.on = 0;
+    blur.w = blur.h = 0;
+    native_bloom_ready = 0;
+    return render_blur_begin_inner(amount, blur.out_w, blur.out_h);
+  }
+#endif
+#ifndef WMMT_NATIVE_VK
   glBindFramebuffer(GL_FRAMEBUFFER, !hq.on ? blur.fbo : hq.single_frame ? hq.single_fbo[1] : hq.msrt ? hq.rt_fbo : hq.ms_fbo);
+#endif
 #else
   glBindFramebuffer(GL_FRAMEBUFFER, !hq.on ? blur.fbo : hq.msrt ? hq.rt_fbo : hq.ms_fbo);
+#endif
+#ifdef WMMT_NATIVE_VK
+  /* Expected constructor/format/optional-SSAO failures precede scene recording.
+   * Rebase only here; unknown completion remains pending and cannot be trusted. */
+  frame_start_epoch = cinder_vk_error_epoch();
+  frame_recording_trusted = frame_start_epoch != UINT64_MAX && !cinder_vk_error_pending();
 #endif
   blur.amount = amount > 1.0f ? 1.0f : amount < 0.0f ? 0.0f : amount;
   /* Rebind only a completed earlier frame, never the attached scene texture. */
@@ -2268,7 +2801,11 @@ static int render_blur_begin_inner(float amount, int w, int h) {
 #endif
   if (hq.msrt) scene_tex = hq.rt_tex;
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_error_pending() || cinder_vk_error_epoch() == UINT64_MAX || cinder_vk_error_epoch() != frame_start_epoch)
+#else
   if (vkgl_error_pending() || vkgl_error_epoch() == UINT64_MAX || vkgl_error_epoch() != frame_start_epoch)
+#endif
     frame_recording_trusted = frame_history_valid = 0;
 #endif
   if (hq.on && frame_env && frame_history_valid && blur.tex && blur.tex != scene_tex &&
@@ -2285,12 +2822,27 @@ static int render_blur_begin_inner(float amount, int w, int h) {
 
 int render_blur_begin(float amount, int w, int h) {
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  frame_start_epoch = cinder_vk_error_epoch();
+#else
   frame_start_epoch = vkgl_error_epoch();
+#endif
+#ifdef WMMT_NATIVE_VK
+  frame_recording_trusted = frame_start_epoch != UINT64_MAX && !cinder_vk_error_pending();
+#else
   frame_recording_trusted = frame_start_epoch != UINT64_MAX && !vkgl_error_pending();
+#endif
   if (frame_history_valid && (!frame_recording_trusted || frame_history_epoch != frame_start_epoch))
     frame_history_valid = 0;
 #endif
-  return render_blur_begin_inner(amount, w, h);
+  int active = render_blur_begin_inner(amount, w, h);
+#ifdef WMMT_NATIVE_VK
+  /* Scene target is selected by this pass, never inferred from GL bindings. */
+  native_scene = (native_scene_view){0, w, h};
+  if (active) native_scene = (native_scene_view){!hq.on ? blur.fbo : hq.single_frame ? hq.single_fbo[1] :
+      hq.msrt ? hq.rt_fbo : hq.ms_fbo, blur.w, blur.h};
+#endif
+  return active;
 }
 
 void render_blur_size(int *w, int *h) {
@@ -2299,12 +2851,24 @@ void render_blur_size(int *w, int *h) {
 
 void render_blur_end(void) {
   int history_ok = 1;
+#ifdef WMMT_NATIVE_VK
+  uint32_t scene_target = native_scene.target;
+  native_scene = (native_scene_view){(uint32_t)blur.screen, blur.out_w, blur.out_h};
+#endif
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  if (!frame_recording_trusted || cinder_vk_error_pending() || cinder_vk_error_epoch() == UINT64_MAX ||
+#else
   if (!frame_recording_trusted || vkgl_error_pending() || vkgl_error_epoch() == UINT64_MAX ||
+#endif
+#ifdef WMMT_NATIVE_VK
+      cinder_vk_error_epoch() != frame_start_epoch) history_ok = 0;
+#else
       vkgl_error_epoch() != frame_start_epoch) history_ok = 0;
 #endif
+#endif
   frame_sampler_off();
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(WMMT_NATIVE_VK)
 #ifdef WMMT_VK
   if (!hq.single_frame)
 #endif
@@ -2315,7 +2879,7 @@ void render_blur_end(void) {
 #endif
   frame_k = 0;
   frame_wet = 0;
-#ifdef WMMT_VK
+#if defined(WMMT_VK) && !defined(WMMT_NATIVE_VK)
   if (hq.single_frame) {
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
@@ -2337,8 +2901,12 @@ void render_blur_end(void) {
         && !hq.single_frame
 #endif
     ) {
+#ifdef WMMT_NATIVE_VK
+      if (!cinder_vk_discard(scene_target, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) history_ok = 0;
+#else
       const GLenum ds[] = { GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT };
       hq.invalidate(GL_FRAMEBUFFER, 2, ds);
+#endif
     }
     GLuint t = blur.tex, f = blur.fbo;
     blur.tex = hq.rt_tex, blur.fbo = hq.rt_fbo;
@@ -2351,15 +2919,26 @@ void render_blur_end(void) {
   }
   if (hq.on && !hq_resolve_bloom()) history_ok = 0;
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_error_pending() || cinder_vk_error_epoch() == UINT64_MAX || cinder_vk_error_epoch() != frame_start_epoch)
+#else
   if (vkgl_error_pending() || vkgl_error_epoch() == UINT64_MAX || vkgl_error_epoch() != frame_start_epoch)
+#endif
     history_ok = 0;
 #endif
   /* Recording is not a proof of asynchronous GPU completion. */
   frame_history_valid = hq.on && history_ok;
 #ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  if (frame_history_valid) frame_history_epoch = cinder_vk_error_epoch();
+#else
   if (frame_history_valid) frame_history_epoch = vkgl_error_epoch();
 #endif
+#endif
   hq.view_set = 0; /* each frame's own (the menus' 3D has none) */
+#ifdef WMMT_NATIVE_VK
+  if (!native_post_clear((uint32_t)blur.screen, native_post_clear_color)) frame_history_valid = 0;
+#else
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)blur.screen);
   glViewport(0, 0, blur.out_w, blur.out_h);
   /* the composite covers the screen: a clear spares the tiler loading last frame's buffers */
@@ -2368,6 +2947,7 @@ void render_blur_end(void) {
   glDepthMask(GL_TRUE);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
   glDepthMask(depth_mask);
+#endif
   /* clRadialBlur::setupPosition on the arcade's 640 x 480 screen, in clip space: the bands
    * are 239 pixels wide and slide in from outside the screen as the blur grows (240 pixels
    * per unit), their texture with them, so the frame stays where it is */
@@ -2380,6 +2960,7 @@ void render_blur_end(void) {
                          ri, -1, 0, 0, 0, ro, -1, 0, 0, 1, ro, 1, 0, 0, 1, ri, 1, 0, 0, 0 };
   static const uint16_t idx[] = { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
   float v[40];
+#ifndef WMMT_NATIVE_VK
   glBindVertexArrayOES(0);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -2394,6 +2975,7 @@ void render_blur_end(void) {
   }
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, blur.tex);
+#endif
   for (int k = 0; k < 2; ++k) {
     const float *src = k ? band : mid;
     int n = k ? 8 : 4;
@@ -2402,6 +2984,9 @@ void render_blur_end(void) {
       v[5 * i + 2] = (src[5 * i] + 1.0f) * 0.5f; /* the frame 1:1 */
       v[5 * i + 3] = (src[5 * i + 1] + 1.0f) * 0.5f;
     }
+#ifdef WMMT_NATIVE_VK
+    if (!native_final_composite(v, (size_t)n * 5 * sizeof *v, idx, k)) frame_history_valid = 0;
+#else
     int q = hq.on ? 3 : 0;
     if (!k && blur.sharp > 0.0f) {
       glUseProgram(blur_progs[q + 2]);
@@ -2416,12 +3001,16 @@ void render_blur_end(void) {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof *v, v + 2);
     glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 5 * sizeof *v, v + 4);
     glDrawElements(GL_TRIANGLES, k ? 12 : 6, GL_UNSIGNED_SHORT, idx);
+#endif
   }
+#ifndef WMMT_NATIVE_VK
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_CULL_FACE);
+#endif
 }
 
 void render_blend_pass(int on) {
+#ifndef WMMT_NATIVE_VK
   if (on) {
     glEnable(GL_BLEND);
     glDepthMask(GL_FALSE);
@@ -2429,7 +3018,14 @@ void render_blend_pass(int on) {
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
   }
+#else
+  /* WPK kind/effect/post packets already author blend and depth write. This
+   * legacy scheduling hook must not create a second inherited native state. */
+  (void)on;
+#endif
 }
+
+#include "render_native_effects.inc"
 
 static void sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p, GLenum src) {
   static uint16_t idx[6 * RENDER_MAX_SPRITES];
@@ -2441,6 +3037,9 @@ static void sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint3
     }
   if (n_quads > RENDER_MAX_SPRITES) n_quads = RENDER_MAX_SPRITES;
   if (n_quads <= 0) return;
+#ifdef WMMT_NATIVE_VK
+  if (native_effect_quads(proj, v, n_quads, tex, idx, src == GL_SRC_COLOR, 0, p)) ++p->draws;
+#else
   const scene_prog *pr = &progs[0];
   glUseProgram(pr->id);
   glUniformMatrix4fv(pr->mvp, 1, GL_FALSE, proj->m);
@@ -2464,6 +3063,7 @@ static void sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint3
   if (enhance_on) { float grade[3]; enhance_grade(p, 0, grade); glUniform3fv(pr->grade, 1, grade); }
   else if (p->grade[0] > 0.0f) glUniform3fv(pr->grade, 1, p->grade);
   p->draws++;
+#endif
 }
 
 void render_sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p) {
@@ -2473,6 +3073,217 @@ void render_sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint3
 void render_sprites_by_colour(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p) {
   sprites(proj, v, n_quads, tex, p, GL_SRC_COLOR);
 }
+
+/* ---- isolated, float-colour tail trail drawing ---- */
+/* Keep the exact scene VS/FS and attribute list: vkgl hashes their text, so a
+ * private program reuses the shipped SPIR-V without sharing uniform storage.
+ * A private VAO avoids overwriting the caller's pointers/enables/EBO; a VBO
+ * avoids ES3 client arrays and keeps deferred Vulkan draws independent of the
+ * temporary CPU conversion below. Never change generic attributes (not VAO state). */
+static struct {
+  scene_prog program;
+  GLuint vao, vbo;
+  int failed;
+} tail_render;
+
+typedef struct { float pos[3], uv[2], rgba[4]; } tail_render_vertex;
+
+void render_tail_context_lost(void) { memset(&tail_render, 0, sizeof tail_render); }
+
+void render_tail_release(void) {
+#ifndef WMMT_NATIVE_VK
+  if (tail_render.vao) glDeleteVertexArraysOES(1, &tail_render.vao);
+  if (tail_render.vbo) glDeleteBuffers(1, &tail_render.vbo);
+#endif
+#ifdef WMMT_NATIVE_VK
+  if (tail_render.program.id) cinder_vk_program_destroy(tail_render.program.id);
+#else
+  if (tail_render.program.id) glDeleteProgram(tail_render.program.id);
+#endif
+  render_tail_context_lost();
+}
+
+static int tail_render_prepare(void) {
+  if (tail_render.failed) return 0;
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_program_ready(tail_render.program.id)) return 1;
+  native_program_release(&tail_render.program.id);
+#else
+  if (tail_render.program.id && tail_render.vao && tail_render.vbo) return 1;
+#endif
+  if (prog_init(&tail_render.program, FS)) goto bad;
+#if defined(WMMT_VK) && !defined(WMMT_NATIVE_VK)
+  /* A missing SPIR-V still returns a nonzero program name. */
+  if (!vkgl_program_usable(tail_render.program.id)) goto bad;
+#endif
+#ifndef WMMT_NATIVE_VK
+  const scene_prog *pr = &tail_render.program;
+  if (pr->mvp < 0 || pr->eye < 0 || pr->fog < 0 || pr->fog_color < 0 ||
+      pr->tex < 0 || pr->uv_off < 0 || pr->grade < 0) goto bad;
+#endif
+#ifndef WMMT_NATIVE_VK
+  glGenVertexArraysOES(1, &tail_render.vao);
+  glGenBuffers(1, &tail_render.vbo);
+  if (!tail_render.vao || !tail_render.vbo) goto bad;
+#endif
+  return 1;
+bad:
+  render_tail_release();
+  tail_render.failed = 1; /* No allocation/compile storm; explicit release/loss retries. */
+  return 0;
+}
+
+#ifndef WMMT_VK
+typedef struct {
+  GLint program, array, vao, active, texture;
+  GLint src_rgb, dst_rgb, src_a, dst_a, eq_rgb, eq_a, depth_func;
+  GLboolean blend, depth, cull, stencil, depth_write, colour[4];
+} tail_render_gl_state;
+
+static void tail_render_gl_save(tail_render_gl_state *s) {
+  glGetIntegerv(GL_CURRENT_PROGRAM, &s->program);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s->array);
+  glGetIntegerv(GL_VERTEX_ARRAY_BINDING_OES, &s->vao);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &s->active);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &s->texture);
+  glActiveTexture((GLenum)s->active);
+  glGetIntegerv(GL_BLEND_SRC_RGB, &s->src_rgb); glGetIntegerv(GL_BLEND_DST_RGB, &s->dst_rgb);
+  glGetIntegerv(GL_BLEND_SRC_ALPHA, &s->src_a); glGetIntegerv(GL_BLEND_DST_ALPHA, &s->dst_a);
+  glGetIntegerv(GL_BLEND_EQUATION_RGB, &s->eq_rgb); glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &s->eq_a);
+  glGetIntegerv(GL_DEPTH_FUNC, &s->depth_func);
+  s->blend = glIsEnabled(GL_BLEND); s->depth = glIsEnabled(GL_DEPTH_TEST);
+  s->cull = glIsEnabled(GL_CULL_FACE); s->stencil = glIsEnabled(GL_STENCIL_TEST);
+  glGetBooleanv(GL_DEPTH_WRITEMASK, &s->depth_write);
+  glGetBooleanv(GL_COLOR_WRITEMASK, s->colour);
+}
+
+static void tail_render_gl_restore(const tail_render_gl_state *s) {
+  glBindVertexArrayOES((GLuint)s->vao); /* Restores its EBO and attribute layout too. */
+  glBindBuffer(GL_ARRAY_BUFFER, (GLuint)s->array);
+  glBlendEquationSeparate((GLenum)s->eq_rgb, (GLenum)s->eq_a);
+  glBlendFuncSeparate((GLenum)s->src_rgb, (GLenum)s->dst_rgb, (GLenum)s->src_a, (GLenum)s->dst_a);
+  if (s->blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+  if (s->depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+  if (s->cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+  if (s->stencil) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+  glDepthFunc((GLenum)s->depth_func); glDepthMask(s->depth_write);
+  glColorMask(s->colour[0], s->colour[1], s->colour[2], s->colour[3]);
+  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, (GLuint)s->texture);
+  glActiveTexture((GLenum)s->active); glUseProgram((GLuint)s->program);
+}
+#endif
+
+int render_tail_triangles(const mat4 *vp, const TailTrailVertex *v, size_t n_vertices, render_params *p) {
+  /* Validate before ANY GL calls, including lazy resource creation. No update,
+   * aging, anchor inference or float-to-byte colour conversion belongs here. */
+  if (!vp || !v || !p || !n_vertices || n_vertices > 2u * TAIL_TRAIL_MAX_VERTICES ||
+      n_vertices % 3u || !white_tex || !progs[0].id || tail_render.failed) return 0;
+  for (int i = 0; i < 16; ++i) if (!isfinite(vp->m[i])) return 0;
+  tail_render_vertex vertices[2 * TAIL_TRAIL_MAX_VERTICES];
+  for (size_t i = 0; i < n_vertices; ++i) {
+    const float pos[3] = { v[i].position.x, v[i].position.y, v[i].position.z };
+    for (int j = 0; j < 3; ++j) {
+      if (!isfinite(pos[j]) || fabsf(pos[j]) > 1e12f) return 0;
+      vertices[i].pos[j] = pos[j];
+    }
+    for (int j = 0; j < 4; ++j) {
+      if (!isfinite(v[i].rgba[j]) || v[i].rgba[j] < 0 || v[i].rgba[j] > 1) return 0;
+      vertices[i].rgba[j] = v[i].rgba[j];
+      /* Bound intermediate shader products/sums, not just a cancelling result. */
+      double bound = fabs((double)vp->m[12 + j]);
+      for (int k = 0; k < 3; ++k) bound += fabs((double)vp->m[4 * k + j] * pos[k]);
+      if (bound > 1e30) return 0;
+    }
+    vertices[i].uv[0] = vertices[i].uv[1] = 0;
+  }
+#ifdef WMMT_NATIVE_VK
+  cinder_vk_draw packet;
+  if (!native_effect_init(&packet, vp, white_tex, 1e30f, 1e29f)) return 0;
+  packet.pipeline.depth_test = VK_TRUE;
+  packet.pipeline.blend = VK_TRUE;
+  packet.pipeline.src_blend = VK_BLEND_FACTOR_SRC_ALPHA;
+  packet.pipeline.dst_blend = VK_BLEND_FACTOR_ONE;
+  native_effect_vertices(&packet, vertices, n_vertices * sizeof vertices[0], sizeof vertices[0], VK_FORMAT_R32G32B32A32_SFLOAT);
+  packet.count = (uint32_t)n_vertices;
+  if (!cinder_vk_submit(&packet)) { tail_render.failed = 1; return 0; }
+  ++p->draws; p->triangles += (int)(n_vertices / 3u);
+  return 1;
+#else
+#ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  uint64_t epoch = cinder_vk_error_epoch();
+#else
+  uint64_t epoch = vkgl_error_epoch();
+#endif
+  if (epoch == UINT64_MAX) return 0;
+  /* The baseline program is not changed; the existing scope API requires a
+   * valid program to snapshot in addition to the full actual adapter context. */
+  void *snapshot = vkgl_preview_save(progs[0].id);
+  if (!snapshot) return 0;
+#else
+  tail_render_gl_state state;
+  tail_render_gl_save(&state);
+#endif
+  int submitted = 0;
+  if (!tail_render_prepare()) goto restore;
+#ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_error_epoch() != epoch) goto device_error;
+#else
+  if (vkgl_error_epoch() != epoch) goto device_error;
+#endif
+#endif
+  const scene_prog *pr = &tail_render.program;
+  glUseProgram(pr->id);
+  glUniformMatrix4fv(pr->mvp, 1, GL_FALSE, vp->m);
+  glUniform3f(pr->eye, 0, 0, 0);
+  /* With the bounded world coordinates above, this ratio clamps exactly to 1:
+   * no fog, while keeping the shipped shader text/hash completely unchanged. */
+  glUniform2f(pr->fog, 1e30f, 1e29f);
+  glUniform3f(pr->fog_color, 0, 0, 0);
+  glUniform2f(pr->uv_off, 0, 0); glUniform3f(pr->grade, 1, 1, 1);
+  glUniform1i(pr->tex, 0);
+  if (pr->wet >= 0) glUniform1f(pr->wet, 0);
+  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, white_tex);
+  glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
+  glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glEnable(GL_BLEND); glBlendEquation(GL_FUNC_ADD); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+  glBindVertexArrayOES(tail_render.vao);
+  glBindBuffer(GL_ARRAY_BUFFER, tail_render.vbo);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(n_vertices * sizeof vertices[0]), vertices, GL_STREAM_DRAW);
+  glEnableVertexAttribArray(0); glEnableVertexAttribArray(1); glEnableVertexAttribArray(2);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof vertices[0], (const void *)offsetof(tail_render_vertex, pos));
+  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof vertices[0], (const void *)offsetof(tail_render_vertex, uv));
+  glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof vertices[0], (const void *)offsetof(tail_render_vertex, rgba));
+  glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_vertices);
+#ifdef WMMT_VK
+#ifdef WMMT_NATIVE_VK
+  if (cinder_vk_error_epoch() != epoch) goto device_error;
+#else
+  if (vkgl_error_epoch() != epoch) goto device_error;
+#endif
+#endif
+  submitted = 1;
+  ++p->draws; p->triangles += (int)(n_vertices / 3u);
+  goto restore;
+#ifdef WMMT_VK
+device_error:
+  render_tail_release(); tail_render.failed = 1;
+#endif
+restore:
+#ifdef WMMT_VK
+  vkgl_scope_restore_preserve_error(snapshot);
+#else
+  /* Do not drain glGetError: an older caller error must not be consumed. */
+  tail_render_gl_restore(&state);
+#endif
+  return submitted;
+#endif
+}
+
+#include "render_tire_smoke.inc"
 
 #ifdef __ANDROID__
 /* clTireTrack::draw: SRC_ALPHA/ONE_MINUS_SRC_ALPHA, RGB writes only,
@@ -2487,6 +3298,11 @@ void render_tire_tracks(const mat4 *vp, const render_vertex *v, int n_quads, uin
       uint16_t b = (uint16_t)(4 * i), *q = idx + 6 * i;
       q[0] = b; q[1] = b + 1; q[2] = b + 2; q[3] = b; q[4] = b + 2; q[5] = b + 3;
     }
+#ifdef WMMT_NATIVE_VK
+  if (native_effect_quads(vp, v, n_quads, tex, idx, 0, 1, p)) {
+    ++p->draws; p->triangles += 2 * n_quads;
+  }
+#else
   GLboolean mask[4], depth_write;
   glGetBooleanv(GL_COLOR_WRITEMASK, mask);
   glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_write);
@@ -2530,6 +3346,7 @@ void render_tire_tracks(const mat4 *vp, const render_vertex *v, int n_quads, uin
   else if (p->grade[0] > 0.0f) glUniform3fv(pr->grade, 1, p->grade);
   ++p->draws;
   p->triangles += 2 * n_quads;
+#endif
 }
 #endif
 
@@ -2561,6 +3378,7 @@ static int box_outside(const mat4 *mvp, const float *lo, const float *hi) {
 /* Bind batch b's buffers and vertex layout: through its pool's vertex array object, made
  * the first time (in the app's context: the loading thread's, which uploads the buffers,
  * does not draw with these); *bound is the one bound now (0 none). */
+#ifndef WMMT_NATIVE_VK
 static void bind_batch(const wpk_scene *s, const wpk_batch *b, GLuint *bound) {
   wpk_pool *pl = &s->pools[b->pool];
   if (pl->vao) {
@@ -2585,6 +3403,8 @@ static void bind_batch(const wpk_scene *s, const wpk_batch *b, GLuint *bound) {
     glVertexAttribPointer(3, 3, GL_SHORT, GL_TRUE, 8, (const void *)0);
   }
 }
+
+#endif
 
 /* a lit scene's per-draw values, in the model's space */
 typedef struct {
@@ -2614,6 +3434,7 @@ static void lit_begin(lit_draw *d, const mat4 *mvp, const mat4 *model, const flo
   d->env = d->spec = d->ao = 0;
 }
 
+#ifndef WMMT_NATIVE_VK
 static const lit_prog *lit_use(lit_draw *d, int idx, const render_params *p) {
   const lit_prog *lp = &lit_progs[idx];
   if (d->cur != idx) glUseProgram(lp->id);
@@ -2641,10 +3462,15 @@ static const lit_prog *lit_use(lit_draw *d, int idx, const render_params *p) {
   if (lp->frame_k >= 0) glUniform1f(lp->frame_k, enhance_on ? frame_k * 1.12f : frame_k);
   return lp;
 }
+#endif
 
 void wpk_draw_wheels(const wpk_scene *w, const mat4 *view_proj, const mat4 *model, const float *eye_local,
                      int pass, render_params *p, const float hub[2][4]) {
   render_params q = *p;
+  /* Separate wheel-pack owner, never the BODY root story scope. */
+  q.story_assembly_enabled = 0;
+  q.story_assembly_flags = 0;
+  q.story_body_y = 0;
   q.wheels = NULL;
   q.wheel_custom = 0;
   q.wheel_drop = 0;
@@ -2679,8 +3505,14 @@ void wpk_draw_wheels(const wpk_scene *w, const mat4 *view_proj, const mat4 *mode
   p->draws = q.draws, p->triangles = q.triangles, p->new_chunks = q.new_chunks;
 }
 
+#include "render_native_scene.inc"
+
 static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, const float *eye_local,
               int pass, render_params *p, int limited, uint32_t group) {
+#ifdef WMMT_NATIVE_VK
+  native_scene_draw(s, view_proj, model, eye_local, pass, p, limited, group);
+  return;
+#else
   const scene_prog *pr = &progs[pass == WPK_CUTOUT];
   mat4 mvp = mat4_mul(*view_proj, *model);
   lit_draw ld;
@@ -2698,7 +3530,8 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
   /* the unlit scenes' program in use (the gloss one for a gloss batch), whether the gloss one
    * has this draw's matrix yet, and the texture coordinates' offset both take */
   const scene_prog *cur = pr, *gp = &gloss_progs[pass == WPK_CUTOUT];
-  int gloss_set = 0;
+  int plain_set = 1, gloss_set = 0;
+  const int story_scope = p->story_assembly_enabled && !limited;
   int road_grade[2] = { 0, 0 };
   /* WET: the road's batches reflect the last frame, mirrored about the horizon: where a point
    * far ahead level with the eye lands on the screen */
@@ -2712,12 +3545,23 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
     else glUniform3f(pr->horizon, 1.0f / (float)blur.w, 1.0f / (float)blur.h, 0.5f + 0.5f * cy / cw);
   }
   float uv_u = p->uv_shift[0], uv_v = p->uv_shift[1];
-  const float *cur_mvp = mvp.m, *cur_eye = eye_local;
+  /* Persistent storage: a later plain/gloss switch must use this CHUNK's
+   * matrix/eye, never a pointer to a block-local wheel/height temporary. */
+  mat4 bound_mvp = mvp;
+  float bound_eye[3] = {eye_local[0],eye_local[1],eye_local[2]};
+  const float *cur_mvp = bound_mvp.m, *cur_eye = bound_eye;
   uint32_t gloss_tex = 0, gloss_cube = 0;
   for (uint32_t c = 0; c < s->n_chunk; ++c) {
     const wpk_chunk *ch = &s->chunks[c];
     if (!wpk_chunk_valid(ch, s->n_batch)) continue;
     if (limited && ch->group != group) continue;
+    int story_part = render_story_part_visibility(p,limited,ch->group);
+    if (story_part == 0) continue;
+    float body_y = render_story_body_offset(p,limited,ch->group);
+    mat4 cm = *model, cmvp = mvp;
+    float ce[3] = {eye_local[0],eye_local[1],eye_local[2]};
+    if (body_y != 0.0f)
+      render_story_translate_y(model,view_proj,eye_local,body_y,&cm,&cmvp,ce);
     float range;
     int wheel = limited ? -1 : ch->group >= WPK_WHEEL && ch->group < WPK_WHEEL + 4 ? (int)(ch->group - WPK_WHEEL) : -1;
     if (limited) goto group_cull;
@@ -2749,6 +3593,10 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
                        : WPK_BONNET + (uint32_t)p->bonnet;
       if (ch->group != shown) continue;
       range = p->range[WPK_GROUND];
+    } else if (story_part > 0) {
+      /* These numeric values are also legal world object IDs. Only the scoped
+       * enabled path treats them as owned body-root parts. */
+      range = p->range[WPK_GROUND];
     } else if (ch->group < WPK_GROUPS) {
       range = p->range[ch->group];
     } else {
@@ -2757,15 +3605,13 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
       if (!p->object_visible || p->n_objects <= 0 || obj >= (uint32_t)p->n_objects || !p->object_visible[obj]) continue;
       range = p->range[WPK_SHORT];
     }
-    if (box_distance(ch->lo, ch->hi, eye_local) > range) continue;
+    if (box_distance(ch->lo, ch->hi, ce) > range) continue;
   group_cull:
-    if (box_outside(&mvp, ch->lo, ch->hi)) continue;
-    if ((wheel >= 0 && (p->wheels || p->wheel_drop != 0.0f)) || turned) {
+    if (box_outside(&cmvp, ch->lo, ch->hi)) continue;
+    if ((wheel >= 0 && (p->wheels || p->wheel_drop != 0.0f)) || body_y != 0.0f || turned) {
       /* clCarDisp::update: the tyre node at (TireLocation x, the posture's y, z) turned by the
        * posture, its spin node about x by the turn; the corner's centre stands for the hub */
-      mat4 cm = *model, cmvp = mvp;
-      float ce[3] = { eye_local[0], eye_local[1], eye_local[2] };
-      turned = 0;
+      turned = body_y != 0.0f;
       if (wheel >= 0 && p->wheels) {
         const float *t = p->wheels[wheel];
         float h[3] = { 0.5f * (ch->lo[0] + ch->hi[0]), 0.5f * (ch->lo[1] + ch->hi[1]), 0.5f * (ch->lo[2] + ch->hi[2]) };
@@ -2800,7 +3646,16 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
       } else {
         glUniformMatrix4fv(cur->mvp, 1, GL_FALSE, cmvp.m);
         glUniform3fv(cur->eye, 1, ce);
-        gloss_set = 0; /* (the wheels' turned matrices: cars, which are lit) */
+        if (story_scope) {
+          bound_mvp = cmvp;
+          memcpy(bound_eye,ce,sizeof bound_eye);
+          plain_set = cur == pr;
+          gloss_set = cur == gp;
+        } else {
+          /* Preserve legacy non-story/limited shader-switch behavior exactly. */
+          plain_set = 1;
+          gloss_set = 0;
+        }
       }
     }
     if (!s->warm[c]) {
@@ -2850,6 +3705,10 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
             glUniformMatrix4fv(gp->mvp, 1, GL_FALSE, cur_mvp);
             glUniform3fv(gp->eye, 1, cur_eye);
             gloss_set = 1;
+          } else if (want == pr && !plain_set) {
+            glUniformMatrix4fv(pr->mvp, 1, GL_FALSE, cur_mvp);
+            glUniform3fv(pr->eye, 1, cur_eye);
+            plain_set = 1;
           }
           glUniform2f(cur->uv_off, uv_u, uv_v);
         }
@@ -2924,6 +3783,7 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
     glActiveTexture(GL_TEXTURE0);
   }
   if (s->two_sided) glEnable(GL_CULL_FACE);
+#endif
 }
 
 void wpk_draw(const wpk_scene *s, const mat4 *vp, const mat4 *model, const float *eye, int pass, render_params *p) {
@@ -2962,12 +3822,26 @@ static struct {
 static int over_init(void) {
   const char *attribs[] = { "aPos", "aUV", "aColor" };
   over.state = -1;
+#ifdef WMMT_NATIVE_VK
+  over.prog = native_program_create(VS_OVER, FS_OVER, attribs, 3);
+#else
   over.prog = gl_compile_program(VS_OVER, FS_OVER, attribs, 3);
+#endif
   if (!over.prog) return -1;
+#ifndef WMMT_NATIVE_VK
   over.mvp = glGetUniformLocation(over.prog, "uMVP");
   over.cut = glGetUniformLocation(over.prog, "uCut");
   glUseProgram(over.prog);
   glUniform1i(glGetUniformLocation(over.prog, "uTex"), 0);
+#endif
+#ifdef WMMT_NATIVE_VK
+  GLuint tex=0, depth=0, fbo=0;
+  int ok=native_simple_target(OVER_SIZE,OVER_SIZE,CINDER_VK_STORAGE_RGBA8,CINDER_VK_STORAGE_DEPTH16,&tex,&depth,&fbo);
+  if(ok) {
+    cinder_vk_target_destroy(over.fbo); cinder_vk_texture_destroy(over.tex); cinder_vk_attachment_destroy(over.depth);
+    over.tex=tex; over.depth=depth; over.fbo=fbo;
+  }
+#else
   GLint screen;
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen);
   glGenTextures(1, &over.tex);
@@ -2986,7 +3860,11 @@ static int over_init(void) {
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, over.depth);
   int ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)screen);
+#endif
   if (!ok) {
+#ifdef WMMT_NATIVE_VK
+    native_program_release(&over.prog);
+#endif
     fprintf(stderr, "overhead map: no %dx%d framebuffer\n", OVER_SIZE, OVER_SIZE);
     return -1;
   }
@@ -2998,6 +3876,9 @@ static int over_init(void) {
 int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_params *p) {
   if (!over.state) over_init();
   if (over.state < 0) return -1;
+#ifdef WMMT_NATIVE_VK
+  if (!cinder_vk_program_ready(over.prog) || !cinder_vk_target_ready(over.fbo)) return -1;
+#endif
   /* the eye over the roof looking ahead and OVER_PITCH up (the car's y, z), the map's x
    * the car's -x (the lit programs' overhead() sees it the same way) */
   const float *m = car->m;
@@ -3009,6 +3890,10 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
   }
   float far = OVER_REACH * 2.0f;
   mat4 vp = mat4_mul(mat4_perspective(2.0f * atanf(OVER_TAN), 1.0f, OVER_NEAR, far), mat4_look_at(eye, at, up));
+#ifdef WMMT_NATIVE_VK
+  const float clear[4]={0,0,0,0};
+  if(!cinder_vk_clear(over.fbo,VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT,clear,NULL)) return -1;
+#else
   GLint screen, view[4];
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen);
   glGetIntegerv(GL_VIEWPORT, view);
@@ -3017,6 +3902,8 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
   glClearColor(0, 0, 0, 0);
   glDepthMask(GL_TRUE);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+#endif
+#ifndef WMMT_NATIVE_VK
   glUseProgram(over.prog);
   glUniformMatrix4fv(over.mvp, 1, GL_FALSE, vp.m);
   glActiveTexture(GL_TEXTURE0);
@@ -3026,6 +3913,7 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
   glDisable(GL_BLEND);
   GLuint bound = 0;
   float cut = -1.0f;
+#endif
   int draws = 0;
   for (int i = 0; i < n; ++i) {
     const wpk_scene *sc = s[i];
@@ -3046,17 +3934,30 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
         float dz = eye[2] < bt->lo[2] ? bt->lo[2] - eye[2] : eye[2] > bt->hi[2] ? eye[2] - bt->hi[2] : 0;
         if (dx * dx + dz * dz > OVER_REACH * OVER_REACH || box_outside(&vp, bt->lo, bt->hi)) continue;
         float want = bt->cutout && !sc->solid ? 0.5f : -1.0f;
+#ifdef WMMT_NATIVE_VK
+        cinder_vk_draw packet;
+        if (bt->pool >= sc->n_pools || !cinder_vk_draw_init(&packet, over.prog, over.fbo, OVER_SIZE, OVER_SIZE)) continue;
+        packet.pipeline.depth_test = packet.pipeline.depth_write = VK_TRUE;
+        native_mesh(&packet, sc, bt);
+        if (!cinder_vk_uniform(&packet, "uMVP", vp.m, sizeof vp.m) ||
+            !cinder_vk_uniform(&packet, "uCut", &want, sizeof want) ||
+            !cinder_vk_texture(&packet, "uTex", bt->tex == 0xFFFF ? white_tex : sc->textures[bt->tex]) ||
+            !cinder_vk_submit(&packet)) continue;
+#else
         if (want != cut) glUniform1f(over.cut, cut = want);
         glBindTexture(GL_TEXTURE_2D, bt->tex == 0xFFFF ? white_tex : sc->textures[bt->tex]);
         bind_batch(sc, bt, &bound);
         glDrawElements(GL_TRIANGLES, (GLsizei)bt->count, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)bt->ioff);
+#endif
         draws++;
         p->triangles += (int)bt->count / 3;
       }
     }
   }
+#ifndef WMMT_NATIVE_VK
   if (bound) glBindVertexArrayOES(0);
-#ifdef WMMT_EGL
+#endif
+#if defined(WMMT_EGL) && !defined(WMMT_NATIVE_VK)
   static int dump_n;
   if (getenv("WMMT_OVER_DUMP") && ++dump_n % 30 == 0) { /* test: the map as a picture every 30 frames */
     static unsigned char px[OVER_SIZE * OVER_SIZE * 4];
@@ -3076,10 +3977,11 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
     }
   }
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(WMMT_NATIVE_VK)
   const GLenum discard[] = { GL_DEPTH_ATTACHMENT };
   glDiscardFramebufferEXT(GL_FRAMEBUFFER, 1, discard);
 #endif
+#ifndef WMMT_NATIVE_VK
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)screen);
   glViewport(view[0], view[1], view[2], view[3]);
   glEnable(GL_CULL_FACE);
@@ -3087,6 +3989,10 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
   glActiveTexture(GL_TEXTURE0 + OVER_UNIT);
   glBindTexture(GL_TEXTURE_2D, over.tex);
   glActiveTexture(GL_TEXTURE0);
+#endif
+#ifdef WMMT_NATIVE_VK
+  native_over_texture = over.tex;
+#endif
   p->draws += draws;
   return draws;
 }
@@ -3097,10 +4003,21 @@ static struct {
   GLuint fbo, tex, depth;
   int w, h;
   GLint screen, view[4];
+#ifdef WMMT_NATIVE_VK
+  native_scene_view saved_native;
+#endif
 } bm;
 
 int render_backmirror_begin(int w, int h, const float clear[3]) {
   if (w < 8 || h < 8) return -1;
+#ifdef WMMT_NATIVE_VK
+  if(bm.w!=w || bm.h!=h || !cinder_vk_target_ready(bm.fbo)) {
+    GLuint tex=0,depth=0,fbo=0;
+    if(!native_simple_target(w,h,CINDER_VK_STORAGE_RGBA8,CINDER_VK_STORAGE_DEPTH16,&tex,&depth,&fbo)) return -1;
+    cinder_vk_target_destroy(bm.fbo); cinder_vk_texture_destroy(bm.tex); cinder_vk_attachment_destroy(bm.depth);
+    bm.tex=tex; bm.depth=depth; bm.fbo=fbo; bm.w=w; bm.h=h;
+  }
+#else
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bm.screen);
   glGetIntegerv(GL_VIEWPORT, bm.view);
   if (bm.w != w || bm.h != h) {
@@ -3129,22 +4046,37 @@ int render_backmirror_begin(int w, int h, const float clear[3]) {
     }
     bm.w = w, bm.h = h;
   }
+#endif
+#ifdef WMMT_NATIVE_VK
+  bm.saved_native = native_scene;
+  native_scene = (native_scene_view){bm.fbo, w, h};
+  const float color[4]={clear[0],clear[1],clear[2],1};
+  if(!cinder_vk_clear(bm.fbo,VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT,color,NULL)) {
+    native_scene=bm.saved_native; return -1;
+  }
+#else
   glBindFramebuffer(GL_FRAMEBUFFER, bm.fbo);
   glViewport(0, 0, w, h);
   /* drawHigh's clear: the colour (0.847, 1, 0.976) unless the mirror says otherwise */
   glClearColor(clear[0], clear[1], clear[2], 1);
   glDepthMask(GL_TRUE);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+#endif
   return 0;
 }
 
 void render_backmirror_end(void) {
+#ifdef WMMT_NATIVE_VK
+  (void)cinder_vk_discard(bm.fbo,VK_IMAGE_ASPECT_DEPTH_BIT);
+  native_scene = bm.saved_native;
+#else
 #ifdef __APPLE__
   const GLenum discard[] = { GL_DEPTH_ATTACHMENT };
   glDiscardFramebufferEXT(GL_FRAMEBUFFER, 1, discard);
 #endif
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)bm.screen);
   glViewport(bm.view[0], bm.view[1], bm.view[2], bm.view[3]);
+#endif
 }
 
 void render_backmirror_draw(const mat4 *proj, float x, float y, float w, float h) {
@@ -3158,6 +4090,32 @@ void render_backmirror_draw(const mat4 *proj, float x, float y, float w, float h
   };
   static const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
   const scene_prog *pr = &progs[0];
+#ifdef WMMT_NATIVE_VK
+  /* A real explicit packet: neither the active GL program/VAO nor any prior
+   * uniform, texture, blend, stencil or viewport state can influence this draw. */
+  int sw, sh;
+  cinder_vk_screen_extent(&sw, &sh);
+  cinder_vk_draw packet;
+  if (!cinder_vk_draw_init(&packet, pr->id, 0, sw, sh)) return;
+  const float zero[3] = {0, 0, 0}, grade[3] = {1, 1, 1}, fog[2] = {1e9f, 1e8f}, uv[2] = {0, 0};
+  if (!cinder_vk_uniform(&packet, "uMVP", proj->m, sizeof proj->m) ||
+      !cinder_vk_uniform(&packet, "uEye", zero, sizeof zero) ||
+      !cinder_vk_uniform(&packet, "uFog", fog, sizeof fog) ||
+      !cinder_vk_uniform(&packet, "uFogColor", zero, sizeof zero) ||
+      !cinder_vk_uniform(&packet, "uGrade", grade, sizeof grade) ||
+      !cinder_vk_uniform(&packet, "uUVOff", uv, sizeof uv) ||
+      !cinder_vk_texture(&packet, "uTex", bm.tex)) return;
+  packet.attributes[0] = (cinder_vk_attribute){.format=VK_FORMAT_R32G32B32_SFLOAT,
+    .stride=sizeof *v, .data=v, .bytes=sizeof v, .offset=offsetof(render_vertex, pos)};
+  packet.attributes[1] = (cinder_vk_attribute){.format=VK_FORMAT_R32G32_SFLOAT,
+    .stride=sizeof *v, .data=v, .bytes=sizeof v, .offset=offsetof(render_vertex, uv)};
+  packet.attributes[2] = (cinder_vk_attribute){.format=VK_FORMAT_R8G8B8A8_UNORM,
+    .stride=sizeof *v, .data=v, .bytes=sizeof v, .offset=offsetof(render_vertex, rgba)};
+  packet.count = 6; packet.indexed = VK_TRUE;
+  packet.indices = idx; packet.index_bytes = sizeof idx;
+  cinder_vk_submit(&packet);
+  return;
+#else
   glBindVertexArrayOES(0);
   glUseProgram(pr->id);
   glUniformMatrix4fv(pr->mvp, 1, GL_FALSE, proj->m);
@@ -3179,8 +4137,10 @@ void render_backmirror_draw(const mat4 *proj, float x, float y, float w, float h
   glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, idx);
   glEnable(GL_CULL_FACE);
   glEnable(GL_DEPTH_TEST);
+#endif
 }
 
+#ifndef WMMT_NATIVE_VK
 static void draw_volume(const wpk_scene *s, const mat4 *mvp) {
   GLuint bound = 0;
   glUniformMatrix4fv(shadow_mvp, 1, GL_FALSE, mvp->m);
@@ -3196,6 +4156,8 @@ static void draw_volume(const wpk_scene *s, const mat4 *mvp) {
   }
 }
 
+#endif
+
 /* The arcade marks the pixels in the frame's alpha: the volumes' front faces that pass the
  * depth test set it (STENCIL_INC), then their back faces that pass clear it (STENCIL_DEC), so
  * what stays marked is the ground (or a tyre) inside a volume; its final pass darkens them.
@@ -3203,6 +4165,10 @@ static void draw_volume(const wpk_scene *s, const mat4 *mvp) {
  * which clears the marks again. */
 void render_shadows(const wpk_scene *const *s, const mat4 *mvp, int n, render_params *p) {
   if (n <= 0) return;
+#ifdef WMMT_NATIVE_VK
+  native_shadow_draw(s, mvp, n, p);
+  return;
+#else
   glUseProgram(shadow_prog);
   glEnable(GL_STENCIL_TEST);
   glStencilMask(0xff);
@@ -3236,6 +4202,7 @@ void render_shadows(const wpk_scene *const *s, const mat4 *mvp, int n, render_pa
   glDisable(GL_BLEND);
   glDepthMask(GL_TRUE);
   glDisable(GL_STENCIL_TEST);
+#endif
 }
 
 /* what the first draws cost (wpk_warm_stats), by what was new in them: the batch's buffer
@@ -3252,6 +4219,8 @@ static double warm_clock(void) {
   return (double)tv.tv_sec * 1e3 + (double)tv.tv_usec * 1e-3;
 }
 
+#include "render_native_warm.inc"
+
 /* a cube's first draw: one triangle over the pixel the scissor leaves, sampling it */
 static void warm_cube(GLuint cube) {
   static GLuint prog;
@@ -3260,11 +4229,27 @@ static void warm_cube(GLuint cube) {
   static const char *fs = "precision mediump float; uniform samplerCube uCube; varying vec3 vDir;\n"
                           "void main() { gl_FragColor = textureCube(uCube, vDir); }\n";
   static const float pos[9] = { -1, -1, 0, 3, -1, 0, -1, 3, 0 };
-  if (!prog) {
+  if (
+#ifdef WMMT_NATIVE_VK
+      !cinder_vk_program_ready(prog)
+#else
+      !prog
+#endif
+  ) {
+#ifdef WMMT_NATIVE_VK
+    native_program_release(&prog);
+#endif
     const char *attribs[] = { "aPos" };
+#ifdef WMMT_NATIVE_VK
+    prog = native_program_create(vs, fs, attribs, 1);
+#else
     prog = gl_compile_program(vs, fs, attribs, 1);
+#endif
     if (!prog) return;
   }
+#ifdef WMMT_NATIVE_VK
+  (void)native_warm_cube(prog, cube, pos, sizeof pos);
+#else
   GLint was = 0;
   glGetIntegerv(GL_CURRENT_PROGRAM, &was);
   glUseProgram(prog);
@@ -3274,9 +4259,28 @@ static void warm_cube(GLuint cube) {
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
   glUseProgram((GLuint)was);
+#endif
 }
 
 /* batch b's first triangle with texture tex (index t of the scene's, or 0xFFFF) */
+#ifdef WMMT_NATIVE_VK
+static int native_warm_draw(const wpk_scene *s, const wpk_batch *b, uint32_t tex, uint32_t t, const render_params *params) {
+  if (b->pool >= s->n_pools || !s->pools || !s->tex_warm || (t != 0xFFFF && t >= s->n_tex)) return 0;
+  wpk_pool *pl = &s->pools[b->pool];
+  int kind = !pl->warm ? WARM_NEW_POOL : t != 0xFFFF && !s->tex_warm[t] ? WARM_NEW_TEX : WARM_OLD;
+  double t0 = warm_clock();
+  if (!native_warm_material(s, b, tex, params)) return 0;
+  if (!s->lit && b->gloss != 0xFFFF && (!params || !params->no_gloss)) s->tex_warm[b->gloss] = 1;
+  if (!s->lit && b->gloss != 0xFFFF && b->cube != 0xFFFF && b->cube < s->n_cube && s->cube_warm && (!params || !params->no_gloss)) s->cube_warm[b->cube] = 1;
+  double ms = warm_clock() - t0;
+  pl->warm = 1;
+  if (t != 0xFFFF) s->tex_warm[t] = 1;
+  warm_cost.n[kind]++;
+  warm_cost.ms[kind] += ms;
+  if (ms > warm_cost.max[kind]) warm_cost.max[kind] = ms;
+  return 1;
+}
+#else
 static void warm_draw(const wpk_scene *s, const wpk_batch *b, uint32_t tex, uint32_t t) {
   wpk_pool *pl = &s->pools[b->pool];
   int kind = !pl->warm ? WARM_NEW_POOL : t != 0xFFFF && !s->tex_warm[t] ? WARM_NEW_TEX : WARM_OLD;
@@ -3306,6 +4310,7 @@ static void warm_draw(const wpk_scene *s, const wpk_batch *b, uint32_t tex, uint
   warm_cost.ms[kind] += ms;
   if (ms > warm_cost.max[kind]) warm_cost.max[kind] = ms;
 }
+#endif
 
 void wpk_warm_stats(char *out, size_t n) {
   static const char *names[WARM_KINDS] = { "new pool", "new texture", "old" };
@@ -3329,8 +4334,10 @@ static int chunk_in_reach(const wpk_chunk *ch, const float *eye_local, float mar
 static int warm_batches(wpk_scene *s, const float *eye_local, float margin, int budget, const render_params *p) {
   int warmed = 0;
   if (!s->warm || !s->n_chunk) return 0; /* not loaded */
+#ifndef WMMT_NATIVE_VK
   glEnable(GL_SCISSOR_TEST);
   glScissor(0, 0, 1, 1);
+#endif
   while (warmed < budget) {
     /* the next cold chunk (wpk_draw may have drawn the one under way meanwhile) */
     if (s->warm_chunk >= 0 && ((uint32_t)s->warm_chunk >= s->n_chunk || s->warm[s->warm_chunk])) s->warm_chunk = -1;
@@ -3360,7 +4367,14 @@ static int warm_batches(wpk_scene *s, const float *eye_local, float margin, int 
       const wpk_batch *b = &s->batches[s->warm_batch++];
       if (b->count) {
         uint32_t t = b->tex < s->n_tex ? b->tex : 0xFFFF;
+#ifdef WMMT_NATIVE_VK
+        if (!native_warm_draw(s, b, t == 0xFFFF ? white_tex : s->textures[t], t, p)) {
+          --s->warm_batch; /* retry a rejected material, never mark its chunk warm */
+          break;
+        }
+#else
         warm_draw(s, b, t == 0xFFFF ? white_tex : s->textures[t], t);
+#endif
         warmed++;
       }
     }
@@ -3369,20 +4383,30 @@ static int warm_batches(wpk_scene *s, const float *eye_local, float margin, int 
       s->warm_chunk = -1;
     }
   }
+#ifndef WMMT_NATIVE_VK
   glDisable(GL_SCISSOR_TEST);
+#endif
   return warmed;
 }
 
 int wpk_prewarm(wpk_scene *s, const mat4 *view_proj, const float *eye_local, float margin, int budget,
                 const render_params *p) {
   if (!s->warm || !s->n_chunk) return 0;
+#ifdef WMMT_NATIVE_VK
+  (void)view_proj;
+  native_warm_view = native_scene;
+#else
   glUseProgram(progs[0].id);
   glUniformMatrix4fv(progs[0].mvp, 1, GL_FALSE, view_proj->m);
   glUniform2f(progs[0].uv_off, 0, 0);
+#endif
   return warm_batches(s, eye_local, margin, budget, p);
 }
 
 int wpk_warm_near(wpk_scene *s, const float *eye, float margin, int budget, const render_params *p) {
+#ifdef WMMT_NATIVE_VK
+  native_warm_view = native_scene;
+#endif
   return warm_batches(s, eye, margin, budget, p);
 }
 
@@ -3408,21 +4432,44 @@ static const char *WARM_FS =
 
 void render_warm_begin(void) {
   static GLuint warm_prog;
-  if (!warm_prog) {
+  if (
+#ifdef WMMT_NATIVE_VK
+      !cinder_vk_program_ready(warm_prog)
+#else
+      !warm_prog
+#endif
+  ) {
+#ifdef WMMT_NATIVE_VK
+    native_program_release(&warm_prog);
+#endif
     const char *attribs[] = { "aPos", "aUV", "aColor" };
+#ifdef WMMT_NATIVE_VK
+    warm_prog = native_program_create(WARM_VS, WARM_FS, attribs, 3);
+#else
     warm_prog = gl_compile_program(WARM_VS, WARM_FS, attribs, 3);
+#endif
   }
+#ifdef WMMT_NATIVE_VK
+  native_loader_program = warm_prog;
+  native_warm_view.target = 0;
+  cinder_vk_screen_extent(&native_warm_view.w, &native_warm_view.h);
+#else
   glUseProgram(warm_prog);
   glActiveTexture(GL_TEXTURE0);
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glEnableVertexAttribArray(2);
+#endif
 }
 
 int wpk_warm(wpk_scene *s, int budget) { return warm_batches(s, NULL, 0, budget, NULL); }
 
 void render_warm_texture(uint32_t tex) {
   /* one triangle over the pixel, from client memory */
+#ifdef WMMT_NATIVE_VK
+  double t0 = warm_clock();
+  if (!native_loader_triangle(native_loader_program, tex, native_warm_destination(), 0, 0, 1)) return;
+#else
   static const float pos[9] = { -1, -1, 0, 3, -1, 0, -1, 3, 0 }, uv[6] = { 0, 0, 1, 0, 0, 1 };
   static const unsigned char col[12] = { 0 };
   double t0 = warm_clock();
@@ -3432,6 +4479,7 @@ void render_warm_texture(uint32_t tex) {
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
   glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, col);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+#endif
   double ms = warm_clock() - t0;
   warm_cost.n[WARM_NEW_TEX]++;
   warm_cost.ms[WARM_NEW_TEX] += ms;
@@ -3440,21 +4488,34 @@ void render_warm_texture(uint32_t tex) {
 
 int wpk_warm_paints(wpk_scene *s, int budget) {
   int warmed = 0;
+#ifndef WMMT_NATIVE_VK
   glEnable(GL_SCISSOR_TEST);
   glScissor(0, 0, 1, 1);
+#endif
   for (uint32_t i = 0; i < s->n_paints && warmed < budget; ++i) {
     const wpk_paint_swap *p = &s->paints[i];
+#ifdef WMMT_NATIVE_VK
+    if (p->src >= s->n_tex || p->dst >= s->n_tex || !s->loaded || !s->tex_warm) continue;
+#endif
     if (!s->loaded[p->src] || s->tex_warm[p->src]) continue;
     /* a batch the paint stands in for the texture of */
     for (uint32_t j = 0; j < s->n_batch; ++j)
       if (s->batches[j].tex == p->dst && j < s->next_batch && s->batches[j].count) {
+#ifdef WMMT_NATIVE_VK
+        if (!native_warm_draw(s, &s->batches[j], s->loaded[p->src], p->src, NULL)) return warmed;
+#else
         warm_draw(s, &s->batches[j], s->loaded[p->src], p->src);
+#endif
         warmed++;
         break;
       }
+#ifndef WMMT_NATIVE_VK
     s->tex_warm[p->src] = 1;
+#endif
   }
+#ifndef WMMT_NATIVE_VK
   glDisable(GL_SCISSOR_TEST);
+#endif
   return warmed;
 }
 
@@ -3466,21 +4527,66 @@ static double st_ms(void) {
 }
 
 /* a triangle of quad buffer vbo with texture tex into the pixel; ms till the GPU is done */
-static double st_draw(GLuint vbo, GLuint tex) {
+#ifdef WMMT_NATIVE_VK
+static double st_draw(GLuint vbo, GLuint tex, GLuint target) {
+  if (!vbo || !tex || !target || !cinder_vk_finish()) return -1.0;
+  double t0=st_ms();
+  if (!native_loader_triangle(native_loader_program,tex,(native_scene_view){target,1,1},vbo,0,0) ||
+      !cinder_vk_finish()) return -1.0;
+  return st_ms()-t0;
+}
+#else
+static double st_draw(GLuint vbo, GLuint tex, GLuint target) {
   glFinish();
   double t0 = st_ms();
+#ifdef WMMT_NATIVE_VK
+  int recorded = vbo && native_loader_triangle(native_loader_program, tex, (native_scene_view){target,1,1}, vbo, 0, 0);
+  if (!recorded) return -1.0;
+#else
+  (void)target;
   glBindTexture(GL_TEXTURE_2D, tex);
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, (const void *)0);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 24, (const void *)12);
   glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 24, (const void *)20);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+#endif
   glFinish();
   return st_ms() - t0;
 }
+#endif
 
 /* a size x size RGB565 texture of noise: mips 0 none, 1 glGenerateMipmap, 2 mip_down;
  * the time of the calls (and of mip_down) into api */
+#ifdef WMMT_NATIVE_VK
+static GLuint st_texture(int size, int mips, double *api, double *cpu) {
+  *api=*cpu=-1.0;
+  if(size<=0 || size>16384 || !is_pot(size) || mips<0 || mips>2) return 0;
+  uint16_t *px=malloc((size_t)size*size*2*2);
+  if(!px) return 0;
+  uint32_t r=12345u;
+  for(int i=0;i<size*size;++i) { r=r*1103515245u+12345u; px[i]=(uint16_t)(r>>16); }
+  if(!cinder_vk_finish()) { free(px); return 0; }
+  double t0=st_ms(); *cpu=0;
+  cinder_vk_texture_subresource sub[31]={{0,0,px,(size_t)size*size*2,0}};
+  int levels=mips?native_scene_levels(size,size):1;
+  if(mips==2) {
+    uint16_t *src=px,*dst=px+(size_t)size*size;
+    for(int w=size,level=1;w>1;++level) {
+      double c0=st_ms(); mip_down(src,w,w,dst,0); *cpu+=st_ms()-c0; w/=2;
+      sub[level]=(cinder_vk_texture_subresource){(uint32_t)level,0,dst,(size_t)w*w*2,0};
+      src=dst; dst+=(size_t)w*w;
+    }
+  }
+  cinder_vk_sampler sampler=native_scene_sampler(mips!=0,1,0); sampler.anisotropy=1.0f;
+  const cinder_vk_texture_desc d={.width=size,.height=size,.levels=levels,.layers=1,
+    .format=CINDER_VK_TEX_RGB565,.sampler=sampler,.subresources=sub,.subresource_count=mips==2?(size_t)levels:1};
+  GLuint tex=mips==1?cinder_vk_texture_generate_mips(&d):cinder_vk_texture_create(&d);
+  *api=tex?st_ms()-t0:-1.0;
+  if(!tex) *cpu=-1.0;
+  free(px); return tex;
+}
+#else
 static GLuint st_texture(int size, int mips, double *api, double *cpu) {
   uint16_t *px = malloc((size_t)size * size * 2 * 2);
   uint32_t r = 12345u;
@@ -3515,15 +4621,76 @@ static GLuint st_texture(int size, int mips, double *api, double *cpu) {
   free(px);
   return tex;
 }
+#endif
 
 #ifndef GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
 #define GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG 0x8C00
 #endif
 
+#ifdef WMMT_NATIVE_VK
 void render_selftest(char *out, size_t n) {
-  GLint prev_fb = 0, vp[4];
+  if(!n) return;
+  GLuint rb=native_target_attachment(1,1,CINDER_VK_STORAGE_RGB565,1,0,0);
+  GLuint fb=rb?native_target_compose(rb,CINDER_VK_IMAGE_ATTACHMENT,0,CINDER_VK_IMAGE_NONE,0,1,1):0;
+  if(!fb) {
+    cinder_vk_target_destroy(fb); cinder_vk_attachment_destroy(rb);
+    snprintf(out,n,"selftest unavailable: native 1x1 target"); return;
+  }
+  render_warm_begin();
+  static const float tri[18]={-1,-1,0,0,0,0,3,-1,0,2,0,0,-1,3,0,0,2,0};
+  float v[18]; memcpy(v,tri,sizeof v);
+  for(int k=0;k<3;++k) memset(&v[6*k+5],0xff,4);
+  GLuint vbo=cinder_vk_buffer_create(sizeof v,v);
+  size_t len=0; GLuint keep=0;
+  if(!cinder_vk_program_ready(native_loader_program) || !cinder_vk_finish()) {
+    snprintf(out,n,"selftest unavailable: native resources/finish"); goto done;
+  }
+  (void)st_draw(vbo,white_tex,fb); /* missing triangle buffer cannot become client0; batch is independent */
+  len+=(size_t)snprintf(out+len,n-len,"selftest native host wall ms (not physical GPU timing):");
+  static const struct {int size,mips;const char *name;} T[]={
+    {256,1,"256 genmip"},{256,2,"256 cpumip"},{256,0,"256 nomip"},
+    {512,1,"512 genmip"},{512,2,"512 cpumip"},{512,0,"512 nomip"}};
+  for(size_t i=0;i<sizeof T/sizeof T[0] && len<n;++i) {
+    double api,cpu; GLuint tex=st_texture(T[i].size,T[i].mips,&api,&cpu);
+    double first=st_draw(vbo,tex,fb),again=st_draw(vbo,tex,fb);
+    if(!tex || first<0 || again<0)
+      len+=(size_t)snprintf(out+len,n-len," | %s unavailable",T[i].name);
+    else len+=(size_t)snprintf(out+len,n-len," | %s api %.2f cpu %.2f first %.2f again %.2f",T[i].name,api,cpu,first,again);
+    if(T[i].mips==2 && !keep && tex) keep=tex;
+    else cinder_vk_texture_destroy(tex);
+  }
+  if(len<n) len+=(size_t)snprintf(out+len,n-len," | pvrtc unavailable (native unsupported)");
+  if(len<n) {
+    enum {NV=4000,NI=9000};
+    unsigned char *vb=calloc(NV,24); uint16_t *ib=malloc(NI*2);
+    if(ib) for(int i=0;i<NI;++i) ib[i]=(uint16_t)(i%NV);
+    int finished=cinder_vk_finish(); double t0=st_ms();
+    GLuint b[2]={finished&&vb?cinder_vk_buffer_create(NV*24,vb):0,finished&&ib?cinder_vk_buffer_create(NI*2,ib):0};
+    double api=st_ms()-t0,first=-1,again=-1;
+    for(int pass=0;pass<2;++pass) {
+      if(!b[0] || !b[1] || !keep || !cinder_vk_finish()) continue;
+      double d0=st_ms();
+      if(native_loader_triangle(native_loader_program,keep,(native_scene_view){fb,1,1},b[0],b[1],0) && cinder_vk_finish())
+        *(pass?&again:&first)=st_ms()-d0;
+    }
+    if(first<0 || again<0) snprintf(out+len,n-len," | batch unavailable");
+    else snprintf(out+len,n-len," | batch %d verts api %.2f first %.2f again %.2f",NV,api,first,again);
+    cinder_vk_buffer_destroy(b[0]); cinder_vk_buffer_destroy(b[1]); free(vb); free(ib);
+  }
+done:
+  cinder_vk_texture_destroy(keep); cinder_vk_buffer_destroy(vbo);
+  cinder_vk_target_destroy(fb); cinder_vk_attachment_destroy(rb);
+}
+#else
+void render_selftest(char *out, size_t n) {
+  GLint prev_fb = 0;
+#ifdef WMMT_NATIVE_VK
+  prev_fb = (GLint)native_scene.target;
+#else
+  GLint vp[4];
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fb);
   glGetIntegerv(GL_VIEWPORT, vp);
+#endif
   GLuint rb, fb;
   glGenRenderbuffers(1, &rb);
   glBindRenderbuffer(GL_RENDERBUFFER, rb);
@@ -3531,18 +4698,24 @@ void render_selftest(char *out, size_t n) {
   glGenFramebuffers(1, &fb);
   glBindFramebuffer(GL_FRAMEBUFFER, fb);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+#ifndef WMMT_NATIVE_VK
   glViewport(0, 0, 1, 1);
   glBindVertexArrayOES(0);
+#endif
   render_warm_begin();
   static const float tri[18] = { -1, -1, 0, 0, 0, 0, 3, -1, 0, 2, 0, 0, -1, 3, 0, 0, 2, 0 };
   float v[18];
   memcpy(v, tri, sizeof v);
   for (int k = 0; k < 3; ++k) memset(&v[6 * k + 5], 0xff, 4); /* white */
   GLuint vbo;
+#ifdef WMMT_NATIVE_VK
+  vbo = cinder_vk_buffer_create(sizeof v, v);
+#else
   glGenBuffers(1, &vbo);
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
   glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
-  st_draw(vbo, white_tex); /* the program's and the buffer's first use */
+#endif
+  st_draw(vbo, white_tex, fb); /* the program's and the buffer's first use */
   size_t len = 0;
   len += (size_t)snprintf(out + len, n - len, "selftest (first draw = upload left to the driver):");
   static const struct { int size, mips; const char *name; } T[] = {
@@ -3553,7 +4726,7 @@ void render_selftest(char *out, size_t n) {
   for (size_t i = 0; i < sizeof T / sizeof T[0] && len < n; ++i) {
     double api, cpu;
     GLuint tex = st_texture(T[i].size, T[i].mips, &api, &cpu);
-    double first = st_draw(vbo, tex), again = st_draw(vbo, tex);
+    double first = st_draw(vbo, tex, fb), again = st_draw(vbo, tex, fb);
     len += (size_t)snprintf(out + len, n - len, " | %s api %.2f cpu %.2f first %.2f again %.2f", T[i].name, api, cpu,
                             first, again);
     if (T[i].mips == 2 && !keep) keep = tex;
@@ -3580,7 +4753,7 @@ void render_selftest(char *out, size_t n) {
       tex_aniso();
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       double api = st_ms() - t0;
-      double first = st_draw(vbo, tex), again = st_draw(vbo, tex);
+      double first = st_draw(vbo, tex, fb), again = st_draw(vbo, tex, fb);
       len += (size_t)snprintf(out + len, n - len, " | %d pvrtc api %.2f first %.2f again %.2f err 0x%x", size, api, first,
                               again, glGetError());
       glDeleteTextures(1, &tex);
@@ -3592,42 +4765,71 @@ void render_selftest(char *out, size_t n) {
     enum { NV = 4000, NI = 9000 };
     unsigned char *vb = calloc(NV, 24);
     uint16_t *ib = malloc(NI * 2);
+#ifdef WMMT_NATIVE_VK
+    if (ib)
+#endif
     for (int i = 0; i < NI; ++i) ib[i] = (uint16_t)(i % NV);
     glFinish();
     double t0 = st_ms();
     GLuint b[2];
+#ifdef WMMT_NATIVE_VK
+    b[0] = vb ? cinder_vk_buffer_create(NV * 24, vb) : 0;
+    b[1] = ib ? cinder_vk_buffer_create(NI * 2, ib) : 0;
+#else
     glGenBuffers(2, b);
     glBindBuffer(GL_ARRAY_BUFFER, b[0]);
     glBufferData(GL_ARRAY_BUFFER, NV * 24, vb, GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[1]);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, NI * 2, ib, GL_STATIC_DRAW);
+#endif
     double api = st_ms() - t0;
     double first = 0, again = 0;
     for (int pass = 0; pass < 2; ++pass) {
       glFinish();
       double d0 = st_ms();
+#ifdef WMMT_NATIVE_VK
+      int recorded = b[0] && b[1] && native_loader_triangle(native_loader_program, keep, (native_scene_view){fb,1,1}, b[0], b[1], 0);
+#else
       glBindTexture(GL_TEXTURE_2D, keep);
       glBindBuffer(GL_ARRAY_BUFFER, b[0]);
       glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, (const void *)0);
       glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 24, (const void *)12);
       glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 24, (const void *)20);
       glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, 0);
+#endif
       glFinish();
       *(pass ? &again : &first) = st_ms() - d0;
+#ifdef WMMT_NATIVE_VK
+      if (!recorded) *(pass ? &again : &first) = -1.0;
+#endif
     }
     len += (size_t)snprintf(out + len, n - len, " | batch %d verts api %.2f first %.2f again %.2f", NV, api, first, again);
+#ifdef WMMT_NATIVE_VK
+    cinder_vk_buffer_destroy(b[0]);
+    cinder_vk_buffer_destroy(b[1]);
+#else
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glDeleteBuffers(2, b);
+#endif
     free(vb);
     free(ib);
   }
   glDeleteTextures(1, &keep);
+#ifdef WMMT_NATIVE_VK
+  cinder_vk_buffer_destroy(vbo);
+#else
   glDeleteBuffers(1, &vbo);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
+#endif
+#ifndef WMMT_NATIVE_VK
   glDisableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
+#endif
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
   glDeleteFramebuffers(1, &fb);
   glDeleteRenderbuffers(1, &rb);
+#ifndef WMMT_NATIVE_VK
   glViewport(vp[0], vp[1], vp[2], vp[3]);
+#endif
 }
+#endif

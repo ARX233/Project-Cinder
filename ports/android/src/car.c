@@ -2,6 +2,11 @@
  * sequence (the player's car, the traffic and what they hit), recompiled to C
  * (src/phys/phys_rc.c). This file sets the race up and reads back what to draw. */
 #include "car.h"
+#include "ghost_runtime.h"
+#include "cardb.h"
+#include "ghost_arcade_models.inc"
+#include "ghost_arcade_palettes.inc"
+#include "ghost_arcade_tyres.inc"
 
 #include <math.h>
 #include <float.h>
@@ -51,6 +56,18 @@ void f_8983e5c(void); /* yt::CSeq::GetInfoTenRivalLine */
 void f_8983488(void); /* yt::CSeq::GetInfoRivalCarDisp */
 void f_898287c(void); /* yt::CSeq::Get2DInfoStory */
 void f_898317c(void); /* yt::CSeq::GetPlayResult */
+/* Private Ghost variant supplies these exact original functions; old physics
+ * stays link-compatible, but its zero feature marker fails closed. */
+__attribute__((weak)) const volatile uint32_t rc_ghost_native_bridge = 0;
+__attribute__((weak, noinline)) const char *rc_ghost_physics_id(void) { return NULL; }
+__attribute__((weak, noinline)) void f_89924c8(void) { eax = 0; esp += 8; }
+__attribute__((weak, noinline)) void f_8982d44(void) { eax = 0; esp += 4; }
+void f_89e1130(void); /* CSampler::SamplingConfig(float seconds,int,int) */
+void f_89e03e0(void); /* CSampler::SamplingStart(EStage,int seed) */
+void f_89e12d4(void); /* CSampler::SetFileName */
+void f_89e1320(void); /* CSampler::SetAreaPtAry */
+void f_89e61dc(void); /* CSampler::Save */
+void f_89e66ec(void); /* SSampleInfo070426::Reset */
 void f_898332c(void); /* yt::CSeq::GetPlayLog(youTitle::_TitleRunningLog_ *) */
 void f_858d8e8(void); /* youTitle::GetTitleList(_TitleData_ &, _TITLEDATALIST_ &) */
 void f_899b378(void); /* yt::CConfigLoader::GetStorySeries(file, int, ESeries), returning SStorySeries */
@@ -95,6 +112,7 @@ void f_89fdfe8(void); /* clMovieSystem::GetRTMovieCarDisp(int, SInfoCarDisp *) *
 #define OTHER_GEN_PTR 0x9802894u /* COtherGen, the traffic */
 #define LX_RIVALS 0x980289cu     /* yt::CLxRival *[3]: a versus' link cars (rivals 1..3) */
 #define COUNTDOWN 0x9802a68u     /* CState: seconds of countdown left (Prep_CountDown sets 4) */
+#define RACE_TIME_LEFT 0x9802a6cu
 #define TIME_KEEPER_PTR 0x98028c8u /* CTimeKeeper, the checkpoints (the first is the start, the last the goal) */
 #define TK_COUNT 0x00u           /* checkpoints */
 #define TK_ODO 0x04u             /* float[]: the odometer reading of each (the last is the goal) */
@@ -202,6 +220,28 @@ static struct {
   uint32_t info_story, result, first_pt, title_log;
   int ready;
 } P = { .view = CAR_VIEW_BEHIND };
+
+#define GHOST_TARGET_PTR 0x9802898u
+#define GHOST_SAMPLER_PTR 0x9802880u
+#define GHOST_TARGET_BYTES 0xb94u
+#define GHOST_BRIDGE_MAGIC 0x47485331u
+static struct {
+  car_ghost_config config;
+  car_ghost_observation observation;
+  uint32_t info, recorder;
+  int requested, started, saved, record_required;
+  int arcade_on;
+  int crown_race, finish_order, finish_sampled, first_crossing; /* +1 player first, -1 rival first */
+  float finish_previous[2], finish_gap_m;
+  car_ghost_arcade_binding arcade;
+} PG;
+static struct {
+  uint64_t pending, token;
+  uint32_t field[6], recorder;
+  int saved;
+} PT;
+static int ghost_target_valid(void);
+static void ghost_observe(void);
 
 static uint32_t fbits(float v) { uint32_t u; memcpy(&u, &v, 4); return u; }
 
@@ -432,8 +472,482 @@ int car_init(const char *data_dir, char *err, int err_len) {
   return 0;
 }
 
+static int ghost_area_allowed(uint32_t id, void *context) {
+  (void)context;
+  if (id >= STORY_AREA_COUNT || !carry_image_span(STORY_AREA_TABLE + 4u * id, 4)) return 0;
+  uint32_t area = M32(STORY_AREA_TABLE + 4u * id);
+  return carry_area_valid(area) && M32(area) == id;
+}
+static int ghost_image(void) {
+  return rc_mem || (P.image[0] && rc_load_image(P.image) == 0);
+}
+const char *car_ghost_physics_id(void) {
+  return rc_ghost_native_bridge == GHOST_BRIDGE_MAGIC ? rc_ghost_physics_id() : NULL;
+}
+static int ghost_route_count(int ramp) {
+  if (ramp < 1 || ramp > 22 || rc_ghost_native_bridge != GHOST_BRIDGE_MAGIC || !ghost_image()) return 0;
+  int matches = 0;
+  uint32_t count = 0;
+  /* Original initTarget 0x88ff88b..89a reads frontend pointer table 0x9739140,
+   * record+8 ERamp and record+0x14 routeCount before route/count division.
+   * This is NOT yt::GetStage_FromRamp's weighted-stage array length. */
+  for (uint32_t i = 0; i < CAR_LINK_RAMPS; ++i) {
+    uint32_t record = M32(0x9739140u + 4u * i);
+    if (!carry_image_span(record, 24)) return 0;
+    if (M32(record + 8u) == (uint32_t)ramp) { ++matches; count = M32(record + 0x14u); }
+  }
+  return matches == 1 && count > 0u && count <= 64u ? (int)count : 0;
+}
+static int ghost_native_race_field(int ramp, int route, int tutorial, uint32_t output[6]) {
+  if (output) memset(output, 0, 6u * sizeof *output);
+  if (!output || rc_ghost_native_bridge != GHOST_BRIDGE_MAGIC || ramp < 1 || ramp > 22 ||
+      route < 0 || (tutorial != 0 && tutorial != 1) || !ghost_image()) return 0;
+  uint32_t count = (uint32_t)ghost_route_count(ramp);
+  if (!count || count > 64u || (uint32_t)route >= count) return 0;
+  uint32_t temporary = RC_STACK_TOP - 0x100u;
+  memset(VA(temporary), 0xa5, 24);
+  call(f_89924c8, 4, temporary, (uint32_t)ramp, fbits((float)route / (float)count), (uint32_t)tutorial);
+  float start = MF(temporary + 12u), goal = MF(temporary + 16u);
+  if (M32(temporary + 4u) || M32(temporary + 20u) || !ghost_area_allowed(M32(temporary + 8u), NULL) ||
+      !isfinite(start) || !isfinite(goal) || goal <= start) return 0;
+  memcpy(output, VA(temporary), 24);
+  return 1;
+}
+int car_ghost_race_field(int ramp, int route, int tutorial, uint32_t output[6]) {
+  /* Preserve the version-1 remote/qualification contract. Local shipped
+   * records enter only through the separately checked arcade binding below. */
+  if (output) memset(output, 0, 24);
+  return route == 0 && ghost_native_race_field(ramp, route, tutorial, output);
+}
+static int ghost_field_supported(const uint32_t field[6], int tutorial) {
+  uint32_t expected[6];
+  for (int ramp = 1; ramp <= 22; ++ramp) {
+    if (car_ghost_race_field(ramp, 0, tutorial, expected) && !memcmp(field, expected, 24)) return 1;
+  }
+  return 0;
+}
+int car_ghost_render_course(const uint32_t field[6]) {
+  if (!field || rc_ghost_native_bridge != GHOST_BRIDGE_MAGIC || !ghost_image() ||
+      (!ghost_field_supported(field, 0) && !ghost_field_supported(field, 1))) return -1;
+  int city = car_area_city((int)field[2]);
+  for (int course = 0; course < CAR_COURSES; ++course)
+    if (car_course_city(course) == city) return course;
+  return -1;
+}
+static int ghost_time_attack_field(int course, uint32_t field[6]) {
+  if (course < 0 || course >= CAR_COURSES || !ghost_image()) return 0;
+  uint32_t slot = COURSES[course].stage - TA_STAGE0;
+  if (slot >= 15u || !carry_image_span(TA_LENGTHS + slot * 8u, 8u) ||
+      !ghost_area_allowed(COURSES[course].area, NULL)) return 0;
+  float start = COURSES[course].dist, length = MF(TA_LENGTHS + slot * 8u + 4u);
+  if (!isfinite(length) || length <= 0.0f || !isfinite(start + length)) return 0;
+  const uint32_t words[6] = {COURSES[course].stage, 0u, COURSES[course].area,
+                             fbits(start), fbits(start + length), 0u};
+  memcpy(field, words, sizeof words);
+  return 1;
+}
+int car_ghost_time_attack_area(int course) {
+  /* Original Ghost area order. The two multi-region Shuto TA courses use
+   * the Wangan area, where their runs begin (Tennouzu/Tokyokou). */
+  static const int areas[CAR_COURSES] = {0, 0, 1, 1, 2, 3, 4, 5, 7, 6, 2, 2};
+  return course >= 0 && course < CAR_COURSES ? areas[course] : -1;
+}
+#include "car_ghost_arcade.inc"
+#include "car_ghost_default.inc"
+
+static int ghost_coverage(float first, float last, const uint32_t field[6]) {
+  float start, goal;
+  memcpy(&start, field + 3, 4); memcpy(&goal, field + 4, 4);
+  return isfinite(first) && isfinite(last) && fabsf(first - start) <= 100000.0f &&
+         last >= goal && last <= goal + 1000000.0f;
+}
+static int ghost_arcade_coverage(float first, float last, const uint32_t field[6]) {
+  if (ghost_coverage(first, last, field)) return 1;
+  uint32_t ids[GHOST_MAX_AREAS], count, kind;
+  if (!ghost_stage_areas(field[0], ids, &count, &kind) || kind != 2u) return 0;
+  for (uint32_t i = 0; i < count; ++i) if (ids[i] == field[2]) return 0;
+  /* Original CSlit/straight-processor Init starts at path origin when the ramp
+   * area precedes the selected finite StageAry path. The original raw field is
+   * retained unchanged in SConfigPlay. These native stages really begin near
+   * odo0 (observed initial machine555mm; original first samples1109..1110mm),
+   * not raw ramp distance1450000mm. This is validation-only normalization. */
+  uint32_t effective[6]; memcpy(effective, field, sizeof effective); effective[3] = fbits(0.0f);
+  return ghost_coverage(first, last, effective);
+}
+static float ghost_goal_mm(const car_ghost_config *config) {
+  float goal;
+  memcpy(&goal, config->race_field + 4, sizeof goal);
+  return goal;
+}
+int car_ghost_arcade_validate_trail(const car_ghost_arcade_binding *binding, const void *trail, size_t bytes) {
+  ghost_format_policy policy;
+  ghost_format_info info;
+  return car_ghost_arcade_policy(binding,&policy) &&
+    ghost_format_validate(trail,bytes,&policy,&info)==GHOST_FORMAT_OK &&
+    ghost_arcade_coverage(info.first_odometer,info.last_odometer,binding->race_field);
+}
+void car_ghost_clear(void) {
+  memset(&ghost_default, 0, sizeof ghost_default);
+  if (PG.started) P.ready = 0;
+  ghost_runtime_clear();
+  memset(&PG, 0, sizeof PG);
+  memset(&PT, 0, sizeof PT);
+  memset(&ghost_arcade_policy_state, 0, sizeof ghost_arcade_policy_state);
+}
+static int ghost_prepare_config(const car_ghost_config *configuration, const car_ghost_arcade_binding *arcade) {
+  car_ghost_config config;
+  if (configuration) config = *configuration; else memset(&config, 0, sizeof config);
+  car_ghost_clear();
+  PG.observation = (car_ghost_observation){.status = CAR_GHOST_FAILED,
+    .kind = config.kind == CAR_GHOST_CHALLENGE || config.kind == CAR_GHOST_QUALIFICATION ? config.kind : 0,
+    .session_token = config.session_token}; /* rejected requests cannot fall into TA */
+  PG.requested = 1;
+  P.ready = 0; /* a rejected Ghost request cannot keep driving a stale ordinary race */
+  if (!configuration || config.abi_version != CAR_GHOST_ABI_VERSION || !config.session_token ||
+      rc_ghost_native_bridge != GHOST_BRIDGE_MAGIC || !car_ghost_physics_id() || !ghost_image() ||
+      (config.kind != CAR_GHOST_CHALLENGE && config.kind != CAR_GHOST_QUALIFICATION) ||
+      (config.record_player != 0 && config.record_player != 1) ||
+      config.native_flags[0] > 1 || config.native_flags[1] > 1 ||
+      (!arcade && !ghost_field_supported(config.race_field, config.native_flags[1]))) return 0;
+  ghost_format_policy policy = {.stage=config.race_field[0], .area_allowed=ghost_area_allowed};
+  if (arcade && (config.kind != CAR_GHOST_CHALLENGE || config.record_player ||
+      memcmp(config.race_field, arcade->race_field, 24) ||
+      !car_ghost_arcade_policy(arcade, &policy))) return 0;
+  if (config.kind == CAR_GHOST_CHALLENGE) {
+    if (config.trail_band[0] != config.rival.power || config.trail_band[1] != config.rival.handling ||
+        config.rival.power < 0 || config.rival.power > CAR_TUNE_MAX ||
+        config.rival.handling < 0 || config.rival.handling > CAR_TUNE_MAX ||
+        config.rival.power + config.rival.handling > CAR_TUNE_TOTAL ||
+        config.trail_band[2] < 0 || config.trail_band[2] > 876000 ||
+        (!arcade && config.rival.type >= TRAFFIC_TYPE0) || (arcade && config.rival.type > 44u) ||
+        config.rival.gears < 4 || config.rival.gears > 6 || config.rival.spokes < (arcade ? 0 : 1) || config.rival.spokes > 64)
+      return 0;
+    for (int i = 0; i < 6; ++i)
+      if (!isfinite(config.rival.tyres[i]) || fabsf(config.rival.tyres[i]) > 10000.0f) return 0;
+    if (config.rival.tyres[1] <= 0 || config.rival.tyres[4] <= 0 ||
+        ghost_runtime_prepare(config.trail, config.trail_bytes, &policy) != GHOST_FORMAT_OK) return 0;
+    const ghost_format_info *info = ghost_runtime_input_info();
+    if (!info || !(arcade ? ghost_arcade_coverage(info->first_odometer, info->last_odometer, config.race_field) :
+                           ghost_coverage(info->first_odometer, info->last_odometer, config.race_field))) {
+      ghost_runtime_clear(); return 0;
+    }
+  } else {
+    /* Qualification is explicitly solo mode 6 + native sampler, never mode 9
+     * (Tournament), and never an automatic missing-opponent fallback. */
+    if (!config.record_player || config.trail || config.trail_bytes) return 0;
+  }
+  PG.config = config;
+  PG.record_required = config.kind == CAR_GHOST_QUALIFICATION || config.record_player;
+  PG.config.trail = NULL; /* validated runtime owns the immutable copy */
+  PG.arcade_on = arcade != NULL;
+  if (arcade) PG.arcade = *arcade;
+  PG.observation = (car_ghost_observation){.status = CAR_GHOST_PREPARED, .kind = config.kind,
+                                         .session_token = config.session_token};
+  P.has_rival = P.n_rival = P.vs_on = P.ten_stage = P.n_ten = 0;
+  car_story_carry_cancel();
+  return 1;
+}
+int car_ghost_prepare(const car_ghost_config *config) {
+  return ghost_prepare_config(config, NULL);
+}
+int car_ghost_arcade_prepare(const car_ghost_arcade_spec *spec, car_ghost_arcade_binding *binding) {
+  car_ghost_arcade_binding local;
+  if (binding) memset(binding, 0, sizeof *binding);
+  if (!spec || !spec->session_token || !car_ghost_arcade_bind(spec, &local)) {
+    car_ghost_config rejected = {.abi_version=CAR_GHOST_ABI_VERSION, .kind=CAR_GHOST_CHALLENGE,
+                                .session_token=spec ? spec->session_token : 0};
+    ghost_prepare_config(&rejected, NULL); /* clears readiness; cannot fall back */
+    return 0;
+  }
+  car_ghost_config config = {.abi_version=CAR_GHOST_ABI_VERSION, .session_token=spec->session_token,
+    .kind=CAR_GHOST_CHALLENGE, .rival=local.rival, .trail=spec->trail, .trail_bytes=spec->trail_bytes,
+    .trail_band={spec->power, spec->handling, spec->age_hours},
+    .native_flags={(unsigned char)spec->has_crown, (unsigned char)spec->first_tutorial}};
+  memcpy(config.race_field, local.race_field, sizeof config.race_field);
+  if (!ghost_prepare_config(&config, &local)) return 0;
+  if (local.raw_ramp >= CAR_GHOST_TA_RAMP_BASE)
+    car_ghost_arm_rival_runout(spec->session_token);
+  if (binding) *binding = local;
+  return 1;
+}
+int car_ghost_arcade_info(car_ghost_arcade_binding *binding) {
+  if (binding) memset(binding, 0, sizeof *binding);
+  if (!binding || !PG.arcade_on || PG.config.kind != CAR_GHOST_CHALLENGE || PG.observation.status == CAR_GHOST_FAILED) return 0;
+  *binding = PG.arcade;
+  return 1;
+}
+int car_ghost_crown_area_matches(unsigned area,int raw_ramp) {
+  return area<8u && raw_ramp>=0 && raw_ramp<CAR_LINK_RAMPS && ghost_image() &&
+    ghost_default_area_ramp(area,raw_ramp);
+}
+int car_ghost_arm_cloud_recording(uint64_t token) {
+  if (!token || !PG.arcade_on || PG.config.session_token!=token ||
+      PG.observation.status!=CAR_GHOST_PREPARED) return 0;
+  PG.config.record_player=1;
+  return 1;
+}
+int car_ghost_arm_time_attack_recording(uint64_t token) {
+  if (!token || PG.requested || !car_ghost_physics_id()) return 0;
+  PT.pending = token;
+  return 1;
+}
+int car_ghost_arm_local_crown(uint64_t token, int record_player) {
+  if (!token || !PG.arcade_on || !PG.config.native_flags[0] || PG.config.session_token != token ||
+      PG.observation.status != CAR_GHOST_PREPARED) return 0;
+  if (PG.config.kind == CAR_GHOST_CHALLENGE) car_ghost_arm_rival_runout(token);
+  PG.finish_order = 1;
+  PG.crown_race = 1;
+  if (record_player) PG.config.record_player = PG.record_required = 1;
+  return 1;
+}
+int car_ghost_arm_rival_runout(uint64_t token) {
+  if (!token || !PG.arcade_on || PG.config.kind != CAR_GHOST_CHALLENGE ||
+      PG.config.session_token != token || PG.observation.status != CAR_GHOST_PREPARED) return 0;
+  if (!PG.finish_order) ghost_runtime_extend_crown(ghost_goal_mm(&PG.config), CAR_GHOST_CROWN_RUNOUT_TICKS);
+  PG.finish_order = 1;
+  return 1;
+}
+static int ghost_target_valid(void) {
+  if (!PG.started || PG.config.kind != CAR_GHOST_CHALLENGE || !rc_mem) return 0;
+  uint32_t target = M32(GHOST_TARGET_PTR);
+  const ghost_format_info *info = ghost_runtime_input_info();
+  if (!info || target < RC_HEAP_BASE || !carry_span(target, GHOST_TARGET_BYTES) ||
+      M32(target + 4u) != GHOST_NATIVE_VERSION || M32(target + 0x10u) != info->samples ||
+      M32(target + 0x1cu) != info->stage || M32(target + 0x20u) != info->seed ||
+      M32(target + 0x28u) != info->sample_step) return 0;
+  uint32_t samples = M32(target + 8u), areas = M32(target + 0x14u), count = M32(target + 0x18u);
+  if (samples < RC_HEAP_BASE || !carry_span(samples, info->samples * GHOST_SAMPLE_BYTES) ||
+      count != info->areas || areas < RC_HEAP_BASE || !carry_span(areas, (count + 1u) * 4u)) return 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t area = M32(areas + 4u * i);
+    uint32_t expected;
+    if (!carry_area_valid(area) || !ghost_area_allowed(M32(area), NULL) ||
+        !ghost_runtime_input_area(i, &expected) || M32(area) != expected) return 0;
+  }
+  if (M32(areas + count * 4u)) return 0;
+  return isfinite(MF(target + 0x484u));
+}
+static void ghost_observe_crossing(float player, float rival) {
+  float goal = ghost_goal_mm(&PG.config);
+  if (PG.first_crossing || !isfinite(player) || !isfinite(rival)) return;
+  if (player >= goal || rival >= goal) {
+    float gap = player - rival;
+    if (PG.finish_sampled) {
+      /* Interpolate within this tick so an overtake just beyond the line
+       * cannot reverse the order when both odometers cross in one tick. */
+      float p0 = PG.finish_previous[0], r0 = PG.finish_previous[1];
+      float player_at = player >= goal ? (goal - p0) / (player - p0) : INFINITY;
+      float rival_at = rival >= goal ? (goal - r0) / (rival - r0) : INFINITY;
+      float first = fminf(player_at, rival_at);
+      gap = player_at <= rival_at ?
+        (goal - r0) - first * (rival - r0) :
+        first * (player - p0) - (goal - p0);
+      PG.first_crossing = player_at <= rival_at ? 1 : -1;
+    } else PG.first_crossing = gap >= 0.0f ? 1 : -1;
+    PG.finish_gap_m = gap * 0.001f;
+    return;
+  }
+  PG.finish_previous[0] = player;
+  PG.finish_previous[1] = rival;
+  PG.finish_sampled = 1;
+}
+
+static int ghost_crown_running_out(void) {
+  return PG.crown_race && PG.observation.goal_reached &&
+    PG.observation.native_ticks - PG.observation.finish_tick < CAR_GHOST_CROWN_RUNOUT_TICKS;
+}
+
+static int ghost_recorder_valid(uint32_t recorder, uint32_t stage) {
+  if (recorder < RC_HEAP_BASE || !carry_span(recorder, 0x64)) return 0;
+  uint32_t capacity = M32(recorder + 0xcu), step = M32(recorder + 0x28u);
+  return capacity >= 2u && capacity <= GHOST_MAX_SAMPLES &&
+         (step == 3u || step == 5u || (stage == GHOST_LONG_TA_STAGE && step == 9u)) &&
+         M32(recorder + 0x1cu) == stage && carry_span(M32(recorder + 8u), capacity * GHOST_SAMPLE_BYTES);
+}
+static int ghost_extend_ta_recorder(uint32_t recorder, uint32_t stage) {
+  if (!ghost_recorder_valid(recorder, stage) || M32(recorder + 0x10u)) return 0;
+  /* The stock 270-second buffer truncates longer Time Attack courses.
+   * Native SamplingConfig supports longer intervals while retaining the
+   * 8192 sample limit. Shuto Tokyo needs a larger window for its 60 km. */
+  uint32_t ticks = stage == GHOST_LONG_TA_STAGE ? GHOST_LONG_TA_MAX_TICKS : GHOST_MAX_TICKS;
+  uint32_t step = stage == GHOST_LONG_TA_STAGE ? 9u : 5u;
+  uint32_t bytes = (ticks / step + 1u) * GHOST_SAMPLE_BYTES;
+  uint32_t aligned = (rc_heap_next + 15u) & ~15u;
+  if (aligned > RC_HEAP_BASE + RC_HEAP_SIZE - bytes) return 0;
+  call(f_89e1130, 4, recorder, fbits((float)ticks / 60.0f), step, 1u);
+  return ghost_recorder_valid(recorder, stage) && M32(recorder + 0x28u) == step;
+}
+static int ghost_recorder_covers(uint32_t recorder, const uint32_t field[6], int arcade) {
+  if (!ghost_recorder_valid(recorder, field[0])) return 0;
+  uint32_t count = M32(recorder + 0x10u), samples = M32(recorder + 8u);
+  return count >= 2u && count <= M32(recorder + 0xcu) &&
+    (arcade ? ghost_arcade_coverage : ghost_coverage)(
+      MF(samples), MF(samples + (count - 1u) * GHOST_SAMPLE_BYTES), field);
+}
+static int ghost_recorder_save(uint32_t recorder) {
+  W8(recorder + 0x30u, 0);
+  call(f_89e1320, 1, recorder);
+  if (!call(f_89e61dc, 1, recorder)) return 0;
+  ghost_runtime_stop();
+  return 1;
+}
+static void ghost_configure_recording(uint32_t cfg) {
+  uint32_t output_name = rc_alloc(sizeof GHOST_OUTPUT_TOKEN);
+  memcpy(VA(output_name), GHOST_OUTPUT_TOKEN, sizeof GHOST_OUTPUT_TOKEN);
+  W32(cfg + 0x11cu, output_name);
+  /* Original CSeq stores (cfg+0x118)^1 into sampling selector 0x9802964;
+   * Exec samples only selector 0/2. Explicit recording uses selector 0. */
+  W8(cfg + 0x118u, 1);
+}
+static void ghost_begin_ta_recording(uint32_t cfg, uint64_t token) {
+  int raw_ramp = CAR_GHOST_TA_RAMP_BASE + P.course;
+  car_ghost_arcade_binding b = {.source_id=token, .raw_ramp=raw_ramp, .ramp=raw_ramp + 1, .route_count=1};
+  ghost_format_policy policy;
+  if (!ghost_time_attack_field(P.course, b.race_field) ||
+      memcmp(VA(cfg + RACE_FIELD), b.race_field, sizeof b.race_field) ||
+      !car_ghost_arcade_policy(&b, &policy) || !ghost_runtime_begin_qualification(&policy)) return;
+  memcpy(PT.field, b.race_field, sizeof PT.field);
+  PT.token = token;
+  ghost_configure_recording(cfg);
+}
+int car_ghost_time_attack_recording_info(uint64_t token, int *course, uint32_t field[6], car_spec *owner) {
+  car_ta_ranking_observation native;
+  if (!token || PT.token != token || !course || !field || !owner ||
+      !car_ta_ranking_info(&native) || !native.goal ||
+      memcmp(native.race_field, PT.field, sizeof PT.field) ||
+      (!PT.saved && !ghost_recorder_covers(PT.recorder, PT.field, 0))) return 0;
+  *course = native.course;
+  memcpy(field, PT.field, sizeof PT.field);
+  *owner = native.owner;
+  return 1;
+}
+int car_ghost_time_attack_recording_export(uint64_t token, void *output, size_t capacity, size_t *bytes) {
+  if (!bytes) return 0;
+  *bytes = 0;
+  int course;
+  uint32_t field[6];
+  car_spec owner;
+  if (!car_ghost_time_attack_recording_info(token, &course, field, &owner)) return 0;
+  if (!PT.saved) {
+    if (!ghost_recorder_save(PT.recorder)) return 0;
+    PT.saved = 1;
+  }
+  return ghost_runtime_export(output, capacity, bytes, NULL);
+}
+
+static void ghost_observe(void) {
+  if (!PG.started || PG.observation.status == CAR_GHOST_FAILED || !P.ready) return;
+  if (PG.config.kind == CAR_GHOST_DEFAULT) {
+    PG.observation.native_default_ai_valid = ghost_default_ai_valid();
+    if (!PG.observation.native_default_ai_valid) { PG.observation.status = CAR_GHOST_FAILED; P.ready = 0; return; }
+  }
+  if (PG.config.kind == CAR_GHOST_CHALLENGE) {
+    PG.observation.native_target_valid = ghost_target_valid();
+    if (!PG.observation.native_target_valid) {
+      PG.observation.status = CAR_GHOST_FAILED;
+      ghost_runtime_stop();
+      P.ready = 0;
+      return;
+    }
+  }
+  /* Get2DInfoTarget reads the native CTarget odometer or the original default
+   * AI odometer (0x8982da0), depending on which target owns this race. */
+  uint32_t state = M32(STATE);
+  PG.observation.live_gap_mm = NAN;
+  if (!PG.observation.result_valid && (PG.config.kind==CAR_GHOST_CHALLENGE || PG.config.kind==CAR_GHOST_DEFAULT)) {
+    WF(PG.info + 4u, NAN);
+    if (call(f_8982d44, 1, PG.info) && isfinite(MF(PG.info + 4u))) {
+      PG.observation.live_gap_mm = MF(PG.info + 4u);
+      PG.observation.gap_m = PG.observation.live_gap_mm * 0.001f;
+      if (PG.finish_order && (state == 2u || state == 7u || state == 8u)) {
+        float rival = PG.config.kind == CAR_GHOST_CHALLENGE ? MF(M32(GHOST_TARGET_PTR) + 0x484u) :
+                                                           MF(M32(0x98028b4u) + 0x7f4u);
+        ghost_observe_crossing(MF(P.m + 0x970u), rival);
+      }
+    }
+  }
+  if (!PG.observation.result_valid && (state == 3 || state == 6 || state == 8)) {
+    memset(VA(P.result), 0xff, 0x40);
+    uint32_t result_ok = call(f_898317c, 1, P.result);
+    uint32_t place = M32(P.result);
+    unsigned goal = M8(P.result + 0x10u);
+    if (result_ok && place <= 1u && goal <= 1u) {
+      PG.observation.result_valid = 1;
+      /* Target's result console reads the frozen GetPlayResult advantage,
+       * distinct from the live Get2DInfoTarget odometer difference. */
+      float result_gap = MF(P.result + 8u);
+      if (isfinite(result_gap)) PG.observation.gap_m = result_gap * 0.001f;
+      PG.observation.place = (int)place;
+      PG.observation.goal_reached = (int)goal;
+      if (state == 8 && goal && PG.first_crossing) {
+        PG.observation.place = PG.first_crossing < 0;
+        PG.observation.gap_m = PG.finish_gap_m;
+      }
+      PG.observation.won = state == 8 && PG.observation.place == 0 && goal;
+      PG.observation.status = CAR_GHOST_FINISHED;
+      PG.observation.finish_tick=PG.observation.native_ticks;
+    }
+  }
+  PG.observation.recording = ghost_runtime_recording();
+  if (!PG.saved && PG.config.record_player && PG.recorder && PG.observation.status == CAR_GHOST_FINISHED &&
+      PG.observation.result_valid && PG.observation.goal_reached &&
+      !(PG.observation.won && ghost_crown_running_out())) {
+    PG.observation.export_ready = ghost_recorder_covers(PG.recorder, PG.config.race_field, PG.arcade_on);
+  }
+}
+int car_ghost_status(car_ghost_observation *observation) {
+  if (!observation) return 0;
+  ghost_observe();
+  PG.observation.recording = ghost_runtime_recording();
+  if (PG.observation.status == CAR_GHOST_FAILED) PG.observation.export_ready = 0;
+  *observation = PG.observation;
+  return PG.observation.status != CAR_GHOST_OFF;
+}
+int car_ghost_export(void *output, size_t capacity, size_t *bytes) {
+  if (bytes) *bytes = 0;
+  ghost_observe();
+  if (!bytes || !PG.started || !PG.config.record_player || PG.observation.status != CAR_GHOST_FINISHED ||
+      !PG.observation.result_valid || !PG.observation.goal_reached || !PG.recorder ||
+      (PG.observation.won && ghost_crown_running_out())) return 0;
+  if (!PG.saved) {
+    if (!ghost_recorder_covers(PG.recorder, PG.config.race_field, PG.arcade_on) ||
+        !ghost_recorder_save(PG.recorder)) return 0;
+    PG.saved = 1;
+    PG.observation.recording = 0;
+  }
+  int ok = ghost_runtime_export(output, capacity, bytes, NULL);
+  PG.observation.export_ready = ok || *bytes > 0;
+  return ok;
+}
+
 /* CSeq::Init: STireDimension, normally from the display model: front (x, radius, z), rear, spokes; mm */
 static void on_hook(uint32_t at) {
+  if (at == 0x898f18du && PG.requested && PG.config.kind == CAR_GHOST_DEFAULT) {
+    ++ghost_default.tire_hook_calls;
+    uint32_t tire = ebp - 0xb8u, cfg = M32(0x9802968u);
+    int valid = ghost_default.active && ghost_default.tire_hook_calls == 1 &&
+      carry_span(esp, 0x2cu) && tire >= RC_STACK_TOP - RC_STACK_SIZE && carry_span(tire, 0x1cu) &&
+      M32(esp + 0x10u) == tire && carry_span(cfg, 0xd2u) && M32(cfg + CFG_MODE) == 8u &&
+      M32(cfg + 0xccu) == 0u && M32(cfg + 0xbcu) == PG.config.rival.type &&
+      M32(esp + 0xcu) == PG.config.rival.type &&
+      (PG.config.record_player?ghost_runtime_recording():!ghost_runtime_active());
+    ghost_default.tire_hook_valid = valid;
+    if (valid) {
+      for (int i = 0; i < 6; ++i) WF(tire + 4u * (uint32_t)i, PG.config.rival.tyres[i]);
+      W32(tire + 0x18u, (uint32_t)PG.config.rival.spokes);
+    }
+    return;
+  }
+  if (at == 0x898807eu && PG.requested && PG.config.kind == CAR_GHOST_CHALLENGE) {
+    uint32_t tire = ebp - 0xb8u;
+    for (int i = 0; i < 6; ++i) WF(tire + 4u * (uint32_t)i, PG.config.rival.tyres[i]);
+    W32(tire + 0x18u, (uint32_t)PG.config.rival.spokes);
+    return;
+  }
+  if (at == 0x898484cu && PG.started && PG.observation.native_target_valid) {
+    PG.observation.collision_registrations++;
+    return;
+  }
   if (at == RIVAL_TIRE_HOOK) { /* CSeq::Init's loop over the rivals: edi the rival's number */
     const car_rival *r = &P.rival[edi >= 1 && edi <= (uint32_t)P.n_rival ? edi - 1 : 0];
     uint32_t tire = M32(esp + 0x14);
@@ -587,6 +1101,13 @@ static int on_other_setup(uint32_t slot, uint32_t type) {
 static void first_frame(car_state *c);
 
 int car_start(car_state *c, int course, int manual, const car_spec *spec) {
+  if (PG.requested && (PG.started || PG.observation.status != CAR_GHOST_PREPARED)) return -1;
+  if (PG.arcade_on && car_course_city(course) != PG.arcade.city) {
+    PG.observation.status = CAR_GHOST_FAILED; P.ready = 0; return -1;
+  }
+  if (!PG.requested) ghost_runtime_clear();
+  uint64_t ta_recording_token = PT.pending;
+  memset(&PT, 0, sizeof PT);
   if (c) car_clear_junction(&c->race);
   story_carry.loaded = 0;
   if (story_carry.valid && !story_carry.armed) car_story_carry_cancel();
@@ -619,7 +1140,7 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
   WF(cfg + CFG_DIST, COURSES[course].dist);
   WF(cfg + CFG_GOAL, COURSES[course].dist + MF(TA_LENGTHS + 8 * (COURSES[course].stage - TA_STAGE0) + 4));
 #ifdef WMMT_EGL
-  if (getenv("WMMT_TA_GOAL")) /* test: the goal this many m from the start */
+  if (!PG.requested && getenv("WMMT_TA_GOAL")) /* test: the goal this many m from the start */
     WF(cfg + CFG_GOAL, COURSES[course].dist + 1000.0f * (float)atof(getenv("WMMT_TA_GOAL")));
 #endif
   W32(cfg + CFG_MODE, MODE_TIME_ATTACK);
@@ -690,12 +1211,64 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
     fprintf(stderr, "ten stage %d level %d: area %u dist %.0f goal %.0f\n", P.ten_stage, P.ten_level, M32(cfg + CFG_AREA),
             MF(cfg + CFG_DIST), MF(cfg + CFG_GOAL));
   }
+  if (PG.requested) {
+    if (P.has_rival || P.vs_on || P.ten_stage) { PG.observation.status = CAR_GHOST_FAILED; return -1; }
+    for (int i = 0; i < 6; ++i) W32(cfg + RACE_FIELD + 4u * (uint32_t)i, PG.config.race_field[i]);
+    W32(cfg + CFG_MODE, PG.config.kind == CAR_GHOST_QUALIFICATION ? MODE_TIME_ATTACK : 8u);
+    W32(cfg + CFG_TA_TRAFFIC, 0);
+    W8(cfg + CFG_CARD, 1);
+    int ready;
+    if (PG.config.kind == CAR_GHOST_DEFAULT) {
+      W32(cfg + 0xbcu, PG.config.rival.type);
+      for (int i = 0; i < 3; ++i) W32(cfg + 0xc0u + 4u * (uint32_t)i, (uint32_t)PG.config.trail_band[i]);
+      W32(cfg + 0xccu, 0u); /* intentional original default-AI, not missing-trail fallback */
+      W8(cfg + 0xd0u, PG.config.native_flags[0]); W8(cfg + 0xd1u, PG.config.native_flags[1]);
+      ready=ghost_default.active && !ghost_runtime_active();
+      if (ready && PG.config.record_player) {
+        ghost_format_policy policy;
+        int recording = car_ghost_arcade_policy(&PG.arcade,&policy) && ghost_runtime_begin_qualification(&policy);
+        if (!recording && !PG.record_required) PG.config.record_player = 0;
+        else ready = recording;
+      }
+    } else if (PG.config.kind == CAR_GHOST_CHALLENGE) {
+      W32(cfg + 0xbcu, PG.config.rival.type);
+      for (int i = 0; i < 3; ++i) W32(cfg + 0xc0u + 4u * (uint32_t)i, (uint32_t)PG.config.trail_band[i]);
+      uint32_t name = rc_alloc(sizeof GHOST_INPUT_TOKEN);
+      memcpy(VA(name), GHOST_INPUT_TOKEN, sizeof GHOST_INPUT_TOKEN);
+      W32(cfg + 0xccu, name);
+      W8(cfg + 0xd0u, PG.config.native_flags[0]); W8(cfg + 0xd1u, PG.config.native_flags[1]);
+      ready = ghost_runtime_begin(PG.config.record_player);
+      if (!ready && PG.config.record_player && !PG.record_required) {
+        PG.config.record_player = 0;
+        ready = ghost_runtime_begin(0);
+      }
+    } else {
+      ghost_format_policy policy = {.stage=PG.config.race_field[0], .area_allowed=ghost_area_allowed};
+      ready = ghost_runtime_begin_qualification(&policy);
+    }
+    if (!ready) { PG.observation.status = CAR_GHOST_FAILED; return -1; }
+    if (PG.config.record_player) {
+      /* Original CSeq owns the COMPLETE sampler construction/config/start
+       * sequence. The private variant gates its mode-6 recording branch only
+       * for this explicit qualification session; no host-made sampler. */
+      ghost_configure_recording(cfg);
+    }
+  } else if (ta_recording_token && M32(cfg + CFG_MODE) == MODE_TIME_ATTACK) {
+    ghost_begin_ta_recording(cfg, ta_recording_token);
+  }
   if (story_carry.valid && story_carry.armed) {
     story_carry.target_stage = M32(cfg + CFG_STAGE);
     story_carry.initializing = 1;
     if (!carry_target_matches()) car_story_carry_cancel();
   }
   call(f_89878c4, 1, cfg);
+  if (PG.arcade_on && PG.arcade.raw_ramp >= CAR_GHOST_TA_RAMP_BASE) {
+    /* Original mode 8 has 300 seconds and no TA checkpoint extensions.
+     * Allow the field's entire recording window plus a minute for traffic. */
+    uint32_t ticks = PG.config.race_field[0] == GHOST_LONG_TA_STAGE ?
+      GHOST_LONG_TA_MAX_TICKS : GHOST_MAX_TICKS;
+    WF(RACE_TIME_LEFT, (float)ticks / 60.0f + 60.0f);
+  }
   story_carry.initializing = 0;
   P.vs_race = P.vs_on ? P.vs_n : 0;
   P.vs_on = 0; /* car_set_versus is for this race only */
@@ -725,8 +1298,41 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
   P.info_ten = rc_alloc(0xa0);
   P.result = rc_alloc(0x40);
   P.first_pt = rc_alloc(0x20);
+  if (PG.requested) {
+    PG.started = 1;
+    PG.info = rc_alloc(8);
+    PG.observation.status = CAR_GHOST_RUNNING;
+    if (PG.config.kind == CAR_GHOST_CHALLENGE && !ghost_target_valid()) {
+      PG.observation.status = CAR_GHOST_FAILED; ghost_runtime_stop(); return -1;
+    }
+    PG.observation.native_target_valid = PG.config.kind == CAR_GHOST_CHALLENGE;
+    if (PG.config.record_player) {
+      PG.recorder = M32(GHOST_SAMPLER_PTR);
+      int ta_field = PG.arcade_on && PG.arcade.raw_ramp >= CAR_GHOST_TA_RAMP_BASE;
+      if (!(ta_field ? ghost_extend_ta_recorder : ghost_recorder_valid)(PG.recorder, PG.config.race_field[0])) {
+        if (PG.record_required) {
+          PG.observation.status = CAR_GHOST_FAILED; ghost_runtime_stop(); return -1;
+        }
+        PG.recorder = 0;
+        PG.config.record_player = 0;
+        ghost_runtime_discard_recording();
+        W32(GHOST_SAMPLER_PTR, 0u);
+        if (PG.config.kind == CAR_GHOST_DEFAULT) ghost_runtime_stop();
+      }
+    }
+    PG.observation.native_default_ai_valid = PG.config.kind == CAR_GHOST_DEFAULT && ghost_default_ai_valid();
+    if (PG.config.kind == CAR_GHOST_DEFAULT && !PG.observation.native_default_ai_valid) { PG.observation.status = CAR_GHOST_FAILED; return -1; }
+  } else if (PT.token) {
+    PT.recorder = M32(GHOST_SAMPLER_PTR);
+    if (!ghost_extend_ta_recorder(PT.recorder, PT.field[0])) {
+      memset(&PT, 0, sizeof PT);
+      ghost_runtime_stop();
+    }
+  }
   P.ready = 1;
   first_frame(c);
+  ghost_observe();
+  if (PG.requested && PG.observation.status == CAR_GHOST_FAILED) { P.ready = 0; return -1; }
   return 0;
 }
 
@@ -769,6 +1375,15 @@ static void read_body(car_state *c) {
   c->spot = M8(P.disp + 0x146) == 1;
   call(f_89b410c, 2, P.m, P.eff);
   read_effect(&c->effect);
+  /* Read the already-produced native effect; no extra engine call or RNG draw.
+   * clCarEffectManager type0 uses +18/+24, +30, +50/+54 (not tyre-track alpha). */
+  if (c->tire_smoke_tick == UINT64_MAX) {
+    memset(&c->tire_smoke,0,sizeof c->tire_smoke);
+    c->tire_smoke_valid=0;
+  } else {
+    ++c->tire_smoke_tick;
+    c->tire_smoke_valid=tire_smoke_input_from_effect(&c->tire_smoke,VA(P.eff),TIRE_SMOKE_EFFECT_BYTES);
+  }
 #ifdef __ANDROID__
   for (int k = 0; k < 4; ++k) c->track_alpha[k] = MF(P.eff + 0x40 + 4u * (uint32_t)k);
 #endif
@@ -1064,7 +1679,8 @@ static void read_traffic(car_state *c) {
 /* The rivals (CSeq::GetInfoRivalCarDisp, rivals 1..): off the road (out of reach) it says so. */
 static void read_rival(car_state *c) {
   for (int i = 0; i < CAR_RIVALS; ++i) {
-    c->rival_shown[i] = (i < P.n_rival || i < P.vs_race || (P.ten_stage && i == 0)) && (call(f_8983488, 3, (uint32_t)i + 1u, P.disp, P.eff) & 0xff);
+    int ghost = i == 0 && PG.started && ((PG.config.kind == CAR_GHOST_CHALLENGE && ghost_target_valid()) || (PG.config.kind == CAR_GHOST_DEFAULT && ghost_default_ai_valid()));
+    c->rival_shown[i] = (ghost || i < P.n_rival || i < P.vs_race || (P.ten_stage && i == 0)) && (call(f_8983488, 3, (uint32_t)i + 1u, P.disp, P.eff) & 0xff);
     c->rival_effect[i].spark = 0;
     c->rival_effect[i].backfire_pulse = 0;
     memset(c->rival_effect[i].backfire_vec, 0, sizeof c->rival_effect[i].backfire_vec);
@@ -1075,6 +1691,14 @@ static void read_rival(car_state *c) {
       read_tyres(c->rival_tyre[i], c->rival_tyre_rot[i]);
       c->rival_brake[i] = M8(P.disp + 0x144);
       c->rival_spot[i] = M8(P.disp + 0x146) == 1;
+      if (ghost) {
+        int finite = 1;
+        for (int k = 0; k < 16; ++k) if (!isfinite(c->rival_body[i][k])) finite = 0;
+        for (int wheel = 0; wheel < 4; ++wheel)
+          for (int k = 0; k < 16; ++k) if (!isfinite(c->rival_tyre[i][wheel][k])) finite = 0;
+        PG.observation.display_valid = finite;
+        if (!finite) { c->rival_shown[i] = 0; PG.observation.status = CAR_GHOST_FAILED; }
+      }
     }
   }
 }
@@ -1088,6 +1712,7 @@ static void read_rival(car_state *c) {
 static uint32_t movie;
 
 float car_movie_start(car_state *c, int id, const car_spec *player, const car_rival *rivals, int n) {
+  if (PG.requested || PT.token || PT.pending) car_ghost_clear(); /* movies cannot inherit a recorder */
   P.ready = 0;
   story_carry.loaded = 0; /* a pre-movie Init is not the final race */
   movie = 0;
@@ -1176,7 +1801,21 @@ static int hits; /* car_hits */
 void car_hits(int on) { hits = on != 0; }
 
 void car_reset(car_state *c) {
+  if (PG.started) {
+    PG.observation.status = CAR_GHOST_FAILED; /* a reset cannot produce a ranked Ghost recording */
+    ghost_runtime_stop(); P.ready = 0; return;
+  }
+  if (PT.token) {
+    memset(&PT, 0, sizeof PT);
+    ghost_runtime_stop();
+  }
   if (!P.ready) return;
+  c->se.rev_enabled = 0;
+  c->se.rev_sequence = 0;
+  c->se.rev_vol = 0;
+  c->tire_smoke_tick=0;
+  c->tire_smoke_valid=0;
+  memset(&c->tire_smoke,0,sizeof c->tire_smoke);
   c->vel_ok = 0; /* (the warp is no hit) */
   uint32_t slit = P.m + 0x7b4u;
   float odo = MF(slit + 0x1bc), speed = fminf(fmaxf(c->speed * 1000.0f, 0.0f), WARP_SPEED);
@@ -1200,13 +1839,13 @@ static void first_frame(car_state *c) {
   read_traffic(c);
   read_rival(c);
 #ifdef WMMT_EGL
-  if (getenv("WMMT_TA_GOAL")) { /* test: the checkpoints and the goal (car_start) within this many m */
+  if (!PG.requested && getenv("WMMT_TA_GOAL")) { /* test: the checkpoints and the goal (car_start) within this many m */
     uint32_t tk = M32(TIME_KEEPER_PTR);
     int n = tk ? (int)M32(tk + TK_COUNT) : 0;
     float len = 1000.0f * (float)atof(getenv("WMMT_TA_GOAL"));
     for (int k = 1; k < n; ++k) WF(M32(tk + TK_ODO) + 4u * (uint32_t)k, COURSES[P.course].dist + len * (float)k / (float)(n - 1));
   }
-  if (getenv("WMMT_TA_TIME")) WF(0x9802a6cu, (float)atof(getenv("WMMT_TA_TIME"))); /* test: the time to start with */
+  if (!PG.requested && getenv("WMMT_TA_TIME")) WF(RACE_TIME_LEFT, (float)atof(getenv("WMMT_TA_TIME"))); /* test: the time to start with */
 #endif
   read_race(&c->race);
   c->manual = P.manual;
@@ -1214,24 +1853,18 @@ static void first_frame(car_state *c) {
   c->on_ground = 1;
 }
 
-void car_set_manual(car_state *c, int manual) {
-  P.manual = manual != 0;
-  c->manual = P.manual;
-  if (!P.ready) return;
-  /* the flag CTransmission::TransOn reads every frame (a reset starts with P.manual's) */
-  W32(P.m + M_ENGINE + 0x34, P.manual ? 0u : 1u);
-  /* the lever takes over from the gear the automatic was in */
-  if (P.manual) {
-    int g = (int)M32(P.m + M_ENGINE + 0x3c);
-    P.lever = g < 1 ? 0 : g - 1 > P.top_lever ? P.top_lever : g - 1;
-  }
-}
-
 float car_kmh(const car_state *c) { return fabsf(c->speed) * 3.6f; }
 
 /* CInfoSEMc events are sampled at physics rate, not rendering rate. */
 static void read_se(car_se *out) {
+  static unsigned rev_sequence;
   uint32_t se = P.m + 0xb88u;
+  /* CInfoSEMc::Init sets +0x1d from settings+0x73; +0x84 is the
+   * reactive envelope, not the adjacent +0x1e instantaneous state. */
+  out->rev_enabled = M8(se + 0x1du) != 0;
+  out->rev_vol = MF(se + 0x84u);
+  if (++rev_sequence == 0) ++rev_sequence;
+  out->rev_sequence = rev_sequence;
   if (M8(se + 0xa8u)) {
     out->valb = 1;
     out->valb_vol = MF(se + 0xacu);
@@ -1243,10 +1876,21 @@ static void read_se(car_se *out) {
     out->backfire_hz = (float)(int32_t)M32(se + 0xb8u);
   }
   P.se_backfire_on = backfire;
+  /* Set_SE_Effect_Reactive selects CheckZebra or CheckGapEff. Mc_Req
+   * maps this request to original one-shot 3 (gyap.wav). */
+  if (M8(se + 0xbcu)) {
+    out->road_hz = (int32_t)M32(se + 0xc4u);
+    out->road_vol = MF(se + 0xc0u);
+  }
 }
 
 void car_update(car_state *c, const car_input *in) {
   if (!P.ready) return;
+  if (PG.arcade_on && PG.observation.status==CAR_GHOST_FINISHED &&
+      !ghost_crown_running_out() &&
+      (!PG.config.record_player || PG.saved || !PG.observation.goal_reached || PG.observation.export_ready ||
+       PG.observation.native_ticks - PG.observation.finish_tick >=
+         (PG.config.race_field[0] == GHOST_LONG_TA_STAGE ? 9u : 6u))) return;
   /* digital buttons: the arcade expects a wheel, so stand in for the driver's hands.
    * Turn in at a steady rate and centre faster, to full lock at any speed as the cabinet's
    * wheel goes; the tilt is a wheel already, followed closely */
@@ -1275,10 +1919,14 @@ void car_update(car_state *c, const car_input *in) {
 #endif
   WF(P.gin + 4, in->throttle);
   WF(P.gin + 8, in->brake);
+  /* clGameInput+0xc is the arcade intrusion trigger. CSeq mode 5 copies it
+   * to CIO+0x11 for CPassing; the resulting lamp bit is already in SLxPacket. */
+  W8(P.gin + 0x0c, P.vs_race && c->race.play_state == 2 && !c->race.over && in->passing);
   W32(P.gin + 0x14, P.manual ? (uint32_t)P.lever : 0xffffffffu);
   /* the arcade frame: the traffic's AI and life, the car, what everything hit, the
    * checkpoints and the time, the sounds' cues */
   call(f_8983f64, 1, P.gin_ptr);
+  if (PG.started) PG.observation.native_ticks++;
   read_se(&c->se);
   c->rev_lamp_frame = (int32_t)M32(0x9802828u); /* CSeq::nCnt, observation only */
 
@@ -1290,6 +1938,7 @@ void car_update(car_state *c, const car_input *in) {
   read_traffic(c);
   read_rival(c);
   read_race(&c->race);
+  ghost_observe();
   /* velocity from the frame's displacement (display units per frame -> m/s) */
   float v[3] = { (c->pos[0] - prev[0]) * 6.0f, (c->pos[1] - prev[1]) * 6.0f, (c->pos[2] - prev[2]) * 6.0f };
   const float *M = c->body;
@@ -1332,4 +1981,53 @@ void car_update(car_state *c, const car_input *in) {
     c->impact = fmaxf(c->impact, lost * 4.0f);
     c->wall_hit = 0.3f;
   }
+}
+
+/* Native TA timing snapshot: no game calls, native-memory writes, or RNG mutation. */
+static int ta_ranking_heap_span(uint32_t p, size_t bytes) {
+  return rc_mem && p >= RC_HEAP_BASE && p <= rc_heap_next &&
+         rc_heap_next <= RC_HEAP_BASE + RC_HEAP_SIZE && bytes <= (size_t)(rc_heap_next - p);
+}
+int car_ta_ranking_info(car_ta_ranking_observation *out) {
+  if (out) memset(out, 0, sizeof *out);
+  if (!out || !P.ready || !rc_mem || PG.requested || PG.started || PG.arcade_on || movie ||
+      P.has_rival || P.ten_stage || P.vs_on || P.vs_race || P.course < 0 || P.course >= CAR_COURSES) return 0;
+  uint32_t cfg = M32(0x9802968u), tk = M32(TIME_KEEPER_PTR), state = M32(STATE);
+  if (!ta_ranking_heap_span(cfg, 0x200u) || !ta_ranking_heap_span(tk, 0x18u) ||
+      !ta_ranking_heap_span(P.info_race, 0x10u) || !ta_ranking_heap_span(P.m, M_ENGINE + 0x38u) ||
+      M32(MACHINE_PTR) != P.m || M32(cfg + CFG_MODE) != MODE_TIME_ATTACK ||
+      (state != 0u && state != 1u && state != 2u && state != 7u && state != 8u) ||
+      M32(cfg + CFG_CAR) != P.spec.type || M32(cfg + CFG_POWER) != (uint32_t)P.spec.power ||
+      M32(cfg + CFG_HANDLING) != (uint32_t)P.spec.handling ||
+      (P.manual != 0 && P.manual != 1) || M32(P.m + M_ENGINE + 0x34u) != (P.manual ? 0u : 1u) ||
+      P.spec.gears < 1 || P.spec.gears > 6 || P.spec.power < 0 || P.spec.power > CAR_TUNE_MAX ||
+      P.spec.handling < 0 || P.spec.handling > CAR_TUNE_MAX ||
+      M32(cfg + CFG_TA_TRAFFIC) > 1u) return 0;
+  for (int i = 0; i < 6; ++i) if (!isfinite(P.spec.tyres[i])) return 0;
+  if (P.spec.tyres[1] <= 0.0f || P.spec.tyres[4] <= 0.0f) return 0;
+  uint32_t field[6]; memcpy(field, VA(cfg + RACE_FIELD), sizeof field);
+  uint32_t slot = COURSES[P.course].stage - TA_STAGE0;
+  if (slot >= 15u || !carry_image_span(TA_LENGTHS + slot * 8u, 8u) ||
+      field[0] != COURSES[P.course].stage || field[1] || field[2] != COURSES[P.course].area ||
+      field[3] != fbits(COURSES[P.course].dist) ||
+      field[4] != fbits(COURSES[P.course].dist + MF(TA_LENGTHS + slot * 8u + 4u)) || field[5]) return 0;
+  uint32_t count = M32(tk + TK_COUNT), next = M32(tk + TK_NEXT), times = M32(tk + TK_SPLIT);
+  if (count < 2u || count > CAR_SECTIONS + 1u || next > count ||
+      !ta_ranking_heap_span(times, (size_t)count * 4u) ||
+      !isfinite(MF(P.info_race + 8u)) || MF(P.info_race + 8u) < 0.0f) return 0;
+  for (uint32_t i = 0; i < next; ++i)
+    if (!isfinite(MF(times + i * 4u)) || MF(times + i * 4u) < 0.0f ||
+        (i && MF(times + i * 4u) < MF(times + (i - 1u) * 4u))) return 0;
+  if (state == 8u && (next != count || MF(P.info_race + 8u) <= 0.0f ||
+                     M32(P.info_race + 8u) != M32(times + (count - 1u) * 4u))) return 0;
+  car_ta_ranking_observation o = {0};
+  o.abi_version = CAR_TA_RANKING_ABI_VERSION; o.native_mode = MODE_TIME_ATTACK;
+  o.native_state = state; o.goal = state == 8u;
+  o.course = P.course; o.course_id = car_course_id(P.course); o.ta_slot = (int)slot;
+  o.city = car_area_city((int)field[2]); o.traffic = (int)M32(cfg + CFG_TA_TRAFFIC); o.manual = P.manual;
+  o.owner = P.spec; memcpy(o.race_field, field, sizeof field);
+  o.elapsed_bits = M32(P.info_race + 8u); o.countdown_bits = M32(P.info_race);
+  o.time_left_bits = M32(P.info_race + 4u); o.checkpoint_count = count; o.checkpoint_next = next; o.split_count = next;
+  for (uint32_t i = 0; i < next; ++i) o.split_bits[i] = M32(times + 4u * i);
+  *out = o; return 1;
 }

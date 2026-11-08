@@ -11,7 +11,7 @@ a = prefix.index("/* the projection of the layout")
 b = prefix.index("/* the gyro's dead zone", a)
 prefix = prefix[:a] + prefix[b:]
 layout = s[s.index('static rect group_rect(int group, int gyro) {'):s.index('void hud_draw_layout_mode(')]
-with tempfile.TemporaryDirectory(prefix='hud-steering-') as td:
+with tempfile.TemporaryDirectory(prefix='hud-steering-', dir='/Volumes/CodexWork') as td:
     td = Path(td)
     (td / 'hud_steering_extracted.h').write_text(prefix + '\n' + layout)
     exe = td / 'hud_steering_test'

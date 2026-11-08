@@ -1,0 +1,20 @@
+[Unit]
+Description=Project Cinder SQLite snapshot
+After=cinder-cloud.service
+
+[Service]
+Type=oneshot
+User=cinder-cloud
+Group=cinder-cloud
+StateDirectory=cinder-cloud-backups
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 -B /opt/cinder-cloud/server/deploy/backup.py /var/lib/cinder-cloud /var/lib/cinder-cloud-backups
+TimeoutStartSec=120
+MemoryMax=128M
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX

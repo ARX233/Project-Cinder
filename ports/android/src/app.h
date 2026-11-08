@@ -13,9 +13,20 @@ void app_wide(float edge, float key_k);
 /* Before app_wide on a fast device (Android): no iPhone cuts though the screen is wide, the
  * maps drawn further. */
 void app_console(void);
+/* Game-thread UI resize, also valid before app_init. Updates only framebuffer
+ * dimensions and the existing wide-layout anchors; logical UI remains 1024x768.
+ * Invalid dimensions/transforms return 0 and leave the previous mapping intact.
+ * The platform must cancel old touches before changing its input transform. */
+int app_viewport(int fb_width, int fb_height, float edge, float key_k);
 int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, float screen_h);
 void app_touch(void *id, int phase, float x, float y);
 void app_frame(float dt);
+/* Android: elapsed display time -> bounded 60 Hz logic, then one independent
+ * presentation. Draw interpolation never writes back into the arcade state.
+ * Reset timing at lifecycle/surface discontinuities; no background catch-up. */
+void app_present(float dt);
+void app_timing_reset(void);
+int app_frame_rate_limit(void); /* game-thread presentation preference, 0 for auto */
 /* The iPad's turn about the screen's normal from level (radians, clockwise as the player
  * sees it positive), for steering by tilt (the OPTION screen's GYRO); main.m each frame. */
 void app_tilt(float radians);
@@ -30,6 +41,8 @@ void app_movie_done(void);
 /* The menu or race BGM that should play: a file name in data_dir/sound/bgm (without
  * .m4a), or NULL for none (the attract loop has its own sound). */
 const char *app_bgm(void);
+/* Game-thread snapshot: story goal's visible negate hold pauses BGM. */
+int app_bgm_gameplay_paused(void);
 /* Game-thread only. No selected slot, missing or damaged setting => level 3,
  * preserving the legacy Android player volume 1.0 (original card default is 2).
  * Setter accepts 0..3 and returns 1 only after the per-slot file is published;
@@ -53,6 +66,22 @@ void app_frame_done(double present_ms);
 void app_suspend(int away);
 /* iOS is short of memory: free what can be loaded again. */
 void app_memory_warning(void);
+/* Game/context owner: release approved Ghost readers and borrowed views before
+ * native shutdown. context_lost!=0 forgets old GPU handles without GL calls. */
+void app_ghost_release_assets(int context_lost);
+/* Game/context owner: close the independent player repaint MAIN-member reader. */
+void app_body_release_assets(int context_lost);
+/* Game/context owner: drop smoke particles and its independent RGBA8 atlas.
+ * Nonzero context_lost forgets handles without issuing calls on a dead GPU. */
+void app_smoke_release(int context_lost);
+/* Game-thread shutdown only: terminal best-effort leave and close owned VS4 sockets. */
+void app_vs_release(void);
+/* Game-thread local ranking owner: close independent sidecar, never old PBs. */
+void app_ta_rank_release(void);
+/* Game-thread only: trusted private root for new TA board/outbox. NULL disables
+ * them; never changes the legacy save directory or migrates existing files. */
+void app_ta_rank_save_dir(const char *dir);
+void app_ghost_crown_save_dir(const char *dir);
 const char *app_error(void);
 
 #endif
