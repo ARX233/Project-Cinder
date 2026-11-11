@@ -95,12 +95,13 @@ enum {
    * (0x4a, 0x4b), the level 63 part's COMPLETE (0x48); the title select's titles coming in (0x30);
    * the versus stars' star landing (0x2c) and big star (0x38) */
   S_PARTS_EQUIP, S_TUNING, S_LEVELUP, S_JACK_UP, S_JACK_DOWN, S_TUNING1, S_TUNING2, S_PARTS_COMP, S_RANK, S_WIN, S_WIN_BIGSTAR,
-  S_BACKFIRE1, S_BACKFIRE2,
+  S_BACKFIRE1, S_BACKFIRE2, S_ODO_COUNT,
   S_COUNT
 };
 /* every car type's engine and muffler loops (S_ENG0..S_MUF3 point into these) */
 static sample ENGINE_SAMPLES[SOUNDDB_NSETS][8];
 static const sounddb_set *engine_set = &SOUNDDB_SETS[0];
+static int arcade_engine_mix;
 static const char *EFFECT_FILES[S_COUNT - S_SLIP] = { "slip", "wall", "crash1", "crash4", "valb1",
                                                       "cursor", "select", "cancel", "gamestart",
                                                       "ti_count", "ti_count2", "turning6", "finish1",
@@ -110,7 +111,7 @@ static const char *EFFECT_FILES[S_COUNT - S_SLIP] = { "slip", "wall", "crash1", 
                                                       "valb2", "valb3", "gyap", "door_open", "door_close",
                                                       "engine_start", "phone2", "rybal_intro", "parts_equip",
                                                       "tuning", "levelup", "jack_up", "jack_down", "tuning1",
-                                                      "tuning2", "parts_comp", "rank", "win", "win_bigstar", "backfire1", "backfire2" };
+                                                      "tuning2", "parts_comp", "rank", "win", "win_bigstar", "backfire1", "backfire2", "odo_count" };
 static sample SAMPLES[S_COUNT];
 
 /* Loop voices map 1:1 to the first ten samples; one-shots get their own pool. */
@@ -236,7 +237,7 @@ int snd_init(const char *data_dir) {
   int missing = 0;
   for (int i = S_SLIP; i < S_COUNT; ++i) {
     snprintf(path, sizeof path, "%s/sound/%s.wav", data_dir, EFFECT_FILES[i - S_SLIP]);
-    if (load_wav(&SAMPLES[i], path) != 0) missing++;
+    if (load_wav(&SAMPLES[i], path) != 0 && i != S_ODO_COUNT) missing++;
   }
   for (int k = 0; k < SOUNDDB_NSETS; ++k)
     for (int i = 0; i < 8; ++i) {
@@ -266,6 +267,9 @@ static int valb_sample = S_VALVE;
 void snd_set_car(unsigned type, int power) {
   snd_rev_quiet();
   rev_car_type = type;
+  /* Arcade ECarType: SE3P, FD3S, FC3S and the Lancer Evolution models. */
+  arcade_engine_mix = (type >= 4 && type <= 6) || (type >= 9 && type <= 11) ||
+                      type == 13 || type == 14 || type == 36;
   int v = type < 48 ? VALB_BY_TYPE[type] : 0;
   valb_sample = v == 0 ? S_VALVE : v == 1 ? S_VALB2 : S_VALB3;
   const unsigned char *by_type = power >= 8 ? SOUNDDB_BY_TYPE : SOUNDDB_BY_TYPE_STOCK;
@@ -326,19 +330,22 @@ static struct {
 } E = { .rpm = 1000, .accel = 1000, .accel_target = 1000, .accel_step = 1000 };
 
 void snd_update(car_state *car, const car_input *in, float dt) {
+  int native_engine = arcade_engine_mix && car->se.rev_sequence;
   /* throttle state and gear changes drive the muffler level like the arcade */
-  int on = in->throttle > 0.1f;
+  int on = native_engine ? car->engine_se.accel : in->throttle > 0.1f;
   if (on && !E.throttle_on) { E.accel_target = 5000; E.accel_step = 1000; }
   if (!on && E.throttle_on) {
     E.accel_target = 1000; E.accel_step = 1000;
   }
   E.throttle_on = on;
-  if (car->shift_event > 0) {
+  if (native_engine ? car->engine_se.shift_up : car->shift_event > 0) {
     E.accel = fmaxf(0, E.accel_target - 5000); E.accel_step = 400;
-  } else if (car->shift_event < 0) {
+  }
+  if (native_engine ? car->engine_se.shift_down : car->shift_event < 0) {
     E.accel = fminf(5000, E.accel_target + 5000); E.accel_step = 8;
   }
   car->shift_event = 0;
+  car->engine_se.shift_up = car->engine_se.shift_down = 0;
   /* muffler_calc runs per 60 Hz tick */
   for (E.tick += dt; E.tick >= 1.0f / 60.0f; E.tick -= 1.0f / 60.0f) {
     if (E.accel > E.accel_target) E.accel = fmaxf(E.accel_target, E.accel - E.accel_step);
@@ -382,21 +389,33 @@ void snd_update(car_state *car, const car_input *in, float dt) {
     LOOP_STORE(LOOPS[L_REV].vol, rev);
   }
 
-  /* Prevent NaN/Inf or absurd inputs from poisoning the smoothed state. */
-  float input_rpm = car->rpm;
-  if (!(input_rpm >= 0.0f)) input_rpm = 0.0f; /* includes NaN and -Inf */
-  if (input_rpm > 1000000.0f) input_rpm = 1000000.0f;
-  if (!(E.rpm >= 0.0f) || E.rpm > 1000000.0f) E.rpm = 0.0f;
-  E.rpm += (input_rpm - E.rpm) * fminf(1.0f, dt * 20.0f);
-  float eng_rpm = band_rpm(engine_set->engine_bands, E.rpm);
-  float muf_rpm = band_rpm(engine_set->muffler_bands, E.rpm);
   float accel = E.accel / 5000.0f;
-  /* Boost only the car engine/exhaust and tyre-slip loops; menu, impacts and BGM are unchanged. */
   const float car_audio_boost = 1.7f; /* about +4.6 dB before the existing soft limiter */
+  float eng_rpm, muf_rpm, engine_gain, muffler_gain, engine_envelope;
+  if (native_engine) {
+    /* Mc_Req 0x89a0678 scales GetRevRate into the shared 300..8999 audio
+     * range. Using the tachometer's physical RPM skips this per-car mapping.
+     * EngSndCtrl applies the accelerator envelope only to the muffler. */
+    const float rpm = car->engine_se.rpm;
+    eng_rpm = muf_rpm = isfinite(rpm) ? truncf(fminf(8999.0f, fmaxf(300.0f, rpm))) : 300.0f;
+    engine_gain = 0.73f * fminf(1.0f, fmaxf(0.0f, car->engine_se.gain));
+    muffler_gain = engine_gain;
+    engine_envelope = 1.0f;
+  } else {
+    /* Prevent non-finite or absurd inputs from poisoning the smoothed state. */
+    float input_rpm = fminf(1000000.0f, fmaxf(0.0f, car->rpm));
+    if (!(E.rpm >= 0.0f) || E.rpm > 1000000.0f) E.rpm = 0.0f;
+    E.rpm += (input_rpm - E.rpm) * fminf(1.0f, dt * 20.0f);
+    eng_rpm = band_rpm(engine_set->engine_bands, E.rpm);
+    muf_rpm = band_rpm(engine_set->muffler_bands, E.rpm);
+    engine_gain = car_audio_boost * 0.30f;
+    muffler_gain = car_audio_boost * 0.34f;
+    engine_envelope = 0.55f + 0.45f * accel;
+  }
   for (int i = 0; i < 4; ++i) {
-    LOOP_STORE(LOOPS[S_ENG0 + i].vol, car_audio_boost * 0.30f * band_gain(&engine_set->engine_bands[i], eng_rpm) * (0.55f + 0.45f * accel));
+    LOOP_STORE(LOOPS[S_ENG0 + i].vol, engine_gain * band_gain(&engine_set->engine_bands[i], eng_rpm) * engine_envelope);
     LOOP_STORE(LOOPS[S_ENG0 + i].pitch, band_pitch(&engine_set->engine_bands[i], eng_rpm));
-    LOOP_STORE(LOOPS[S_MUF0 + i].vol, car_audio_boost * 0.34f * band_gain(&engine_set->muffler_bands[i], muf_rpm) * accel);
+    LOOP_STORE(LOOPS[S_MUF0 + i].vol, muffler_gain * band_gain(&engine_set->muffler_bands[i], muf_rpm) * accel);
     LOOP_STORE(LOOPS[S_MUF0 + i].pitch, band_pitch(&engine_set->muffler_bands[i], muf_rpm));
   }
 

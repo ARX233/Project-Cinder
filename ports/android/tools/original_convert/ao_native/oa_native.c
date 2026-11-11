@@ -9,7 +9,6 @@
 #include <fenv.h>
 #include <limits.h>
 #include <math.h>
-#include <pthread.h>
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -28,8 +27,10 @@ union block {
   max_align_t alignment;
   struct { block *prev, *next; size_t bytes; } h;
 };
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static struct {
+/* Each call owns the legacy scratch state, allocator ledger and jump target
+ * for its thread. A cancellation callback cannot re-enter on that thread. */
+static _Thread_local int active;
+static _Thread_local struct {
   jmp_buf failure;
   oa_limits lim;
   const oa_cancel *cancel;
@@ -193,7 +194,9 @@ static int oa_legacy_main(int argc,char **argv);
 #define printf quiet_printf
 #define fprintf quiet_fprintf
 #define perror(...) ((void)0)
+#define AO_JOB_STORAGE _Thread_local
 #include "../../stage/bake_ao.c"
+#undef AO_JOB_STORAGE
 #undef main
 #undef malloc
 #undef calloc
@@ -326,6 +329,13 @@ static void validate(void) {
   job.result.maps=maps; job.result.triangles=(uint32_t)triangles;
   tracked_free(pages); tracked_free(regions); tracked_free(owned); poll_now();
 }
+OA_API int oa_poll_stop(void *flag) {
+  return __atomic_load_n((const uint32_t *)flag,__ATOMIC_RELAXED)!=0;
+}
+OA_API void oa_request_stop(uint32_t *flag) {
+  __atomic_store_n(flag,1,__ATOMIC_RELAXED);
+}
+
 OA_API void oa_default_limits(oa_limits *l) {
   if (!l) return;
   *l=(oa_limits){sizeof *l,OA_ABI_VERSION,64ull<<20,256ull<<20,32ull<<20,
@@ -350,7 +360,8 @@ OA_API int oa_bake_fd(int source_fd,int out_fd,const oa_limits *limits,const oa_
     return immediate(result,OA_INVALID_ARGUMENT,"invalid limits or unsupported AO recipe");
   const uint16_t endian=1;
   if (*(const uint8_t*)&endian!=1) return immediate(result,OA_INVALID_ARGUMENT,"little endian required");
-  if (pthread_mutex_trylock(&lock)) return immediate(result,OA_BUSY,"AO backend already in use");
+  if (active) return immediate(result,OA_BUSY,"Recursive AO call on the same thread");
+  active=1;
   memset(&job,0,sizeof job); reset_legacy(); job.lim=l; job.cancel=cancel; job.out_fd=out_fd;
   job.result.struct_size=sizeof job.result; job.result.abi_version=OA_ABI_VERSION;
   int clocks_ok=!clock_gettime(CLOCK_MONOTONIC,&job.wall_start) && !clock_gettime(CLOCK_THREAD_CPUTIME_ID,&job.cpu_start);
@@ -404,6 +415,6 @@ OA_API int oa_bake_fd(int source_fd,int out_fd,const oa_limits *limits,const oa_
   *result=job.result;
   int status=job.result.status;
   job.source=NULL; job.cancel=NULL;
-  pthread_mutex_unlock(&lock);
+  active=0;
   return status;
 }

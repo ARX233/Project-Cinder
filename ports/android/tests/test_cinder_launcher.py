@@ -18,14 +18,16 @@ from test_resource_import_activity import method, marked_block, closing_brace
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / 'android/java/com/wmmt/port/MainActivity.java'
 WALLPAPER = MAIN.with_name('LauncherWallpaperView.java')
-PRESERVED_METHODS = {'startGame': '14cdc29dec9215f67aac213982b61a3a3d2ffc8e1f2bf145e51daf7e0a204459', 'chooseResourceArchive': '0de31a4ba04e7ae1ba4e52df0c35632edfece5c740cd0624a7dd9e76b757a2be', 'onActivityResult': '0d8ef3f4ecf99d796a1955f33a66e36dd56c1660e521ece1c39af4a32e5d2d28', 'startQueuedImport': 'ca0fca2238bfe634d1f35031828ff16727baf38f2e5d4e6371f7f6881780cbef', 'onSaveInstanceState': '0032065adceb15859663c8513f23c89f391ee2a765a0a021c4642541e03bf02c', 'prepareResources': '8d3a2a4ace1d1ff2c7aa5605a79d16686b1dfe01825ba0ccbd166f70ba7aa167', 'cancelResourceOperation': '92556a52160892536d23d4e0f38a77281b0850fb703701f520b4aa13a13526b5', 'closeResourceInput': '20cfd2b3a162e3f1c8699885a3ef47b24597bba733225a2db202b6b552875ebf', 'resourcePath': '3200e596d6f95e9a3c159f2c68670c9069b9de5c7b7bf2a6c74f77c8fbfb5d7d', 'installError': '4ccc225743b2f0b4742e8f6da6044ac47175e62fa5aa0ec4bba5dac8fc2662fd'}
-PRESERVED_BLOCKS = {'private static final class OriginalHost': '8e7cf573264cf0b7781d957258758bbf0e35458567f6eb6feeae47149d4863ba', 'private static final class ResolvedResources': 'c74843abfde9e63e8dc093e43f0decaf1c303f9da90f9ff4a5e393b13b51e85a'}
+DIALOG = MAIN.with_name('LauncherDialog.java')
+PRESERVED_METHODS = {'startGame': 'b7b135af4186f8bce5458a26ff5a059ece6b18ab2784fc24958baa205424df75', 'onActivityResult': '0d8ef3f4ecf99d796a1955f33a66e36dd56c1660e521ece1c39af4a32e5d2d28', 'startQueuedImport': 'ca0fca2238bfe634d1f35031828ff16727baf38f2e5d4e6371f7f6881780cbef', 'onSaveInstanceState': '0032065adceb15859663c8513f23c89f391ee2a765a0a021c4642541e03bf02c', 'prepareResources': 'fffd0a8120f3ce0184ee0475c70ea1c9a98af067b50003a9311caa02369b4afd', 'cancelResourceOperation': '92556a52160892536d23d4e0f38a77281b0850fb703701f520b4aa13a13526b5', 'closeResourceInput': '20cfd2b3a162e3f1c8699885a3ef47b24597bba733225a2db202b6b552875ebf', 'resourcePath': '3200e596d6f95e9a3c159f2c68670c9069b9de5c7b7bf2a6c74f77c8fbfb5d7d', 'installError': '4ccc225743b2f0b4742e8f6da6044ac47175e62fa5aa0ec4bba5dac8fc2662fd'}
+PRESERVED_BLOCKS = {'private static final class OriginalHost': '8e7cf573264cf0b7781d957258758bbf0e35458567f6eb6feeae47149d4863ba', 'private static final class ResolvedResources': '870a04d95fe48946c43fe83c712a0cb792244cc2964da56f7567d6d3fc9ba2b7'}
 
 class CinderLauncherContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.main = MAIN.read_text(encoding='utf-8')
         cls.wallpaper = WALLPAPER.read_text(encoding='utf-8')
+        cls.dialog = DIALOG.read_text(encoding='utf-8')
 
     def test_existing_resource_and_start_methods_are_unchanged(self):
         for name, expected in PRESERVED_METHODS.items():
@@ -50,6 +52,27 @@ class CinderLauncherContracts(unittest.TestCase):
         self.assertIn('private FrameLayout dataPanel;', self.main)
         self.assertIn('originalController = OriginalConversionController.obtain(originalHost, b)', body)
 
+    def test_notice_requires_acknowledgement_and_follows_launcher_visits(self):
+        create = method(self.main, 'onCreate')
+        show = method(self.main, 'showLauncherNotice')
+        self.assertIn('noticeButton.setOnClickListener(v -> showLauncherNotice())', create)
+        self.assertLess(self.wallpaper.index('launchActions.addView(noticeButton'),
+                        self.wallpaper.index('launchActions.addView(launchButton'))
+        for text in ['"倒狗必死"', 'boldTitle()', 'setCancelable(false)', 'setCanceledOnTouchOutside(false)',
+                     '"我已阅读"', 'URLSpan', '"niceapi.net"', '"点此跳转赞助网页"',
+                     'new URLSpan("https://afdian.com/a/ProjectCinder")',
+                     'if (launcherNotice != null) return;', 'if (!launcherVisible()) return;']:
+            self.assertIn(text, show)
+        self.assertIn('Typeface.BOLD', self.dialog)
+        self.assertIn('setLinkTextColor(LINK)', self.dialog)
+        self.assertIn('LinkMovementMethod.getInstance()', self.dialog)
+        self.assertIn('launcherNoticePending = true', self.main)
+        self.assertIn('launcherNoticePending) showLauncherNotice()', method(self.main, 'onResume'))
+        self.assertIn('Intent.CATEGORY_LAUNCHER', method(self.main, 'onNewIntent'))
+        stop = method(self.main, 'onStop')
+        for text in ['launcherNotice == null', '!awaitingResourcePicker', '!originalController.isPickingSource()']:
+            self.assertIn(text, stop)
+
     def test_dialog_actions_revalidate_current_gate(self):
         gate = method(self.main, 'resourceSelectionAllowed')
         for text in ['!destroyed', 'currentActivity==this', '!isFinishing()', '!resourceBusy',
@@ -58,10 +81,35 @@ class CinderLauncherContracts(unittest.TestCase):
         menu = method(self.main, 'showResourceSelection')
         self.assertGreaterEqual(menu.count('if (!resourceSelectionAllowed()) return;'), 2)
         for text in ['原版 ZIP / 目录一键转换', '导入已转换的资源 ZIP', '重新检查资源',
-                     'requestOriginalConversion()', 'chooseResourceArchive()', 'requestResourceRecheck()']:
+                     'requestOriginalConversion()', 'chooseResourceArchive()', 'requestResourceRecheck()',
+                     'originalController.resumeLast()']:
             self.assertIn(text, menu)
         self.assertIn('originalController.showStartDialog()', method(self.main, 'requestOriginalConversion'))
         self.assertIn('resourceSelectionAllowed()', method(self.main, 'requestResourceRecheck'))
+        picker = method(self.main, 'chooseResourceArchive')
+        self.assertEqual(picker.count('if (!resourceSelectionAllowed()) return;'), 2)
+        self.assertLess(picker.index('awaitingResourcePicker = true;'), picker.index('startActivityForResult'))
+        self.assertIn('Intent.ACTION_OPEN_DOCUMENT', picker)
+
+    def test_registration_uses_independent_launcher_button(self):
+        self.assertIn('registrationButton.setOnClickListener(v -> showGhostCloudSettings())',
+                      method(self.main, 'onCreate'))
+        self.assertLess(self.wallpaper.index('resourceActions.addView(selectButton'),
+                        self.wallpaper.index('resourceActions.addView(registrationButton'))
+        self.assertNotIn('showGhostCloudSettings()', method(self.main, 'showResourceSelection'))
+        registration = method(self.main, 'showGhostCloudSettings')
+        self.assertNotIn('resourceSelectionAllowed()', registration)
+        for text in ['if (!launcherVisible()) return;', 'clipboard.setPrimaryClip',
+                     'cloud.refreshRegistration', 'dialog.isShowing()']:
+            self.assertIn(text, registration)
+
+    def test_dialog_body_scrolls_independently_of_header_and_actions(self):
+        self.assertIn('new ScrollView(getContext())', self.dialog)
+        self.assertIn('panel.addView(scroll, new LinearLayout.LayoutParams(-1, -2, 1f))', self.dialog)
+        self.assertIn('panel.addView(heading, titleLayout)', self.dialog)
+        self.assertIn('panel.addView(actions, actionLayout)', self.dialog)
+        self.assertIn('shape(SURFACE, 28)', self.dialog)
+        self.assertNotIn('AlertDialog.Builder', self.main)
 
     def test_controls_never_enable_launch_from_wallpaper_or_dialog(self):
         controls = method(self.main, 'resourceControls')
@@ -79,7 +127,7 @@ class CinderLauncherContracts(unittest.TestCase):
     def test_clear_requires_confirmation_and_excludes_other_operations(self):
         confirm = method(self.main, 'confirmResourceClear')
         clear = method(self.main, 'clearResources')
-        self.assertIn('setPositiveButton("清除资源包", (dialog, which) -> clearResources())', confirm)
+        self.assertIn('primary("清除资源包", this::clearResources)', confirm)
         self.assertIn('if (!resourceSelectionAllowed()) return;', clear)
         self.assertLess(clear.index('resourceClearing = true;'), clear.index('new Thread('))
         self.assertLess(clear.index('lockInstallProcess(app);'), clear.index('ResourceStore.clearInstalledResources('))

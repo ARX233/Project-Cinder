@@ -269,6 +269,7 @@ RUNTIME_JAVA="$ORIGINAL_RUNTIME_PACKAGE/jars/chaquopy-java-17.2.0.jar"
 [ -f "$RUNTIME_CLASSES" ] && [ -f "$RUNTIME_JAVA" ] || { echo 'Missing deduplicated runtime Java jars' >&2; exit 1; }
 # the Java side; only production sources, never actor test/stub/proof jars.
 "$JAVA_HOME/bin/javac" -source 8 -target 8 -nowarn -classpath "$PLAT/android.jar:$RUNTIME_CLASSES:$RUNTIME_JAVA" -d "$OUT/classes" \
+  android/java/com/wmmt/port/LauncherDialog.java \
   android/java/com/wmmt/port/LauncherWallpaperView.java android/java/com/wmmt/port/MainActivity.java android/java/com/wmmt/port/GhostCloud.java android/java/com/wmmt/port/CloudDevice.java android/java/com/wmmt/port/CardResources.java android/java/com/wmmt/port/ArcadeBgm.java android/java/com/wmmt/port/DebugLogStorage.java \
   android/java/com/wmmt/port/DataManifest.java android/java/com/wmmt/port/DataOverlay.java android/java/com/wmmt/port/DataCoordinator.java android/java/com/wmmt/port/DataBaselines.java \
   android/java/com/wmmt/port/ResourceMetadata.java android/java/com/wmmt/port/SafeResourceZip.java android/java/com/wmmt/port/ResourceStore.java \

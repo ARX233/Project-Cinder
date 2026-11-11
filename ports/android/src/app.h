@@ -38,9 +38,13 @@ void app_press_start(void);
 int app_movie(void);
 /* The movie shown for app_movie() ended, or its file is missing. */
 void app_movie_done(void);
-/* The menu or race BGM that should play: a file name in data_dir/sound/bgm (without
- * .m4a), or NULL for none (the attract loop has its own sound). */
+/* The menu or race BGM that should play: a track name without an extension,
+ * or NULL for none (the attract loop has its own sound). */
 const char *app_bgm(void);
+/* An active Ten race offers the legacy track if its arcade soundtrack is unavailable. */
+const char *app_bgm_fallback(void);
+/* The arcade fade duration in milliseconds when a Ten rival changes the track. */
+int app_bgm_crossfade_ms(void);
 /* Game-thread snapshot: story goal's visible negate hold pauses BGM. */
 int app_bgm_gameplay_paused(void);
 /* Game-thread only. No selected slot, missing or damaged setting => level 3,

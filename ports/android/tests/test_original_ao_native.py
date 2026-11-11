@@ -224,22 +224,123 @@ class NativeAOTests(unittest.TestCase):
             self.assertEqual(code,4,(field,r.message)); self.assertLess(time.monotonic()-start,2)
             self.assertEqual(r.allocations_live,0)
 
-    def test_concurrent_and_recursive_busy(self):
+    def test_concurrent_calls_and_recursive_busy(self):
         entered=threading.Event(); release=threading.Event(); result=[]
-        sf,of,_=self.pair(fixture(dim=256))
+        sf,of,partial=self.pair(fixture(dim=256))
+        original_sf,original_of,original=self.pair(two_map_fixture())
+        self.assertEqual(bake(self.lib,original_sf,original_of)[0],0)
         def stop(_): entered.set(); release.wait(5); return 1
         thread=threading.Thread(target=lambda: result.append(bake(self.lib,sf,of,callback=stop)))
         thread.start(); self.assertTrue(entered.wait(5))
         try:
-            sf2,of2,_=self.pair(); code,r=bake(self.lib,sf2,of2)
-            self.assertEqual(code,7,r.message)
+            sf2,of2,parallel=self.pair(two_map_fixture()); code,r=bake(self.lib,sf2,of2)
+            self.assertEqual(code,0,r.message)
+            self.assertEqual(parallel.read_bytes(),original.read_bytes())
+            self.assertEqual(r.allocations_live,0)
         finally: release.set(); thread.join(5)
         self.assertFalse(thread.is_alive()); self.assertEqual(result[0][0],5)
+        self.assertEqual(partial.stat().st_size,0)
+        self.assertEqual(result[0][1].allocations_live,0)
         sf,of,_=self.pair(); recursive=[]
         def recurse(_):
             sf2,of2,_=self.pair(); recursive.append(bake(self.lib,sf2,of2)[0]); return 1
         self.assertEqual(bake(self.lib,sf,of,callback=recurse)[0],5)
         self.assertEqual(recursive,[7])
+
+    def test_owned_batch_parallel_receipts_and_cancellation(self):
+        sys.path.insert(0,str(REPO/'tools'))
+        try:
+            from original_convert.ao import Backend, _StopSignal, bake_owned_many
+            from original_convert.source import ConversionCancelled, OwnedOutput, SourceEntry
+        finally:
+            sys.path.pop(0)
+        backend=Backend(self.library)
+        def new_output():
+            output=OwnedOutput(self.root)
+            names=[]
+            fixtures = (fixture(), two_map_fixture(), fixture(dim=16), fixture(dim=32))
+            for i,data in enumerate(fixtures * 2):
+                name=f'cars/car{i}.wpk'
+                output.target(name).write_bytes(data)
+                output.files[name]=SourceEntry(len(data),hashlib.sha256(data).hexdigest())
+                names.append(name)
+            return output,names
+        baseline,names=new_output()
+        bake_owned_many(backend,baseline,names,workers=1)
+        for count in (2,4,8):
+            output,names=new_output()
+            progress=[]
+            bake_owned_many(backend,output,names,workers=count,progress=lambda _,done,total:progress.append((done,total)))
+            self.assertEqual(progress,[(i,len(names)) for i in range(1,len(names)+1)])
+            self.assertEqual(output.files,baseline.files)
+            for name in names:
+                ao=name[:-4]+'.ao'
+                self.assertEqual((output.root/ao).read_bytes(),(baseline.root/ao).read_bytes())
+
+        stop=_StopSignal(backend)
+        stop.set()
+        sf,of,out=self.pair(fixture(dim=256))
+        with self.assertRaises(ConversionCancelled):
+            backend.convert(sf,of,stop=stop)
+        self.assertEqual(out.stat().st_size,0)
+
+        output,names=new_output()
+        cancelled=threading.Event()
+        with self.assertRaises(ConversionCancelled):
+            bake_owned_many(backend,output,names,workers=2,cancel=cancelled.is_set,
+                            progress=lambda *_:cancelled.set())
+        self.assertEqual(sum(name.endswith('.ao') for name in output.files),1)
+
+    def test_bakes_resume_at_the_last_durable_checkpoint(self):
+        sys.path.insert(0,str(REPO/'tools'))
+        try:
+            from original_convert.ao import Backend, bake_owned_many
+            from original_convert.checkpoint import ConversionCheckpoint
+            from original_convert.source import ConversionCancelled, SourceEntry
+        finally:
+            sys.path.pop(0)
+        backend=Backend(self.library)
+        job_root=Path(tempfile.mkdtemp(prefix='checkpoint-',dir=self.root))
+        (job_root/'outputs').mkdir()
+        job={key:'a'*64 for key in ('job_id','nonce','profile_sha256','readset_sha256','recipe_sha256')}
+        car_names=[f'cars/car{i}.wpk' for i in range(4)]
+        input_bytes=[fixture(),two_map_fixture(),fixture(dim=16),fixture(dim=32)]
+        targets={name:{'max_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}
+                 for name,data in zip(car_names,input_bytes)}
+        targets.update({name[:-4]+'.ao':{'max_bytes':5000,'sha256':None} for name in car_names})
+        cancelled=threading.Event()
+        checkpoint=ConversionCheckpoint(job_root,job,targets,cancelled.is_set)
+        output=checkpoint.open_output()
+        for name,data in zip(car_names,input_bytes):
+            output.target(name).write_bytes(data)
+            output.files[name]=SourceEntry(len(data),targets[name]['sha256'])
+        checkpoint.save('cars')
+        saved=[]
+        def record(name):
+            checkpoint.save('ao:'+name,[name])
+            saved.append(name)
+            cancelled.set()
+        with self.assertRaises(ConversionCancelled):
+            bake_owned_many(backend,output,car_names,workers=2,cancel=cancelled.is_set,
+                            wall_budget_ms=60_000,on_baked=record)
+        self.assertEqual(len(saved),1)
+        persisted=(output.root/saved[0]).read_bytes()
+        cancelled.clear()
+        checkpoint=ConversionCheckpoint(job_root,job,targets,cancelled.is_set)
+        output=checkpoint.open_output()
+        self.assertTrue(checkpoint.has('cars'))
+        self.assertEqual(set(output.files),set(car_names+saved))
+        pending=[name for name in car_names if name[:-4]+'.ao' not in output.files]
+        self.assertEqual(len(pending),3)
+        bake_owned_many(backend,output,pending,workers=2,cancel=cancelled.is_set,wall_budget_ms=60_000,
+                        on_baked=lambda name:checkpoint.save('ao:'+name,[name]))
+        self.assertEqual((output.root/saved[0]).read_bytes(),persisted)
+        self.assertEqual(len(output.files),8)
+        (output.root/saved[0]).write_bytes(b'changed')
+        recovered=ConversionCheckpoint(job_root,job,targets,cancelled.is_set).open_output()
+        self.assertNotIn(saved[0],recovered.files)
+        self.assertFalse((recovered.root/saved[0]).exists())
+        self.assertEqual(len(recovered.files),7)
 
     def test_repeated_success_failure_no_fd_leak(self):
         directory='/dev/fd' if sys.platform=='darwin' else '/proc/self/fd'

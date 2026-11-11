@@ -6,6 +6,12 @@
 float car_kmh(const car_state *c) { return fabsf(c->speed) * 3.6f; }
 static void check(float expected) { assert(fabsf(LOOP_LOAD(LOOPS[L_REV].vol) - expected) < 0.0001f); }
 static void frame(car_state *c, car_input *in) { ++c->se.rev_sequence; snd_update(c,in,1.0f/60); }
+static void check_engine(unsigned type, int power, const char *engine, const char *muffler) {
+  snd_set_car(type, power);
+  assert(arcade_engine_mix);
+  assert(!strcmp(engine_set->engine[0], engine));
+  assert(!strcmp(engine_set->muffler[0], muffler));
+}
 int main(void) {
   car_state car = {0}; car_input input = {0};
   static short data[4] = {10000,-10000,10000,-10000};
@@ -41,5 +47,32 @@ int main(void) {
   car.se.backfire=1; car.se.backfire_vol=.5f; car.se.backfire_hz=22050;
   slot=shot_next; snd_update(&car,&input,0);
   assert(fabsf(SHOTS[slot].vol-1.7f*.73f*.5f)<.0001f);
+
+  for (unsigned type = 4; type <= 6; ++type) {
+    check_engine(type, 7, "rx714", "celica21");
+    check_engine(type, 8, "rx714", "rn_m11t2");
+  }
+  const unsigned evo_types[] = {9, 10, 11, 13, 14, 36};
+  for (size_t i = 0; i < sizeof evo_types / sizeof evo_types[0]; ++i) {
+    check_engine(evo_types[i], 7, "lancer14", "lancer24");
+    check_engine(evo_types[i], 8, "lancer14", "s4n_m11t");
+    frame(&car, &input); check(0);
+  }
+  snd_set_car(5, 8);
+  car.rpm = 9600.0f;
+  car.engine_se = (car_engine_se){.rpm = 7200.5f, .gain = .5f, .accel = 1, .shift_up = 1};
+  E.accel_target = 5000;
+  input.throttle = 0.0f;
+  frame(&car, &input);
+  const band *layer = &engine_set->engine_bands[3];
+  assert(fabsf(LOOP_LOAD(LOOPS[S_ENG3].pitch) - band_pitch(layer, 7200.0f)) < .0001f);
+  assert(fabsf(LOOP_LOAD(LOOPS[S_ENG3].vol) - .365f * band_gain(layer, 7200.0f)) < .0001f);
+  assert(!car.engine_se.shift_up && E.accel == 400.0f);
+  car.engine_se.rpm = 10000.0f;
+  frame(&car, &input);
+  assert(fabsf(LOOP_LOAD(LOOPS[S_ENG3].pitch) - band_pitch(layer, 8999.0f)) < .0001f);
+  car.engine_se.gain = 0.0f;
+  frame(&car, &input);
+  assert(LOOP_LOAD(LOOPS[S_ENG3].vol) == 0.0f && LOOP_LOAD(LOOPS[S_MUF3].vol) == 0.0f);
   return 0;
 }

@@ -33,11 +33,12 @@ static struct {
   uint32_t *zsize;   /* their zlib-packed size, 0 = raw */
   uint32_t *used;    /* clock of the last draw */
   uint32_t clock;
-  FILE *file, *extra_file, *card_file, *ghost_file; /* independently verified optional resources */
-  uint32_t base_sprites, story_end, ghost_begin;
+  FILE *file, *extra_file, *card_file, *ghost_file, *mileage_file, *ghost_match_file, *finish_menu_file, *crown_scenes_file; /* independently verified optional resources */
+  uint32_t base_sprites, story_end, ghost_begin, mileage_begin, ghost_match_begin, finish_menu_begin, crown_scenes_begin;
   float (*size)[2];
   int *ids; /* the arcade's sprite id of each packed sprite */
   uint16_t (*cols)[2]; /* on a wide screen: its first and past-last columns with any opacity, once up */
+  uint16_t (*content)[4]; /* lazy crop bounds for UI that draws a sprite without its padding */
   uint32_t nsprites, nanims;
   anm_anim *anims;
   GLuint prog;
@@ -142,17 +143,17 @@ static void load_extra(const char *data_dir) {
 
 /* WCP1 v1: sprite blobs then named animations; records carry original int32 IDs.
  * Parse and validate into private storage: failure never publishes partial state. */
-static void load_card_pages(const char *data_dir) {
+static FILE *load_sprite_animations(const char *data_dir, const char *name, int allow_sprites_only) {
   char path[1024]; FILE *f = NULL;
 #if defined(__ANDROID__)
   extern int android_optional_resource_path(const char *, char *, size_t);
-  if (!android_optional_resource_path("card-pages.bin", path, sizeof path)) return;
+  if (!android_optional_resource_path(name, path, sizeof path)) return NULL;
   f = fopen(path, "rb");
 #else
-  if (snprintf(path, sizeof path, "%s/card-pages.bin", data_dir) >= (int)sizeof path) return;
+  if (snprintf(path, sizeof path, "%s/%s", data_dir, name) >= (int)sizeof path) return NULL;
   f = fopen(path, "rb");
 #endif
-  if (!f) return;
+  if (!f) return NULL;
   char magic[4]; uint32_t version, n = 0, na = 0, total; long length;
   int *ids = NULL; float (*sizes)[2] = NULL; long *offs = NULL; uint32_t *zs = NULL;
   anm_anim *anims = NULL;
@@ -160,9 +161,9 @@ static void load_card_pages(const char *data_dir) {
   float (*allsize)[2] = NULL; int *allids = NULL; uint16_t (*cols)[2] = NULL; anm_anim *allanims = NULL;
   if (fseek(f, 0, SEEK_END) || (length = ftell(f)) < 16 || length > 256L*1024*1024 || fseek(f,0,SEEK_SET)) goto bad_card;
   if (!read_all(f,magic,4) || memcmp(magic,"WCP1",4) || !read_all(f,&version,4) || version != 1 ||
-      !read_all(f,&n,4) || n > 65535-A.nsprites || !read_all(f,&na,4) || !na || na > 4096-A.nanims) goto bad_card;
+      !read_all(f,&n,4) || n > 65535-A.nsprites || !read_all(f,&na,4) || (!na && (!allow_sprites_only || !n)) || na > 4096-A.nanims) goto bad_card;
   ids=calloc(n ? n : 1,sizeof *ids); sizes=calloc(n ? n : 1,sizeof *sizes);
-  offs=calloc(n ? n : 1,sizeof *offs); zs=calloc(n ? n : 1,sizeof *zs); anims=calloc(na,sizeof *anims);
+  offs=calloc(n ? n : 1,sizeof *offs); zs=calloc(n ? n : 1,sizeof *zs); anims=calloc(na ? na : 1,sizeof *anims);
   if (!ids || !sizes || !offs || !zs || !anims) goto bad_card;
   for (uint32_t i=0;i<n;i++) {
     uint16_t wh[2];
@@ -209,7 +210,7 @@ static void load_card_pages(const char *data_dir) {
   total=A.nsprites+n;
   tex=calloc(total,sizeof *tex); alloff=calloc(total,sizeof *alloff); allzs=calloc(total,sizeof *allzs);
   used=calloc(total,sizeof *used); allsize=calloc(total,sizeof *allsize); allids=calloc(total,sizeof *allids);
-  cols=calloc(total,sizeof *cols); allanims=calloc(A.nanims+na,sizeof *allanims);
+  cols=calloc(total,sizeof *cols); allanims=calloc(A.nanims+na ? A.nanims+na : 1,sizeof *allanims);
   if (!tex || !alloff || !allzs || !used || !allsize || !allids || !cols || !allanims) goto bad_card;
 #define CP(dst,src) memcpy(dst,src,A.nsprites*sizeof *(src))
   CP(tex,A.tex); CP(alloff,A.offset); CP(allzs,A.zsize); CP(used,A.used); CP(allsize,A.size); CP(allids,A.ids); CP(cols,A.cols);
@@ -219,17 +220,20 @@ static void load_card_pages(const char *data_dir) {
   memcpy(allanims,A.anims,A.nanims*sizeof *anims); memcpy(allanims+A.nanims,anims,na*sizeof *anims);
   free(A.tex); free(A.offset); free(A.zsize); free(A.used); free(A.size); free(A.ids); free(A.cols); free(A.anims);
   A.tex=tex; A.offset=alloff; A.zsize=allzs; A.used=used; A.size=allsize; A.ids=allids; A.cols=cols;
-  A.anims=allanims; A.nsprites=total; A.nanims+=na; A.card_file=f;
-  free(ids); free(sizes); free(offs); free(zs); free(anims); return;
+  A.anims=allanims; A.nsprites=total; A.nanims+=na;
+  free(ids); free(sizes); free(offs); free(zs); free(anims); return f;
 bad_card:
-  fprintf(stderr,"Ignoring invalid card-pages.bin\n");
+  fprintf(stderr,"Ignoring invalid %s\n",name);
   if (anims) for (uint32_t i=0;i<na;i++) { free(anims[i].frames); free(anims[i].recs); }
   free(anims); free(ids); free(sizes); free(offs); free(zs); free(tex); free(alloff); free(allzs); free(used); free(allsize); free(allids); free(cols); free(allanims); fclose(f);
+  return NULL;
 }
 
 #include "ghost_ui_loader.inc"
 
 int anm_load(const char *data_dir) {
+  free(A.content);
+  A.content = NULL;
   static const char *vs =
     "attribute vec2 aPos; attribute vec2 aUV; varying vec2 vUV;\n"
     "uniform vec2 uView;\n"
@@ -291,8 +295,18 @@ int anm_load(const char *data_dir) {
   A.base_sprites = A.nsprites;
   load_extra(data_dir);
   A.story_end = A.nsprites;
-  load_card_pages(data_dir);
+  A.card_file = load_sprite_animations(data_dir, "card-pages.bin", 0);
   load_ghost_ui(data_dir);
+  A.mileage_begin = A.nsprites;
+  A.mileage_file = load_sprite_animations(data_dir, "mileage-menu.bin", 0);
+  A.ghost_match_begin = A.nsprites;
+  A.ghost_match_file = load_sprite_animations(data_dir, "ghost-match.bin", 1);
+  /* Prepared packs can already supply these exact sprites via card-pages.bin. */
+  A.finish_menu_begin = A.nsprites;
+  if (anm_find("cons_g_last_000m") < 0)
+    A.finish_menu_file = load_sprite_animations(data_dir, "finish-menu.bin", 0);
+  A.crown_scenes_begin = A.nsprites;
+  A.crown_scenes_file = load_sprite_animations(data_dir, "crown-scenes.bin", 0);
   return 0;
 fail:
   fprintf(stderr, "menu.bin is damaged\n");
@@ -305,6 +319,10 @@ static int read_sprite_pixels(int i, unsigned char *px, size_t n) {
   unsigned char *z = A.zsize[i] ? malloc(A.zsize[i]) : NULL;
   uLongf got = (uLongf)n;
   FILE *f = (uint32_t)i < A.base_sprites ? A.file :
+            A.crown_scenes_file && (uint32_t)i >= A.crown_scenes_begin ? A.crown_scenes_file :
+            A.finish_menu_file && (uint32_t)i >= A.finish_menu_begin ? A.finish_menu_file :
+            A.ghost_match_file && (uint32_t)i >= A.ghost_match_begin ? A.ghost_match_file :
+            A.mileage_file && (uint32_t)i >= A.mileage_begin ? A.mileage_file :
             (A.ghost_file && (uint32_t)i >= A.ghost_begin ? A.ghost_file :
              (!A.card_file || (uint32_t)i < A.story_end ? A.extra_file : A.card_file));
   int ok = f && fseek(f, A.offset[i], SEEK_SET) == 0 &&
@@ -312,6 +330,40 @@ static int read_sprite_pixels(int i, unsigned char *px, size_t n) {
                        : read_all(f, px, n));
   free(z);
   return ok;
+}
+
+int anm_sprite_content_rect(int sprite, float rect[4]) {
+  if (!rect || sprite < 0 || (uint32_t)sprite >= A.nsprites) return 0;
+  int w = (int)A.size[sprite][0], h = (int)A.size[sprite][1];
+  if (w <= 0 || h <= 0) return 0;
+  if (!A.content) A.content = calloc(A.nsprites, sizeof *A.content);
+  if (!A.content) return 0;
+  uint16_t *bounds = A.content[sprite];
+  if (!bounds[2]) {
+    size_t bytes = (size_t)w * h * 4;
+    unsigned char *pixels = malloc(bytes);
+    if (!pixels || !read_sprite_pixels(sprite, pixels, bytes)) {
+      free(pixels);
+      return 0;
+    }
+    int left = w, top = h, right = 0, bottom = 0;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        if (pixels[((size_t)y * w + x) * 4 + 3] > 8) {
+          if (x < left) left = x;
+          if (y < top) top = y;
+          if (x + 1 > right) right = x + 1;
+          bottom = y + 1;
+        }
+    free(pixels);
+    bounds[0] = (uint16_t)left;
+    bounds[1] = (uint16_t)top;
+    bounds[2] = right ? (uint16_t)right : UINT16_MAX;
+    bounds[3] = (uint16_t)bottom;
+  }
+  if (!bounds[3]) return 0;
+  for (int i = 0; i < 4; ++i) rect[i] = bounds[i];
+  return 1;
 }
 
 /* Restore the classic VS overlays with old and new imported packs. The arcade's

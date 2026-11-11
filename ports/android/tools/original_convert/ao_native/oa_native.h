@@ -27,7 +27,8 @@ typedef struct oa_limits {
  * instrumented math/parser units, and before/after bounded qsort/alloc/IO.
  * Return nonzero to cancel. Callback MUST NOT throw, longjmp, or reenter any
  * non-thread-safe application code; concurrent callback state must be atomic.
- * Recursive/concurrent oa_bake_fd is safe and returns OA_BUSY. */
+ * Recursive oa_bake_fd on the same thread returns OA_BUSY. Calls on separate
+ * threads can run concurrently with independent state and disjoint output FDs. */
 typedef int (*oa_cancel_fn)(void *user);
 typedef struct oa_cancel { uint32_t struct_size; oa_cancel_fn poll; void *user; } oa_cancel;
 enum oa_status {
@@ -43,6 +44,11 @@ typedef struct oa_result {
   uint32_t maps, triangles;
   char message[160];
 } oa_result;
+/* Optional native cancellation callback. The caller keeps a zero-initialized,
+ * aligned uint32_t alive until its last worker returns. Once shared, access it
+ * only through these functions. */
+OA_API int oa_poll_stop(void *flag);
+OA_API void oa_request_stop(uint32_t *flag);
 OA_API void oa_default_limits(oa_limits *limits);
 /* FD-only: never opens a path, unlinks, truncates, or closes caller FDs.
  * source/out must be different regular, seekable inodes. Output must be empty,

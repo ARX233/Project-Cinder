@@ -8,6 +8,12 @@
 
 #define MENU_MODE_SLOTS 5
 #define MENU_MODE_SLIDE 5
+
+/* At rest the bottom bar starts at y=397 and its artwork spans rows 1..54. */
+#define MENU_FOOTER_SCALE 1.16f
+#define MENU_FOOTER_OFFSET (480.0f - (397.0f + 55.0f) * MENU_FOOTER_SCALE)
+#define MENU_FOOTER_TOP (480.0f - (55.0f - 1.0f) * MENU_FOOTER_SCALE)
+#define MENU_FOOTER_CENTER ((MENU_FOOTER_TOP + 480.0f) * 0.5f)
 typedef struct { float x, y, w, h; } menu_mode_rect;
 
 static inline int menu_mode_index_valid(int index) { return index >= 0 && index < MENU_MODE_SLOTS; }
@@ -60,7 +66,7 @@ static inline int menu_mode_picture(float width, float height, float edge,
                                     float src[4], menu_mode_rect *dst) {
   if (!src || !dst || !isfinite(width) || !isfinite(height) || width <= 0.0f || height <= 0.0f) return 0;
   edge = menu_mode_edge(edge);
-  *dst = (menu_mode_rect){-edge, 84.0f, 640.0f + 2.0f * edge, 316.0f};
+  *dst = (menu_mode_rect){-edge, 84.0f, 640.0f + 2.0f * edge, MENU_FOOTER_TOP - 84.0f};
   float scale = fmaxf(dst->w / width, dst->h / height);
   float sw = dst->w / scale, sh = dst->h / scale;
   src[0] = (width - sw) * 0.5f; src[1] = (height - sh) * 0.5f;
@@ -70,7 +76,7 @@ static inline int menu_mode_picture(float width, float height, float edge,
 
 static inline menu_mode_rect menu_mode_detail(float edge) {
   edge = menu_mode_edge(edge);
-  return (menu_mode_rect){640.0f + edge - 268.0f, 286.0f, 244.0f, 90.0f};
+  return (menu_mode_rect){24.0f - edge, 328.0f, 340.0f, 60.0f};
 }
 
 static inline int menu_mode_hit(const menu_mode_rect rect[MENU_MODE_SLOTS], float x, float y) {

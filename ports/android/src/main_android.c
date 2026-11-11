@@ -46,11 +46,12 @@ typedef struct { int id, phase; float x, y; } touch_ev;
 static struct {
   JavaVM *vm;
   jobject activity;
-  jmethodID show_movie, play_bgm, set_bgm_volume, set_bgm_gameplay_paused, fail, frame_rate_limit_changed;
+  jmethodID show_movie, play_bgm, play_race_bgm, set_bgm_volume, set_bgm_gameplay_paused, fail, frame_rate_limit_changed;
   jmethodID online_vs_address;
   jmethodID ghost_cloud_configured, ghost_cloud_refresh, ghost_cloud_poll, ghost_cloud_enqueue;
   jmethodID ghost_cloud_search, ghost_cloud_search_id, ghost_cloud_report;
   jmethodID ghost_cloud_defense_refresh, ghost_cloud_defense_poll;
+  jmethodID crown_refresh, crown_poll, crown_ack, crown_enqueue;
   jmethodID timing_cloud_submit, timing_cloud_ack, timing_cloud_refresh, timing_cloud_board;
   _Atomic unsigned activity_generation;
   _Atomic int refresh_millihz; /* Java's <=120 Hz display hint, 0 uses safe 60 Hz */
@@ -58,7 +59,7 @@ static struct {
   unsigned synced_generation;
   int bgm_level, bgm_gameplay_paused;
   char data_dir[512], save_dir[512], sidecar_dir[512], ta_store_dir[512], ghost_crown_dir[512];
-  char optional_files[8][512]; /* Java publishes only catalog-verified read-only paths. */
+  char optional_files[14][512]; /* Java publishes only catalog-verified read-only paths. */
   pthread_mutex_t mx;
   pthread_cond_t cv;
   ANativeWindow *window; /* the surface to draw on (NULL while there is none) */
@@ -210,7 +211,7 @@ int android_card_resources_dir(char *out, size_t capacity) {
 /* No filesystem guessing: unavailable/unverified optional resources stay disabled. */
 int android_optional_resource_path(const char *name, char *out, size_t capacity) {
   static const char *const names[] = {"story-cutin.bin", "card-pages.bin", "backfire.wpk", "backfire.bfx",
-      "ghost-ui.bin", "builtin-ghosts.bin", "front_halo.wpk", "front_halo.bin"};
+      "ghost-ui.bin", "builtin-ghosts.bin", "front_halo.wpk", "front_halo.bin", "mileage-aura.wpk", "mileage-menu.bin", "ghost-match.bin", "ghost-wheel-lman.wpk", "finish-menu.bin", "crown-scenes.bin"};
   if (!name || !out || !capacity) return 0;
   out[0] = 0;
   int index = -1;
@@ -348,6 +349,22 @@ static void call_str(jmethodID m, const char *s) {
   if (js) (*env)->DeleteLocalRef(env, js);
 }
 
+static void play_race_bgm(const char *track, const char *fallback, int fade_ms) {
+  JNIEnv *env = env_here();
+  jstring cue = (*env)->NewStringUTF(env, track);
+  jstring alt = fallback ? (*env)->NewStringUTF(env, fallback) : NULL;
+  pthread_mutex_lock(&A.mx);
+  jobject activity = (*env)->NewLocalRef(env, A.activity);
+  pthread_mutex_unlock(&A.mx);
+  if (activity) {
+    if (!(*env)->ExceptionCheck(env))
+      (*env)->CallVoidMethod(env, activity, A.play_race_bgm, cue, alt, (jint)fade_ms);
+    (*env)->DeleteLocalRef(env, activity);
+  }
+  if (cue) (*env)->DeleteLocalRef(env, cue);
+  if (alt) (*env)->DeleteLocalRef(env, alt);
+}
+
 static jobject ghost_cloud_activity(JNIEnv *env) {
   pthread_mutex_lock(&A.mx);
   jobject activity=(*env)->NewLocalRef(env,A.activity);
@@ -410,6 +427,17 @@ int android_ghost_cloud_refresh(const char *physics) {
   if (activity) (*env)->DeleteLocalRef(env,activity);
   return ghost_cloud_jni_ok(env) && queued;
 }
+int android_ghost_crown_refresh(const char *physics,const char *card_id) {
+  JNIEnv *env=env_here();
+  jobject activity=ghost_cloud_activity(env);
+  jstring id=activity && physics?(*env)->NewStringUTF(env,physics):NULL;
+  jstring card=id && card_id?(*env)->NewStringUTF(env,card_id):NULL;
+  jboolean queued=id && (!card_id || card)?(*env)->CallBooleanMethod(env,activity,A.crown_refresh,id,card):JNI_FALSE;
+  if(card)(*env)->DeleteLocalRef(env,card);
+  if(id)(*env)->DeleteLocalRef(env,id);
+  if(activity)(*env)->DeleteLocalRef(env,activity);
+  return ghost_cloud_jni_ok(env) && queued;
+}
 static int ghost_cloud_search(const char *physics,const uint16_t *name,unsigned length,const char *hex_id) {
   if (!physics || (hex_id==NULL && (!name || !length || length>5))) return 0;
   JNIEnv *env=env_here();
@@ -449,6 +477,37 @@ static int ghost_cloud_poll(jmethodID method,unsigned char **data,size_t *bytes)
 }
 int android_ghost_cloud_poll(unsigned char **data,size_t *bytes) {
   return ghost_cloud_poll(A.ghost_cloud_poll,data,bytes);
+}
+int android_ghost_crown_poll(unsigned char **data,size_t *bytes) {
+  return ghost_cloud_poll(A.crown_poll,data,bytes);
+}
+int android_ghost_crown_ack(void) {
+  JNIEnv *env=env_here();
+  jobject activity=ghost_cloud_activity(env);
+  jint result=activity?(*env)->CallIntMethod(env,activity,A.crown_ack):0;
+  if(activity)(*env)->DeleteLocalRef(env,activity);
+  return ghost_cloud_jni_ok(env)?result:0;
+}
+int android_ghost_crown_enqueue(unsigned area,const unsigned char previous[16],
+                                const void *data,size_t bytes,const char *card_id) {
+  if(area>=8 || !previous || !data || !bytes || bytes>512u*1024u || !card_id)return 0;
+  JNIEnv *env=env_here();
+  jobject activity=ghost_cloud_activity(env);
+  jboolean queued=JNI_FALSE;
+  jbyteArray id=activity?(*env)->NewByteArray(env,16):NULL;
+  jbyteArray blob=id?(*env)->NewByteArray(env,(jsize)bytes):NULL;
+  jstring card=blob?(*env)->NewStringUTF(env,card_id):NULL;
+  if(card) {
+    (*env)->SetByteArrayRegion(env,id,0,16,(const jbyte *)previous);
+    (*env)->SetByteArrayRegion(env,blob,0,(jsize)bytes,data);
+    if(ghost_cloud_jni_ok(env))
+      queued=(*env)->CallBooleanMethod(env,activity,A.crown_enqueue,(jint)area,id,blob,card);
+    (*env)->DeleteLocalRef(env,card);
+  }
+  if(blob)(*env)->DeleteLocalRef(env,blob);
+  if(id)(*env)->DeleteLocalRef(env,id);
+  if(activity)(*env)->DeleteLocalRef(env,activity);
+  return ghost_cloud_jni_ok(env) && queued;
 }
 int android_ghost_cloud_enqueue_card(unsigned area,const void *data,size_t bytes,const char *card_id) {
   if (area>=8 || !data || !bytes || bytes>512u*1024u) return 0;
@@ -506,25 +565,21 @@ int android_ghost_cloud_defense_poll(unsigned char **data,size_t *bytes) {
   return ghost_cloud_poll(A.ghost_cloud_defense_poll,data,bytes);
 }
 
-int android_timing_cloud_submit(const uint8_t *record, size_t bytes) {
+int android_timing_cloud_submit(const uint8_t *record, size_t bytes, int want_result) {
   JNIEnv *env=env_here();
   jobject activity=ghost_cloud_activity(env);
   jbyteArray data=activity?(*env)->NewByteArray(env,(jsize)bytes):NULL;
   jboolean queued=JNI_FALSE;
   if(data) {
     (*env)->SetByteArrayRegion(env,data,0,(jsize)bytes,(const jbyte *)record);
-    if(ghost_cloud_jni_ok(env))queued=(*env)->CallBooleanMethod(env,activity,A.timing_cloud_submit,data);
+    if(ghost_cloud_jni_ok(env))queued=(*env)->CallBooleanMethod(env,activity,A.timing_cloud_submit,data,(jboolean)!!want_result);
     (*env)->DeleteLocalRef(env,data);
   }
   if(activity)(*env)->DeleteLocalRef(env,activity);
   return ghost_cloud_jni_ok(env) && queued;
 }
-int android_timing_cloud_ack(void) {
-  JNIEnv *env=env_here();
-  jobject activity=ghost_cloud_activity(env);
-  jint result=activity?(*env)->CallIntMethod(env,activity,A.timing_cloud_ack):-1;
-  if(activity)(*env)->DeleteLocalRef(env,activity);
-  return ghost_cloud_jni_ok(env)?result:-1;
+int android_timing_cloud_ack(unsigned char **data,size_t *bytes) {
+  return ghost_cloud_poll(A.timing_cloud_ack,data,bytes);
 }
 int android_timing_cloud_refresh(const char *rules,const char *physics,int course,int traffic) {
   JNIEnv *env=env_here();
@@ -631,7 +686,10 @@ static void sync_movie(void) {
   const char *track = app_bgm();
   if (track != A.bgm) {
     A.bgm = track;
-    call_str(A.play_bgm, track);
+    int fade_ms = app_bgm_crossfade_ms();
+    if (track && (fade_ms || strncmp(track, "ten_", 4) == 0))
+      play_race_bgm(track, app_bgm_fallback(), fade_ms);
+    else call_str(A.play_bgm, track);
   }
   if (!paused && paused != A.bgm_gameplay_paused) {
     A.bgm_gameplay_paused = paused;
@@ -1072,12 +1130,14 @@ JNIEXPORT void JNICALL JFN(nativeBgmFailure)(JNIEnv *env, jclass cls, jobject ow
 JNIEXPORT jboolean JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject activity, jstring data, jstring save, jstring sidecar,
                                            jstring cutin, jstring card_pages, jstring backfire_wpk, jstring backfire_bfx,
                                            jstring ghost_ui, jstring builtin_ghosts, jstring front_halo_wpk, jstring front_halo_anchors,
-                                           jstring ta_store_dir, jstring ghost_crown_dir) {
+                                           jstring mileage_aura, jstring mileage_menu, jstring ghost_match, jstring ghost_wheel, jstring finish_menu,
+                                           jstring crown_scenes, jstring ta_store_dir, jstring ghost_crown_dir) {
   if (!activity || !data || !save) return JNI_FALSE;
   JavaVM *vm = NULL;
   if ((*env)->GetJavaVM(env, &vm) != JNI_OK || !vm) return JNI_FALSE;
   jstring input[] = {data, save, sidecar, cutin, card_pages, backfire_wpk, backfire_bfx, ghost_ui,
-                     builtin_ghosts, front_halo_wpk, front_halo_anchors, ta_store_dir, ghost_crown_dir};
+                     builtin_ghosts, front_halo_wpk, front_halo_anchors, mileage_aura, mileage_menu, ghost_match, ghost_wheel, finish_menu,
+                     crown_scenes, ta_store_dir, ghost_crown_dir};
   enum { path_count = sizeof input / sizeof *input, first_optional = 3,
          ta_store_index = path_count - 2, ghost_crown_index = path_count - 1 };
   _Static_assert(ta_store_index - first_optional == sizeof A.optional_files / sizeof A.optional_files[0],
@@ -1092,6 +1152,8 @@ JNIEXPORT jboolean JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject act
   if (!show || (*env)->ExceptionCheck(env)) goto release;
   jmethodID bgm = (*env)->GetMethodID(env, cls, "playBgm", "(Ljava/lang/String;)V");
   if (!bgm || (*env)->ExceptionCheck(env)) goto release;
+  jmethodID race_bgm = (*env)->GetMethodID(env, cls, "playRaceBgm", "(Ljava/lang/String;Ljava/lang/String;I)V");
+  if (!race_bgm || (*env)->ExceptionCheck(env)) goto release;
   jmethodID volume = (*env)->GetMethodID(env, cls, "setBgmVolume", "(F)V");
   if (!volume || (*env)->ExceptionCheck(env)) goto release;
   jmethodID paused = (*env)->GetMethodID(env, cls, "setBgmGameplayPaused", "(Z)V");
@@ -1120,9 +1182,17 @@ JNIEXPORT jboolean JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject act
   if (!cloud_defense_refresh || (*env)->ExceptionCheck(env)) goto release;
   jmethodID cloud_defense_poll=(*env)->GetMethodID(env,cls,"ghostCloudDefensePoll","()[B");
   if (!cloud_defense_poll || (*env)->ExceptionCheck(env)) goto release;
-  jmethodID timing_submit=(*env)->GetMethodID(env,cls,"timingCloudSubmit","([B)Z");
+  jmethodID crown_refresh=(*env)->GetMethodID(env,cls,"ghostCrownRefresh","(Ljava/lang/String;Ljava/lang/String;)Z");
+  if(!crown_refresh || (*env)->ExceptionCheck(env))goto release;
+  jmethodID crown_poll=(*env)->GetMethodID(env,cls,"ghostCrownPoll","()[B");
+  if(!crown_poll || (*env)->ExceptionCheck(env))goto release;
+  jmethodID crown_ack=(*env)->GetMethodID(env,cls,"ghostCrownPollAck","()I");
+  if(!crown_ack || (*env)->ExceptionCheck(env))goto release;
+  jmethodID crown_enqueue=(*env)->GetMethodID(env,cls,"ghostCrownEnqueue","(I[B[BLjava/lang/String;)Z");
+  if(!crown_enqueue || (*env)->ExceptionCheck(env))goto release;
+  jmethodID timing_submit=(*env)->GetMethodID(env,cls,"timingCloudSubmit","([BZ)Z");
   if (!timing_submit || (*env)->ExceptionCheck(env)) goto release;
-  jmethodID timing_ack=(*env)->GetMethodID(env,cls,"timingCloudPollAck","()I");
+  jmethodID timing_ack=(*env)->GetMethodID(env,cls,"timingCloudPollAck","()[B");
   if (!timing_ack || (*env)->ExceptionCheck(env)) goto release;
   jmethodID timing_refresh=(*env)->GetMethodID(env,cls,"timingCloudRefresh","(Ljava/lang/String;Ljava/lang/String;II)Z");
   if (!timing_refresh || (*env)->ExceptionCheck(env)) goto release;
@@ -1140,7 +1210,7 @@ JNIEXPORT jboolean JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject act
     goto release;
   }
   A.vm = vm; A.activity = replacement;
-  A.show_movie = show; A.play_bgm = bgm; A.set_bgm_volume = volume;
+  A.show_movie = show; A.play_bgm = bgm; A.play_race_bgm = race_bgm; A.set_bgm_volume = volume;
   A.set_bgm_gameplay_paused = paused; A.fail = fail;
   A.frame_rate_limit_changed = frame_rate_limit_changed;
   A.online_vs_address=online_vs_address;
@@ -1148,6 +1218,7 @@ JNIEXPORT jboolean JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject act
   A.ghost_cloud_poll=cloud_poll;A.ghost_cloud_enqueue=cloud_enqueue;
   A.ghost_cloud_search=cloud_search;A.ghost_cloud_search_id=cloud_search_id;A.ghost_cloud_report=cloud_report;
   A.ghost_cloud_defense_refresh=cloud_defense_refresh;A.ghost_cloud_defense_poll=cloud_defense_poll;
+  A.crown_refresh=crown_refresh;A.crown_poll=crown_poll;A.crown_ack=crown_ack;A.crown_enqueue=crown_enqueue;
   A.timing_cloud_submit=timing_submit;A.timing_cloud_ack=timing_ack;
   A.timing_cloud_refresh=timing_refresh;A.timing_cloud_board=timing_board;
   memcpy(A.data_dir, path[0], strlen(path[0]) + 1);

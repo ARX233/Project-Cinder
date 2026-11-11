@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>计时赛排行榜 — Project Cinder</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap site-inner">
+    <a class="brand" href="/"><span class="mark"></span>PROJECT CINDER<small>ONLINE</small></a>
+    <nav class="main">
+      <a href="/">首页</a>
+      <a href="/ta" class="active">计时榜</a>
+      <a href="/ghost">店内鬼王</a>
+      <a href="/device">设备验证</a>
+      <a href="https://afdian.com/a/ProjectCinder">赞助</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <p class="eyebrow">Time Attack</p>
+    <h1>计时赛排行榜</h1>
+    <p class="lead">每条赛道一份榜单，只记录无交通车条件下的完整计时赛成绩。同一位车手只保留最快的一次。</p>
+
+    <div class="notice">
+      榜单成绩由客户端提交，服务端只校验格式与规则一致性，未做重放核验。名次仅代表社区提交记录。
+    </div>
+
+    <div class="toolbar" id="courses"></div>
+
+    <div id="board">
+      <p class="muted small"><span class="spinner"></span>载入中…</p>
+    </div>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">Project Cinder · 玩家自建服务</div>
+</footer>
+
+<script>
+function chips(el, items, current, onPick) {
+  el.innerHTML = '';
+  items.forEach(([value, label]) => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (value === current ? ' active' : '');
+    b.textContent = label;
+    b.onclick = () => onPick(value);
+    el.appendChild(b);
+  });
+}
+
+async function init() {
+  try {
+    const response = await fetch('/api/courses');
+    if (!response.ok) throw new Error('Failed to load courses');
+    const { courses } = await response.json();
+    function select(course) {
+      chips(document.getElementById('courses'), courses, course, select);
+      load(course);
+    }
+    select(courses[0][0]);
+  } catch (e) {
+    document.getElementById('board').innerHTML = '<div class="card"><p>赛道载入失败，请刷新后重试。</p></div>';
+  }
+}
+
+let latestRequest = 0;
+async function load(course) {
+  const request = ++latestRequest;
+  const box = document.getElementById('board');
+  box.innerHTML = '<p class="muted small"><span class="spinner"></span>载入中…</p>';
+  try {
+    const r = await fetch(`/api/ta?course=${course}&limit=100`);
+    const d = await r.json();
+    if (request !== latestRequest) return;
+    if (!r.ok) throw new Error('Failed to load board');
+    if (!d.rows || !d.rows.length) {
+      box.innerHTML = '<div class="card"><p>这条赛道还没有成绩。跑完一次计时赛并上传后，这里就会出现。</p></div>';
+      return;
+    }
+    const rows = d.rows.map(x => `
+      <div class="rrow">
+        <div class="rank${x.rank <= 3 ? ' top' : ''}">${x.rank}</div>
+        <div class="name">${esc(x.name)}</div>
+        <div class="ph">${x.power != null ? x.power + '/' + x.handling : ''}</div>
+        <div class="time">${x.time}</div>
+        <div class="date"><span class="d-long">${x.date}</span><span class="d-short">${(x.date || '').slice(5, 10)}</span></div>
+        <div class="car">${esc(x.car || '')}</div>
+      </div>`).join('');
+    box.innerHTML = `
+      <div class="ranklist">
+        <div class="rrow rhead"><div class="rank">#</div><div class="name">车手</div><div class="ph">P/H</div><div class="time">时间</div><div class="date">日期</div></div>
+        ${rows}
+      </div>
+      <p class="muted small mt">共 ${d.rows.length} 条记录 · ${esc(d.course_name)}</p>`;
+  } catch (e) {
+    if (request !== latestRequest) return;
+    box.innerHTML = '<div class="card"><p>载入失败，请稍后重试。</p></div>';
+  }
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+init();
+</script>
+</body>
+</html>

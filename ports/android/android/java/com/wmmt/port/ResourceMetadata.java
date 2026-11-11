@@ -16,6 +16,33 @@ public final class ResourceMetadata {
     public static final String GHOST_UI_PATH="ghost-ui.bin";
     public static final long GHOST_UI_LIMIT=256L*1024*1024;
     static final List<String> FRONT_HALO_PATHS=Collections.unmodifiableList(Arrays.asList("front_halo.wpk", "front_halo.bin"));
+    static final String MILEAGE_AURA_PATH = "mileage-aura.wpk";
+    static final long MILEAGE_AURA_LENGTH = 1607488;
+    static final String MILEAGE_AURA_SHA256 = "b109f08de7581b8d78dc30a2709c287f55624640b65e954ec5f57951b54a2e17";
+    static final String FINISH_MENU_PATH = "finish-menu.bin";
+    static final long FINISH_MENU_LENGTH = 245228;
+    static final String FINISH_MENU_SHA256 = "91227840e9284b1ba842212f88be4150fd132f0e6b6af4eccaf95c9707bd9be8";
+    static final String GHOST_WHEEL_PATH = "ghost-wheel-lman.wpk";
+    static final long GHOST_WHEEL_LENGTH = 1109576;
+    static final String GHOST_WHEEL_SHA256 = "542765468c95cc1870ba03ed7b7bb59da10f52494233b4bfb0f3349f91033f77";
+    static final String GHOST_MATCH_PATH = "ghost-match.bin";
+    static final long GHOST_MATCH_LENGTH = 2228360;
+    static final String GHOST_MATCH_SHA256 = "902081e0c42c009ffd2e5aa2ad68d558a019d063c9f058af7c1e69bf2db58623";
+    static final String MILEAGE_MENU_PATH = "mileage-menu.bin";
+    static final long MILEAGE_MENU_LENGTH = 2666756;
+    static final String MILEAGE_MENU_SHA256 = "bd3c91da559af9ed97c69e6cb393637b6b5632ed77d5e34c7703268430aa6e2b";
+    static final String TEN_BGM_PATH = "ten-bgm.bin";
+    static final long TEN_BGM_LENGTH = 159231744;
+    static final String TEN_BGM_SHA256 = "1a9cde4ea1e617a243a38a8c7f351ef78cf9e1b689056c650a6a079be72c8c87";
+    static final String CROWN_SCENES_PATH = "crown-scenes.bin";
+    static final long CROWN_SCENES_LENGTH = 14015410;
+    static final String CROWN_SCENES_SHA256 = "7565edb646540b4b3aa3741b25c411a4ee9646ffe566cb79e6b19f787d466e1c";
+    static final List<String> CONVERTED_PATHS = Collections.unmodifiableList(Arrays.asList(
+            MILEAGE_AURA_PATH, MILEAGE_MENU_PATH, GHOST_MATCH_PATH, GHOST_WHEEL_PATH, FINISH_MENU_PATH));
+    static boolean companionPath(String path) {
+        return allowed(path) || CONVERTED_PATHS.contains(path) || FRONT_HALO_PATHS.contains(path) ||
+                TEN_BGM_PATH.equals(path) || CROWN_SCENES_PATH.equals(path);
+    }
     public static final List<String> CARD_PATHS;
     private static final Set<String> ALLOWED;
     static {
@@ -35,14 +62,21 @@ public final class ResourceMetadata {
     public SortedMap<String,Entry> files() { return entries; }
     public Entry find(String path) { return entries.get(path); }
     static boolean allowed(String path) { return ALLOWED.contains(path); }
-    /** Fixed output of pack_front_halo.py on the reviewed DX+ arcade data. Like
-     * the APK's metadata, these approvals cannot be supplied by a ZIP. */
-    ResourceMetadata withFrontHalo() {
+    /** Fixed converter outputs from reviewed 3DX+ assets.
+     * Imported ZIP files cannot supply their own approvals. */
+    ResourceMetadata withFixedEffects() {
         SortedMap<String,Entry> merged=new TreeMap<String,Entry>(entries);
         merged.put("front_halo.wpk",new Entry("front_halo.wpk",524384,
                 "36d05929a826676d93ddae2428085ec6e831723b8edceba72dc38131c3a2644a"));
         merged.put("front_halo.bin",new Entry("front_halo.bin",26304,
                 "ee1ee36cd3f23834ebdf048447399d2594f79af24f97dbc90a7f0356a2185bfc"));
+        merged.put(MILEAGE_AURA_PATH, new Entry(MILEAGE_AURA_PATH, MILEAGE_AURA_LENGTH, MILEAGE_AURA_SHA256));
+        merged.put(FINISH_MENU_PATH, new Entry(FINISH_MENU_PATH, FINISH_MENU_LENGTH, FINISH_MENU_SHA256));
+        merged.put(GHOST_WHEEL_PATH, new Entry(GHOST_WHEEL_PATH, GHOST_WHEEL_LENGTH, GHOST_WHEEL_SHA256));
+        merged.put(GHOST_MATCH_PATH, new Entry(GHOST_MATCH_PATH, GHOST_MATCH_LENGTH, GHOST_MATCH_SHA256));
+        merged.put(MILEAGE_MENU_PATH, new Entry(MILEAGE_MENU_PATH, MILEAGE_MENU_LENGTH, MILEAGE_MENU_SHA256));
+        merged.put(TEN_BGM_PATH, new Entry(TEN_BGM_PATH, TEN_BGM_LENGTH, TEN_BGM_SHA256));
+        merged.put(CROWN_SCENES_PATH, new Entry(CROWN_SCENES_PATH, CROWN_SCENES_LENGTH, CROWN_SCENES_SHA256));
         return new ResourceMetadata(merged);
     }
     public static ResourceMetadata read(InputStream input) throws IOException {

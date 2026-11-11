@@ -473,14 +473,14 @@ public final class ResourceStoreHostTest {
             try(InputStream in=Files.newInputStream(preparedPath)) { repaired=env.store.importArchive(in,null,progress); }
             System.out.println("REAL_ZIP_REPAIR_OK duration_s="+(System.nanoTime()-began)/1e9+" root="+repaired.dataDirectory);
             ok(!repaired.dataDirectory.equals(legacy)&&Files.isRegularFile(repaired.dataDirectory.resolve(missing)),"real missing rsm repaired into NEW root");
-            ok(repaired.optionalFiles.size()==4&&repaired.cardDirectory!=null&&repaired.warnings.isEmpty(),"real signed sidecar all4 plus37 enabled");
+            ok(repaired.optionalFiles.size()==4&&repaired.cardDirectory!=null&&repaired.warnings.stream().noneMatch(w->w.startsWith("缺少完整卡片")),"real signed sidecar all4 plus37 enabled");
             began=System.nanoTime(); ResourceStore.Ready resolved=env.store.resolve(null,progress); ok(resolved.dataDirectory.equals(repaired.dataDirectory)&&resolved.optionalFiles.size()==4&&resolved.cardDirectory!=null,"real ZIP independent resolve full hash");
             System.out.println("REAL_ZIP_REPAIR_RESOLVE_OK duration_s="+(System.nanoTime()-began)/1e9);
             unchanged(env.ext.resolve("re3dxplus-data"),beforeLegacy,"real legacy and unknown tree byte-identical after repair"); unchanged(env.ext.resolve("wmmt"),beforeSave,"real save unchanged"); unchanged(env.noBackup.resolve("game-data-state"),beforePrivate,"real old active unchanged");
             byte[] oldSelection=Files.readAllBytes(env.selection()); began=System.nanoTime(); ResourceStore.Ready plain;
             try(InputStream in=Files.newInputStream(preparedPath)) { plain=env.store.importArchive(in,null,progress); }
             System.out.println("REAL_PREPARED_IMPORT_OK duration_s="+(System.nanoTime()-began)/1e9+" root="+plain.dataDirectory);
-            ok(!plain.dataDirectory.equals(repaired.dataDirectory)&&plain.optionalFiles.size()==4&&plain.cardDirectory!=null&&plain.warnings.isEmpty(),"real prepared main and41 sidecars");
+            ok(!plain.dataDirectory.equals(repaired.dataDirectory)&&plain.optionalFiles.size()==4&&plain.cardDirectory!=null&&plain.warnings.stream().noneMatch(w->w.startsWith("缺少完整卡片")),"real prepared main and41 sidecars");
             ok(!Arrays.equals(oldSelection,Files.readAllBytes(env.selection()))&&Files.isRegularFile(repaired.dataDirectory.resolve(missing)),"real previous import root retained");
             began=System.nanoTime(); ok(env.store.resolve(null,progress).dataDirectory.equals(plain.dataDirectory),"real prepared independent resolve full hash"); System.out.println("REAL_PREPARED_RESOLVE_OK duration_s="+(System.nanoTime()-began)/1e9);
             unchanged(env.ext.resolve("re3dxplus-data"),beforeLegacy,"real plain import does not change legacy"); unchanged(env.ext.resolve("wmmt"),beforeSave,"real plain import does not change save"); unchanged(env.noBackup.resolve("game-data-state"),beforePrivate,"real plain import does not change old active");

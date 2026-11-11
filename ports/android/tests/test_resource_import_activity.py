@@ -188,7 +188,7 @@ public final class ResourceImportActivityHostTest {
   static final class OriginalProfile { }
   static final class OriginalJobStore {
     static final class Ready {
-      final Path dataDirectory;final List<String> warnings;
+      final Path dataDirectory;final Path mileageAura=null,mileageMenu=null,ghostMatch=null,ghostWheel=null,finishMenu=null;final List<String> warnings;
       private Ready(Path path,List<String> notes){dataDirectory=path;warnings=Collections.unmodifiableList(new ArrayList<String>(notes));}
     }
     static Ready verifiedFixture(){return new Ready(Paths.get("/SYNTHETIC-NOT-OPENED/verified-original"),Arrays.asList("fixture capability warning"));}
@@ -219,6 +219,9 @@ public final class ResourceImportActivityHostTest {
   // Boundary declarations only: null capabilities never manufacture verification.
   static final class ResourceMetadata {
     static final String GHOST_UI_PATH="ghost-ui.bin", BUILTIN_GHOSTS_PATH="builtin-ghosts.bin";
+    static final String MILEAGE_AURA_PATH="mileage-aura.wpk", MILEAGE_MENU_PATH="mileage-menu.bin", GHOST_MATCH_PATH="ghost-match.bin", GHOST_WHEEL_PATH="ghost-wheel-lman.wpk", FINISH_MENU_PATH="finish-menu.bin";
+    static final String CROWN_SCENES_PATH="crown-scenes.bin";
+    static final String TEN_BGM_PATH="ten-bgm.bin";
   }
   static final class ResourceStore {
     static final class VerifiedOptional { Path verifiedPath(String name){return null;} }
@@ -245,6 +248,7 @@ public final class ResourceImportActivityHostTest {
     static MainActivity currentActivity;
     static String nativeDataDir;
     static File nativeCardResources;
+    static File nativeTenBgmFile;
     static String[] nativeOptionalFiles;
     static boolean resourceClearing;
     static final Object INSTALL_LOCK=new Object();
@@ -277,10 +281,10 @@ public final class ResourceImportActivityHostTest {
     String[] passedOptional;
     MainActivity(){currentActivity=this;}
     int refreshCalls; void refreshSurfaceRate(){refreshCalls++;} // Display-rate boundary, not refresh-policy proof.
-    static boolean nativeStart(MainActivity owner,String data,String save,String card,String cutin,String pages,String wpk,String bfx,String ghost,String builtin,String haloWpk,String haloAnchors,String taStore,String crownStore){
+    static boolean nativeStart(MainActivity owner,String data,String save,String card,String cutin,String pages,String wpk,String bfx,String ghost,String builtin,String haloWpk,String haloAnchors,String mileageAura,String mileageMenu,String ghostMatch,String ghostWheel,String finishMenu,String crownScenes,String taStore,String crownStore){
       owner.passedTaStore=taStore;owner.passedCrownStore=crownStore;
       owner.nativeCalls++;owner.passedData=data;owner.passedSave=save;owner.passedCard=card;
-      owner.passedOptional=new String[]{cutin,pages,wpk,bfx,ghost,builtin,haloWpk,haloAnchors};owner.cacheAtNativeCall=nativeDataDir;
+      owner.passedOptional=new String[]{cutin,pages,wpk,bfx,ghost,builtin,haloWpk,haloAnchors,mileageAura,mileageMenu,ghostMatch,ghostWheel,finishMenu,crownScenes};owner.cacheAtNativeCall=nativeDataDir;
       return owner.nextNativeResult;
     }
     static void nativeSurface(Surface surface,int width,int height){currentActivity.surfaceCalls++;}
@@ -318,7 +322,7 @@ public final class ResourceImportActivityHostTest {
     MainActivity a=fresh();a.installReady=true;a.dataDir="/SYNTHETIC-NOT-OPENED/main-first";
     a.saveDir="/SYNTHETIC-NOT-OPENED/save-only";a.cardResources=new File("/SYNTHETIC-NOT-OPENED/card-first");
     Map<String,Path> extras=new TreeMap<>();
-    for(String name:new String[]{"story-cutin.bin","card-pages.bin","backfire.wpk","backfire.bfx","front_halo.wpk","front_halo.bin"})
+    for(String name:new String[]{"story-cutin.bin","card-pages.bin","backfire.wpk","backfire.bfx","front_halo.wpk","front_halo.bin","mileage-aura.wpk","mileage-menu.bin","ghost-match.bin","ghost-wheel-lman.wpk","finish-menu.bin","crown-scenes.bin"})
       extras.put(name,Paths.get("/SYNTHETIC-NOT-OPENED/approved-optional",name));
     a.preparedResources=new MainActivity.ResolvedResources(new ResourceStore.Ready(a.dataDir,a.cardResources.getAbsolutePath(),extras));
     a.surfaceWidth=1280;a.surfaceHeight=720;a.resourceControls();return a;
@@ -345,9 +349,14 @@ public final class ResourceImportActivityHostTest {
     a.nextNativeResult=true;a.startGame();
     ok(a.nativeCalls==2&&a.started&&a.root.removals==1,"retry accepts true and hides panel once");
     ok(a.cacheAtNativeCall==null&&MainActivity.nativeDataDir.equals(selected),"first cache published only AFTER successful boolean call");
-    ok(MainActivity.nativeCardResources==a.cardResources&&MainActivity.nativeOptionalFiles.length==8,"all first verified resource paths frozen together");
+    ok(MainActivity.nativeCardResources==a.cardResources&&MainActivity.nativeOptionalFiles.length==14,"all first verified resource paths frozen together");
     ok(Arrays.equals(a.passedOptional,MainActivity.nativeOptionalFiles),"first JNI call consumes exact Ready optionalFiles map");
     ok(a.passedOptional[6].endsWith("/front_halo.wpk")&&a.passedOptional[7].endsWith("/front_halo.bin"),"front halo pair reaches JNI in order");
+    ok(a.passedOptional[8].endsWith("/mileage-aura.wpk")&&a.passedOptional[9].endsWith("/mileage-menu.bin"),"mileage sidecars reach JNI in order");
+    ok(a.passedOptional[10].endsWith("/ghost-match.bin"),"ghost intro assets reach JNI");
+    ok(a.passedOptional[11].endsWith("/ghost-wheel-lman.wpk"),"Ghost wheel reaches JNI");
+    ok(a.passedOptional[12].endsWith("/finish-menu.bin"),"finish menu reaches JNI");
+    ok(a.passedOptional[13].endsWith("/crown-scenes.bin"),"crown scenes reach JNI");
     ok(a.surfaceCalls==1&&a.pauseCalls==1&&a.lastPause,"valid surface and paused lifecycle forwarded after success");
     ok(a.passedSave.equals("/SYNTHETIC-NOT-OPENED/save-only")&&!a.passedSave.equals(a.passedData),"native receives distinct save path");
     ok(a.getDir("ta-ranking-v1",Context.MODE_PRIVATE).getCanonicalPath().equals(a.passedTaStore)&&
@@ -376,7 +385,7 @@ public final class ResourceImportActivityHostTest {
     ok(replacement.started&&replacement.dataDir.equals(frozen)&&replacement.cardResources==frozenCard,"reattach success selects first process paths");
     ok(MainActivity.nativeOptionalFiles==frozenOptional&&MainActivity.nativeCardResources==frozenCard&&replacement.root.removals==1,"reattach does not replace frozen path objects");
     MainActivity absent=eligible();absent.cardResources=null;absent.preparedResources=new MainActivity.ResolvedResources(ready());absent.startGame();
-    ok(absent.passedCard==null&&Arrays.equals(absent.passedOptional,new String[8]),"unavailable optional files stay null without filesystem guessing");
+    ok(absent.passedCard==null&&Arrays.equals(absent.passedOptional,new String[14]),"unavailable optional files stay null without filesystem guessing");
     System.out.println("Actual extracted boolean startGame failure/retry/reattach checks PASS");
   }
   static final class CloseSource extends InputStream {
@@ -460,9 +469,9 @@ public final class ResourceImportActivityHostTest {
     Bundle both=new Bundle();saving.onSaveInstanceState(both);
     ok(saving.originalController.saveCalls==1&&both.getBoolean("controller-fixture-busy",false),"actual onSaveInstanceState delegates original state");
     ok(both.getBoolean("resource-picker-pending",false)&&both.getParcelable("resource-import-uri")==queuedSave&&saving.baseSaveCalls==1,"original save delegation preserves both legacy picker fields and super");
-    MainActivity adapter=fresh();adapter.preparedResources=new MainActivity.ResolvedResources(OriginalJobStore.verifiedFixture());
-    ok(adapter.preparedResources.cardDirectory==null&&adapter.preparedResources.optionalFiles.isEmpty(),"actual Original Ready adapter never guesses card/optional fallback paths");
-    ok(adapter.preparedResources.warnings.size()==2&&adapter.preparedResources.warnings.get(0).equals("fixture capability warning"),"actual Original Ready adapter preserves verified warnings and adds no-fallback notice");
+    MainActivity adapter=fresh();adapter.preparedResources=new MainActivity.ResolvedResources(new ResourceStore.Ready());
+    ok(adapter.preparedResources.cardDirectory==null&&adapter.preparedResources.optionalFiles.isEmpty(),"actual verified Ready adapter never guesses card/optional paths");
+    ok(adapter.preparedResources.warnings.size()==1&&adapter.preparedResources.warnings.get(0).contains("RX-7"),"actual verified Ready adapter reports missing core audio");
     ok(adapter.resourcePath("story-cutin.bin")==null&&adapter.resourcePath("backfire.wpk")==null,"Original capability absent optional paths remain null");
     try{adapter.preparedResources.optionalFiles.put("bait",Paths.get("/SYNTHETIC-NOT-OPENED/bait"));throw new AssertionError("mutable original optional map");}catch(UnsupportedOperationException expected){ok(true,"actual Original optional map is immutable");}
     try{adapter.preparedResources.warnings.add("bait");throw new AssertionError("mutable original warnings");}catch(UnsupportedOperationException expected){ok(true,"actual Original warnings are immutable");}
@@ -633,7 +642,7 @@ class ResourceImportActivityTests(unittest.TestCase):
         (self.work/'close-input.log').write_text(result.stdout+result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertIn('closeResourceInput PASS: 24 assertions', result.stdout)
-        close_at = self.worker.index('closeResourceInput(opened, imported != null);')
+        close_at = self.worker.index('closeResourceInput(opened, committed);')
         self.assertLess(close_at, self.worker.index('if (resourceSource == opened) resourceSource = null;'))
         self.assertLess(close_at, self.worker.index('if (resourceOpenSignal == signal) resourceOpenSignal = null;'))
         self.assertIn('if (resourceNotice != null) text.append(', self.callbacks[0])
@@ -714,9 +723,8 @@ class ResourceImportActivityTests(unittest.TestCase):
         self.assertIn('a.pendingOriginalNotice=', complete)
         adapter = marked_block(self.source, 'private static final class ResolvedResources')
         self.assertIn('ResolvedResources(ResourceStore.Ready ready)', adapter)
-        self.assertIn('ResolvedResources(OriginalJobStore.Ready ready)', adapter)
         self.assertNotIn('ResolvedResources(boolean', adapter)
-        self.assertIn('optionalFiles=java.util.Collections.emptyMap()', adapter.replace(' ', ''))
+        self.assertIn('store.resolveOriginal(original, cancel, report)', self.worker)
         self.assertIn('new ResolvedResources(imported)', self.worker)
         self.assertIn('originalStore.resolve(', self.worker)
         pinned = method(self.source, 'originalProfile')

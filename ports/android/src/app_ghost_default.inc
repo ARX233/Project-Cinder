@@ -13,7 +13,7 @@ static unsigned app_default_directory_fill(unsigned first){
    menu_ghost_directory_area*d=&r->areas[a];d->level=v.car.target_level;d->native_available=1;
    d->default_crown=v.crown_area==(int)a;
    d->ramp=d->route=-1; /* Original random ramp/route ONLY at actual confirm. */
-   d->pack=v.car.pack;d->paint=v.car.paint;d->raw_model=v.raw_model_id;d->power=v.car.rival.power;d->handling=v.car.rival.handling;d->title=v.title;
+   d->pack=v.car.pack;d->paint=v.car.paint;d->raw_model=v.raw_model_id;d->power=v.car.rival.power;d->handling=v.car.rival.handling;d->title=v.title;d->class_id=v.class_id;
    d->native_type=(int)v.car.rival.type;d->base_paint=v.car.base_paint;d->custom_color=v.car.custom_color;
    d->aero=(int)v.raw_aero;d->mirror=(int)v.raw_mirror;
    d->wing=(int)v.raw_wing;d->bonnet=(int)v.raw_bonnet;
@@ -24,7 +24,7 @@ static unsigned app_default_directory_fill(unsigned first){
  return count;
 }
 static const menu_ghost_directory_row*app_default_directory_row(unsigned index){
- for(unsigned i=GHOST_CATALOG_RECORDS;i<AC.row_count;i++)if(AC.rows[i].source_kind==MENU_GHOST_SOURCE_DEFAULT&&AC.rows[i].record_index==index)return &AC.rows[i];
+ for(unsigned i=AC.catalog?GHOST_CATALOG_RECORDS:0;i<AC.base_rows;i++)if(AC.rows[i].source_kind==MENU_GHOST_SOURCE_DEFAULT&&AC.rows[i].record_index==index)return &AC.rows[i];
  return NULL;
 }
 static void app_default_style(const car_ghost_default_binding*b,ghost_catalog_area*a){

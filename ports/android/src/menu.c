@@ -23,6 +23,7 @@
 #include "dressdb.h"
 #include "namedb.h"
 #include "mathx.h"
+#include "mileage_style.h"
 #include "sound.h"
 #include "title.h"
 #include "story_assembly.h" /* shared original-earned budget contract; pure, no persistence */
@@ -48,11 +49,13 @@ static struct {
   int title, bg, line, logo, top, bottom, mode, mode_ring, course, arrow, course_map;
   int tg_result_bar, tg_result_moji;
   int ten_timeup, ten_face, ten_x, ten_finish, ten_summary; /* clTenResult */
-  int game, game_image, game_ring; /* the game mode select */
-  int vs_sel_image; /* the versus select preview and caption */
+  int game, game_ring; /* the game mode select */
+  int mileage;
+  int crown_award_bg, crown_award_title, crown_award_frame, crown_award_a, crown_award_b,
+      crown_award_message, crown_award_complete;
   int vs_course, vs_icon, vs_icon_omakase, vs_icon_omakase2, vs_ex_player, timer; /* the area vote */
   int shogo_bg, pre_shadow[3], pre_cars[3], pre_vs[3], plate, plate_ph; /* the cars flying in (MENU_VS_MATCH) */
-  int maker[3], pre_bg, ranking_bg, ranking, ranking_step;
+  int maker[3], pre_bg, ranking_bg, ranking, ranking_step, attract_crown_bg, attract_crown_panels;
   int prologue[2];
   /* the car select */
   int bg_carsel, maker_layout, maker_car, car_info, car_arrow, car_new, mes_r35, mes_jzs161;
@@ -426,7 +429,8 @@ static void draw_ranking(const menu_state *m, float screen_w, float screen_h) {
     assets_ok &= draw_plate(m,k,pb_rank,pb,f < RANKING_PLATE_LAST ? f : RANKING_PLATE_LAST,fade);
   }
   ta_ui_notice(!assets_ok?"LOCAL ASSET MISSING":m->ta_rank_status==MENU_TA_RANK_COMMUNITY?
-               "ONLINE UNVERIFIED":m->ta_rank_status==MENU_TA_RANK_STORE_ERROR?"LOCAL DATA ERROR":"LOCAL RANKING",fade);
+               (m->ta_rank_snapshot.real_count?"ONLINE RANKING":"NO ONLINE RECORDS"):
+               m->ta_rank_status==MENU_TA_RANK_STORE_ERROR?"LOCAL DATA ERROR":"LOCAL RANKING",fade);
   if (ranking_next_visible(m)) {
     const float *r = RANKING_NEXT;
     const char *label = "NEXT COURSE >";
@@ -533,18 +537,17 @@ static int color_at(const menu_state *m, float x, float y) {
 #include "menu_body_color.inc"
 #include "menu_story_body_runtime.inc"
 
-/* Stable game identity is not a visual slot. These are resource identities only,
- * not a copied private animation/frame table. Real-time VS has its own built-in
- * icon/description; the original ghost disc/picture belong only to GHOST. Its old
- * upgrade-parts label is deliberately not used without the corresponding rewards. */
+/* Mode identities stay stable as their positions on the carousel change. */
 #define GAME_SLOTS MENU_MODE_SLOTS
+#define GAME_BATTLE_PHOTO 3226
+#define GAME_BATTLE_CROP {192, 58, 640, 396}
 static const struct { int game, icon, picture, label; float picture_crop[4]; } GAME_MODE[GAME_SLOTS] = {
   /* Source-alpha artwork bounds, not the 1024x512 padded texture canvas. */
   { MENU_GAME_STORY, 2825, 3224, 2317, {192, 60, 640, 396} },
-  { MENU_GAME_GHOST, 2827, 3226,    0, {192, 58, 640, 396} }, /* no unimplemented upgrade-parts promise */
+  { MENU_GAME_GHOST, 2827, GAME_BATTLE_PHOTO, 2319, GAME_BATTLE_CROP },
   { MENU_GAME_TEN,   2824, 3223, 2316, {191, 58, 642, 397} },
   { MENU_GAME_TA,    2826, 3225, 2318, {191,  8, 643, 447} },
-  { MENU_GAME_VS,       0,    0,    0, {0} },
+  { MENU_GAME_VS,       0, GAME_BATTLE_PHOTO,    0, GAME_BATTLE_CROP },
 };
 
 static int game_slot(int game) {
@@ -603,7 +606,7 @@ static void ghost_invalidate(menu_state *m) {
   if (m->ghost.request_serial != UINT_MAX) ++m->ghost.request_serial;
   m->ghost.active_request = m->ghost.completed_request = m->ghost.prepared_request = 0;
   m->ghost.completed_action = MENU_GHOST_ACTION_NONE;
-  m->ghost.pre_go = 0;
+  m->ghost.pre_go = m->ghost.intro_t = 0;
   if (m->ghost.choose_race_options) m->zones = m->ghost.previous_zones;
   m->ghost.choose_race_options = 0;
   m->ghost.pending_action = m->ghost.inflight_action = MENU_GHOST_ACTION_NONE;
@@ -788,6 +791,7 @@ static int ghost_name_matches(const menu_state *m, const menu_ghost_directory_ro
 /* The original manager supplies one seed per area (getDefaultCrown,
  * 0x86959b0). A complete locally recorded win can supersede that seed. */
 static int ghost_champion(const menu_state *m,int area) {
+  if(m->ghost.directory.cloud_crowns && !m->ghost.directory.cloud_crowns_ready)return -1;
   int holder=-1,local=-1,seed_count=0;
   for (unsigned i=0;i<m->ghost.directory.count;++i) {
     const menu_ghost_directory_row *row=&m->ghost.directory.rows[i];
@@ -799,7 +803,9 @@ static int ghost_champion(const menu_state *m,int area) {
       holder=(int)i;
     }
   }
-  return local>=0 ? local : seed_count==1 ? holder : -1;
+  if(local>=0)return local;
+  if(m->ghost.directory.cloud_crowns && (m->ghost.directory.cloud_crown_occupied&(1u<<area)))return -1;
+  return seed_count==1 ? holder : -1;
 }
 
 static int ghost_row_matches(const menu_state *m, unsigned index, int area, int level) {
@@ -988,7 +994,7 @@ int menu_ghost_begin_pre(menu_state *m) {
       !ghost_request_map_bound(m)) return 0;
   m->ghost.prepared_request = m->ghost.completed_request;
   m->ghost.completed_request = 0;
-  m->ghost.pre_go = 0;
+  m->ghost.pre_go = m->ghost.intro_t = 0;
   m->ghost.status = MENU_GHOST_BUSY;
   m->ghost.touch = NULL; m->ghost.touch_action = m->ghost.held = 0;
   if (m->ghost.choose_race_options) {
@@ -1014,6 +1020,30 @@ static int ghost_prepared(const menu_state *m) {
 
 int menu_ghost_preparing(const menu_state *m) {
   return m && m->screen==MENU_GHOST_PRE && ghost_prepared(m);
+}
+
+/* The menu borrows the same immutable row whose identity and map were
+ * bound to the native race. A directory refresh invalidates this request. */
+static const menu_ghost_directory_row *ghost_intro_rival(const menu_state *m) {
+  if (!menu_ghost_preparing(m) || !ghost_directory_action(m->ghost.completed_action)) return NULL;
+  int i=m->ghost.directory_row;
+  if (i<0 || (unsigned)i>=m->ghost.directory.count) return NULL;
+  const menu_ghost_directory_row *r=&m->ghost.directory.rows[i];
+  return r->source_kind==m->ghost.request_source_kind && r->record_index==m->ghost.request_record_index ? r : NULL;
+}
+
+static int ghost_intro_crown(const menu_state *m) {
+  return m->ghost.completed_action==MENU_GHOST_CHALLENGE_LOCAL_CROWN ||
+         (m->ghost.search_kind==0 && m->ghost.level==9);
+}
+
+/* TgMatchingInformationMove: cars run from the first tick, plates at 80,
+ * normal VS at 120, crown at 200. Without the revenge branch the original
+ * jumps from tick 160 to 200. Crown adds 50 ticks to the hold. */
+enum { GHOST_INTRO_PLATES=80, GHOST_INTRO_VS=120, GHOST_INTRO_CROWN=160,
+       GHOST_INTRO_END=210, GHOST_INTRO_CROWN_HOLD=50, GHOST_INTRO_FADE=10 };
+static int ghost_intro_end(const menu_state *m) {
+  return GHOST_INTRO_END+(ghost_intro_crown(m)?GHOST_INTRO_CROWN_HOLD:0);
 }
 
 int menu_ghost_choosing_options(const menu_state *m) {
@@ -1437,12 +1467,42 @@ static int match_scene3d(const menu_state *m, menu_scene *s);
 
 #include "ghost_preview_pose.inc"
 
+/* nsMenuCheck::areaIDFromMenuOrder (0x8633fb4) puts Fukuoka before Hakone. */
+static const int ATTRACT_CROWN_ORDER[MENU_GHOST_DIRECTORY_AREAS]={0,1,2,3,4,5,7,6};
+
+static int attract_crown_find(const menu_state *m,int first) {
+  for (int slot=first;slot<(int)MENU_GHOST_DIRECTORY_AREAS;++slot)
+    if (m->attract_crowns[ATTRACT_CROWN_ORDER[slot]].car.native_available)return slot;
+  return -1;
+}
+
+static int attract_crown_area(const menu_state *m) {
+  int slot=attract_crown_find(m,m->attract_crown_slot);
+  return slot>=0 ? ATTRACT_CROWN_ORDER[slot] : -1;
+}
+
+/* clArg at 0x87be58a: 300 ticks with one holder, 180 with multiple,
+ * plus the two black fades (0.1667s each, clSeqChampionDispThread::run). */
+enum { ATTRACT_CROWN_FADE=10 };
+static int attract_crown_length(const menu_state *m) {
+  int first=attract_crown_find(m,0);
+  return 2*ATTRACT_CROWN_FADE+(first>=0 && attract_crown_find(m,first+1)>=0 ? 180 : 300);
+}
+
 const menu_ghost_directory_area *menu_ghost_preview_profile(const menu_state *m,int ghost_row) {
-  if (m->screen!=MENU_GHOST || m->ghost.ui.page!=GHOST_UI_RIVAL ||
-      ghost_row<=0 || (unsigned)ghost_row>m->ghost.directory.count ||
-      !m->ghost.directory.rows || m->ghost.area_slot<0 || m->ghost.area_slot>=MENU_GHOST_DIRECTORY_AREAS) return NULL;
+  if (m->screen==MENU_ATTRACT_CROWNS && ghost_row<0 && ghost_row>=-(int)MENU_GHOST_DIRECTORY_AREAS) {
+    const menu_ghost_directory_area *car=&m->attract_crowns[-ghost_row-1].car;
+    return car->native_available ? car : NULL;
+  }
+  if (ghost_row<=0 || (unsigned)ghost_row>m->ghost.directory.count || !m->ghost.directory.rows) return NULL;
   const menu_ghost_directory_row *row=&m->ghost.directory.rows[ghost_row-1];
-  const menu_ghost_directory_area *area=&row->areas[m->ghost.area_slot];
+  int slot=m->ghost.area_slot;
+  if (m->screen==MENU_GHOST_PRE) {
+    if (row!=ghost_intro_rival(m)) return NULL;
+    slot=m->ghost.request_area_slot;
+  } else if (m->screen!=MENU_GHOST || m->ghost.ui.page!=GHOST_UI_RIVAL) return NULL;
+  if (slot<0 || slot>=MENU_GHOST_DIRECTORY_AREAS) return NULL;
+  const menu_ghost_directory_area *area=&row->areas[slot];
   return ghost_directory_area(row,area) ? area : NULL;
 }
 
@@ -1480,13 +1540,74 @@ static int ghost_preview_scene(const menu_state *m,menu_scene *s) {
   return s->n!=0;
 }
 
+#include "ghost_intro_pose.inc"
+
+static unsigned ghost_intro_pose(const menu_state *m) {
+  unsigned t=(unsigned)m->ghost.intro_t, count=sizeof GHOST_INTRO_POSE/sizeof *GHOST_INTRO_POSE;
+  return t<count?t:count-1;
+}
+
+static int ghost_intro_scene(const menu_state *m,menu_scene *s) {
+  const menu_ghost_directory_row *r=ghost_intro_rival(m);
+  if (!r) return 0;
+  int index=(int)(r-m->ghost.directory.rows)+1;
+  const menu_ghost_directory_area *a=menu_ghost_preview_profile(m,index);
+  if (!a) return 0;
+  const cardb_color *own=&chosen_car(m,m->car)->colors[m->color];
+  s->env=4; /* clSeqTgMatchingInformation's clMenu3dEnvironment */
+  s->fov_x=55.0f*DEG;
+  const typeof(GHOST_INTRO_POSE[0]) *p=&GHOST_INTRO_POSE[ghost_intro_pose(m)];
+  memcpy(s->eye,p->eye,sizeof s->eye);
+  memcpy(s->at,p->aim,sizeof s->at);
+  s->cars[0]=(menu_car){.pack=own->pack,.paint=own->paint,.aero=m->aero[m->maker][m->car]};
+  tg_wear(m,&s->cars[0]);
+  s->cars[0].body_color_valid=menu_body_color_get(m,&s->cars[0].body_color);
+  s->cars[0].story_body_valid=menu_story_body_get(m,&s->cars[0].story_body);
+  s->cars[1]=(menu_car){.ghost_row=index,.pack=a->pack,.paint=a->base_paint,.aero=a->aero,
+    .mirror=a->mirror,.wing=a->wing,.bonnet=a->bonnet,.wheel=a->wheel,.neon=a->neon,.vinyl=a->vinyl};
+  s->n=2;
+  for (int i=0;i<s->n;++i) {
+    menu_car *c=&s->cars[i];
+    /* Both cars use the same animation; the player on the left uses F*M*F. */
+    for (int r0=0;r0<4;++r0)
+      for (int col=0;col<3;++col)
+        c->model[4*r0+col]=p->body[3*r0+col]*(!i && ((r0==0)!=(col==0))?-1.0f:1.0f);
+    c->model[15]=1;
+    c->turned=1;
+    for (int w=0;w<4;++w) {
+      for (int r0=0;r0<3;++r0)
+        for (int col=0;col<3;++col)
+          c->tyre[w][4*r0+col]=p->wheel[w][3*r0+col]*(!i && ((r0==0)!=(col==0))?-1.0f:1.0f);
+      c->tyre[w][15]=1;
+    }
+  }
+  return 1;
+}
+
 static int menu_scene3d_base(const menu_state *m, menu_scene *s) {
   /* all of it: a car's aero and cp left unset made the car select's cars aero cars not in
    * (push86, nothing drawn) */
   memset(s, 0, sizeof *s);
   s->env = 4;
+  if (m->screen==MENU_ATTRACT_CROWNS) {
+    int area=attract_crown_area(m);
+    if (area<0) return 0;
+    const menu_ghost_directory_area *car=&m->attract_crowns[area].car;
+    /* clSeqChampionDispThread camera and per-yield yaw at 0x87a0dee / 0x87a06c5. */
+    s->env=0; s->fov_x=73.0f*DEG;
+    s->eye[1]=10.0f; s->eye[2]=65.0f; s->at[1]=21.0f;
+    const float origin[3]={0,0,0};
+    mat4 model=mat4_body(origin,-0.3f*m->t*DEG,0,0);
+    s->cars[0]=(menu_car){.ghost_row=-area-1,.pack=car->pack,.paint=car->base_paint,
+      .aero=car->aero,.mirror=car->mirror,.wing=car->wing,.bonnet=car->bonnet,
+      .wheel=car->wheel,.neon=car->neon,.vinyl=car->vinyl};
+    memcpy(s->cars[0].model,model.m,sizeof model.m);
+    s->n=1;
+    return 1;
+  }
   if (m->screen==MENU_GHOST && m->ghost.ui.page==GHOST_UI_RIVAL)
     return ghost_preview_scene(m,s);
+  if (m->screen==MENU_GHOST_PRE) return ghost_intro_scene(m,s);
   /* the cars flying in (and while the race loads before them: their packs in) */
   if (m->screen == MENU_VS_MATCH || (m->screen == MENU_VS && m->vs.state == MENU_VS_LOADING && m->vs.match_n))
     return match_scene3d(m, s);
@@ -1514,6 +1635,42 @@ static int menu_scene3d_base(const menu_state *m, menu_scene *s) {
       for (int e = 0; e < 16; ++e) s->cars[s->n].model[e] = mm.m[e];
       s->n++;
     }
+    return 1;
+  }
+  if (m->screen == MENU_CROWN_AWARD) {
+    /* clSeqTgCrownGetThread uses environment 0, the camera at 0x887e1f0,
+     * initial yaw at 0x888037a and -0.3 degrees per yield at 0x887e54e. */
+    s->env = 0;
+    s->fov_x = 73.0f * DEG;
+    s->eye[1] = 18.0f; s->eye[2] = 55.0f;
+    s->at[1] = 11.0f;
+    const float pos[3] = {0, 0, 0};
+    mat4 mm = mat4_body(pos, (-20.0f - 0.3f * m->t) * DEG, 0, 0);
+    const cardb_color *c = &chosen_car(m, m->car)->colors[m->color];
+    s->cars[0].pack = c->pack;
+    s->cars[0].paint = c->paint;
+    s->cars[0].aero = m->aero[m->maker][m->car];
+    tg_wear(m, &s->cars[0]);
+    memcpy(s->cars[0].model, mm.m, sizeof mm.m);
+    s->n = 1;
+    return 1;
+  }
+  if (m->screen == MENU_MILEAGE) {
+    /* clSeqMileageResultThread camera without an arcade password, 0x87874e0,
+     * environment 0 and -0.3 degrees per 60 Hz yield, 0x8787205. */
+    s->env = 0;
+    s->fov_x = 73.0f * DEG;
+    s->eye[1] = 16.0f; s->eye[2] = 50.0f;
+    s->at[1] = 9.0f;
+    const float pos[3] = {0, 0, 0};
+    mat4 mm = mat4_body(pos, -0.3f * m->t * DEG, 0, 0);
+    const cardb_color *c = &chosen_car(m, m->car)->colors[m->color];
+    s->cars[0].pack = c->pack;
+    s->cars[0].paint = c->paint;
+    s->cars[0].aero = m->aero[m->maker][m->car];
+    tg_wear(m, &s->cars[0]);
+    memcpy(s->cars[0].model, mm.m, sizeof mm.m);
+    s->n = 1;
     return 1;
   }
   if (m->screen == MENU_VS_STAR) {
@@ -1786,7 +1943,7 @@ int menu_scene3d(const menu_state *m, menu_scene *s) {
    * card; aero/part previews may construct several views of that same card.
    * Never stamp purchase maker/car/colour previews, VS opponents or match cars. */
   switch (m->screen) {
-  case MENU_VS_STAR: case MENU_GARAGE: case MENU_SETTING: case MENU_BODY_COLOR:
+  case MENU_MILEAGE: case MENU_CROWN_AWARD: case MENU_VS_STAR: case MENU_GARAGE: case MENU_SETTING: case MENU_BODY_COLOR:
   case MENU_ST_EFF: case MENU_TG_GET: case MENU_TG_AERO: case MENU_TG_PART:
   case MENU_TG_SELECT: case MENU_TG_WHEEL: case MENU_TG_VINYL: case MENU_TG_WEAR: {
     menu_body_color_view v; menu_story_body_stamp earned;
@@ -1877,6 +2034,20 @@ static void draw_topbar(int bars, float fade, const anm_swap *mes) {
     anm_draw_sprite(inf, r[0] + INF_DX - INF_W / 2, r[1] + INF_DY - INF_H / 2, fade);
 }
 
+static void draw_bottombar(int bars, float fade) {
+  anm_draw_xy(ID.bottom, bars, fade, 0, MENU_FOOTER_OFFSET, 1, MENU_FOOTER_SCALE, NULL, 0);
+}
+
+static void draw_footer_hint(int sprite, float alpha) {
+  float src[4];
+  if (!anm_sprite_content_rect(sprite, src)) return;
+  float w = src[2] - src[0], h = src[3] - src[1];
+  float scale = fminf(1.22f, fminf(550.0f / w, 36.0f / h));
+  const float dst[4] = {320.0f - w * scale * 0.5f, MENU_FOOTER_CENTER - h * scale * 0.5f,
+                        320.0f + w * scale * 0.5f, MENU_FOOTER_CENTER + h * scale * 0.5f};
+  anm_draw_part(sprite, src, dst, alpha);
+}
+
 /* ---- the time zone and BGM select (clSeqStdDayTimeSelectThread, between the course
  * select and the race) ----
  * - menu_layout_yn_card_1_gold: the morning (0) and night (1) cards of a clMenuSpinBoxStd,
@@ -1953,7 +2124,7 @@ const char *menu_bgm(const menu_state *m, int racing) {
   if (racing && m->finish && m->finish_story != 3)
     return m->finish > m->finish_wait && (!m->finish_ghost || m->finish_goal) ? MUSIC_RESULT : NULL;
   if (racing || (m->screen == MENU_PRE && m->pre_quiet)) return card_bgm_file(m, m->song);
-  if (m->screen < MENU_START) return NULL; /* the attract loop: its movies have their own sound */
+  if (menu_in_attract(m)) return NULL; /* the attract loop: its movies have their own sound */
   /* mseqTimeAttack stops the music once the BGM is chosen (before seqTaCourseDecide) */
   if ((m->screen == MENU_BGM && m->deciding) || m->screen == MENU_PRE
 #if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
@@ -1965,7 +2136,8 @@ const char *menu_bgm(const menu_state *m, int racing) {
    * the select music back on the mode select; the car setting's on the dress-up menu it opens */
   if (!m->dress_free && (m->screen == MENU_ST_TUNE || m->screen == MENU_TG_GET || m->screen == MENU_TG_AERO || m->screen == MENU_TG_PART ||
       m->screen == MENU_TG_WHEEL || m->screen == MENU_TG_VINYL || m->screen == MENU_TG_WEAR || m->screen == MENU_LVUP || m->screen == MENU_SHOGO ||
-      m->screen == MENU_ST_EFF || m->screen == MENU_VS_STAR))
+      m->screen == MENU_ST_EFF || m->screen == MENU_VS_STAR || m->screen == MENU_MILEAGE ||
+      m->screen == MENU_CROWN_AWARD))
     return MUSIC_RESULT;
   if (m->dress_free) return MUSIC_ENTRY;
   return m->music ? MUSIC_SELECT : MUSIC_ENTRY;
@@ -2119,9 +2291,9 @@ static void draw_vs_omakase(const menu_state *m, float screen_w, float screen_h)
   if (!voted && !vs_omakase_shown(m)) return;
   if (!voted) hud_draw_menu_hidden(screen_w, screen_h, m->key_held == HUD_MENU_HIDDEN);
   const char *s = voted ? "RANDOM AREA SELECTED" : "RANDOM AREA";
-  float px = 2.4f;
+  float px = 3.0f;
   hud_ui_begin(screen_w, screen_h);
-  hud_ui_text(s, 0.5f * (screen_w - hud_ui_text_width(s, px)), 680.0f - 3.5f * px, px, 1.0f, voted ? 0.55f : 1.0f,
+  hud_ui_text(s, 0.5f * (screen_w - hud_ui_text_width(s, px)), MENU_FOOTER_CENTER * (768.0f / 480.0f) - 3.5f * px, px, 1.0f, voted ? 0.55f : 1.0f,
               voted ? 0.1f : 1.0f, 1);
   hud_ui_end();
 }
@@ -2221,7 +2393,7 @@ static void draw_day_select(const menu_state *m, int clock, float fade, int bars
   } else {
     draw_topbar(bars, fade, &title);
   }
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 #if !defined(__ANDROID__) && !defined(WMMT_BGM_TEST)
   if (m->story_day_select) return;
 #endif
@@ -2454,9 +2626,9 @@ static void draw_setting(const menu_state *m, int clock, void (*draw3d)(void *),
     draw_topbar_timed(bars, 1, &title);
     vs_timer(m->vs.tune_timer, bars, 1);
   } else draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
   int hint = anm_sprite(SET_TEXT + 4);
-  if (!bars) anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
+  if (!bars) draw_footer_hint(hint, 0.75f + 0.25f * cosf((float)clock * 0.1f));
 }
 
 /* The setting's sprites (the wheel prompt's too), kept up from the colour select on and
@@ -2493,6 +2665,14 @@ enum {
   O_ALL_ON, O_ALL_OFF /* the colour select's ALL PARTS key */,
   O_HD, O_BLOOM, O_SSAO, O_WET, O_PAINT, O_AA, O_4X, O_2X /* Android's GRAPHICS rows */, O_N
 };
+static void option_set(menu_state *m, int *v, int want) {
+  if (*v == want) return;
+  snd_menu(SND_CURSOR);
+  *v = want;
+  m->garage_changed = 1;
+}
+
+#ifndef __ANDROID__
 #define OPT_CHIP_X 300.0f
 #define OPT_STEER_Y 152.0f /* the rows' middles */
 #define OPT_SENS_Y 182.0f
@@ -2523,13 +2703,6 @@ static int option_chip(const menu_state *m, int first, float y) {
         m->tap_x < x[k] + anm_sprite_width(anm_sprite(OPT_TEXT + first + k)) + SET_CHIP_GAP * 0.5f)
       return k;
   return -1;
-}
-
-static void option_set(menu_state *m, int *v, int want) {
-  if (*v == want) return;
-  snd_menu(SND_CURSOR);
-  *v = want;
-  m->garage_changed = 1;
 }
 
 /* Android's GRAPHICS (hq_rows): two columns of five rows, the chips at x */
@@ -2613,9 +2786,11 @@ static void draw_option_res(const menu_state *m, float screen_w, float screen_h)
   hud_ui_end();
 }
 
+#endif /* legacy options */
+
 #ifdef __ANDROID__
-#define OPT_FPS_Y 390.0f
-#define OPT_FPS_X 190.0f
+#define OPT_FPS_Y 341.0f
+#define OPT_FPS_X 254.0f
 #define OPT_FPS_W 66.0f
 #define OPT_FPS_STEP 74.0f
 static const int OPT_FPS_LIMITS[] = {0, 60, 90, 120};
@@ -2633,18 +2808,6 @@ static void option_fps_step(menu_state *m) {
   }
 }
 
-static void draw_option_fps(const menu_state *m, float screen_w, float screen_h) {
-  const float k = 1.6f, size = 2.0f, y = OPT_FPS_Y * k;
-  hud_ui_begin(screen_w, screen_h);
-  hud_ui_text("FRAME RATE LIMIT", 16.0f * k, y - 3.5f * size, size, 1, 1, 1, 1);
-  for (int i = 0; i < 4; ++i) {
-    float x = (OPT_FPS_X + i * OPT_FPS_STEP) * k, width = OPT_FPS_W * k;
-    hud_ui_button(x, y - 10.0f * k, width, 20.0f * k, m->frame_rate_limit == OPT_FPS_LIMITS[i]);
-    const char *label = OPT_FPS_LABELS[i];
-    hud_ui_text(label, x + (width - hud_ui_text_width(label, size)) * 0.5f, y - 3.5f * size, size, 1, 1, 1, 1);
-  }
-  hud_ui_end();
-}
 #endif
 
 /* ---- the OPTION screen's KEY LAYOUT (MENU_LAYOUT, Allan 10-29: the touch keys' size and
@@ -2665,7 +2828,6 @@ static const float LAY_BUTTON[LAY_BUTTONS][4] = {
   { 296, 418, 204, 38 }, { 524, 418, 204, 38 }, { 296, 506, 432, 45 },
   { 296, 585, 432, 22 }, { 296, 554, 80, 25 }, { 648, 554, 80, 25 }
 };
-static const float OPT_LAYOUT_KEY[4] = { 446, 110, 176, 26 };
 #define LAY_K_STEP 10
 static int layout_button(float x, float y) {
   for (int b = 0; b < LAY_BUTTONS; ++b) {
@@ -2934,7 +3096,6 @@ static const float LAY_BUTTON[LAY_BUTTONS][4] = { { 296, 356, 110, 56 }, { 618, 
                                                   { 524, 426, 204, 56 } };
 static const char *const LAY_GROUP[3] = { "TOP KEYS", "LEFT KEYS", "RIGHT KEYS" };
 /* the OPTION screen's key to it (640 x 480) */
-static const float OPT_LAYOUT_KEY[4] = { 446, 110, 176, 26 };
 #define LAY_K_STEP 10
 
 static int layout_button(float x, float y) {
@@ -3058,6 +3219,10 @@ static void draw_layout(const menu_state *m, int clock, float screen_w, float sc
 
 #endif /* Android extended layout editor */
 
+#ifdef __ANDROID__
+#include "menu_option_pages.inc"
+#else
+static const float OPT_LAYOUT_KEY[4] = { 446, 110, 176, 26 };
 /* the OPTION screen's key to KEY LAYOUT (its words the HUD's, over the bars like RESOLUTION's) */
 static void draw_option_layout_key(const menu_state *m, float screen_w, float screen_h) {
   const float *r = OPT_LAYOUT_KEY, k = 1.6f;
@@ -3082,9 +3247,6 @@ static void option_step(menu_state *m, int tap, int key) {
     return;
   }
   if (!tap) return;
-#ifdef __ANDROID__
-  option_fps_step(m);
-#endif
   const float *lk = OPT_LAYOUT_KEY;
   if (m->tap_x >= lk[0] && m->tap_x < lk[0]+lk[2] && m->tap_y >= lk[1] && m->tap_y < lk[1]+lk[3]) { snd_menu(SND_SELECT); layout_enter(m); return; }
   int k = menu_steer_hit(m->tap_x, m->tap_y);
@@ -3163,11 +3325,13 @@ static void draw_option(const menu_state *m, int clock, int bars) {
   if (m->res_row) anm_draw_sprite(anm_sprite(T_SET_BAND), -192.0f, OPT_RES_Y - 20.0f, 0.5f);
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(OPT_TEXT + O_TITLE) };
   draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
   int hint = anm_sprite(OPT_TEXT + O_TILT);
   if (!bars && m->gyro == HUD_STEER_GYRO)
-    anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
+    draw_footer_hint(hint, 0.75f + 0.25f * cosf((float)clock * 0.1f));
 }
+
+#endif /* legacy options */
 
 /* ---- the port's SAVE DATA screen (the arcade keeps a player on a card, checked between
  * START and the car select; the iPad keeps MENU_SAVES saves instead), in the OPTION
@@ -3318,11 +3482,11 @@ static void draw_save(const menu_state *m, int clock, int bars) {
   }
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(SAVE_TEXT + S_TITLE) };
   draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
   int hint = anm_sprite(SAVE_TEXT + (m->save_del ? (m->save_confirm ? S_HINT_DEL_AGAIN + m->save_confirm - 1 : S_HINT_DEL)
                                      : m->save_confirm ? S_HINT_AGAIN + m->save_confirm - 1
                                      : m->save_new ? S_HINT_NEW : S_HINT_LOAD));
-  if (!bars) anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
+  if (!bars) draw_footer_hint(hint, 0.75f + 0.25f * cosf((float)clock * 0.1f));
 }
 
 /* ---- the save's cars: each one of the arcade's cards (clV386CardData: its car, tune,
@@ -3414,6 +3578,7 @@ static void own_clear(menu_state *m, int mk, int c) {
   memset(m->ten_car[mk][c], 0, sizeof m->ten_car[mk][c]);
   m->class_car[mk][c] = 0;
   m->vs_stars_car[mk][c] = m->vs_count_car[mk][c] = 0;
+  m->drive_style_car[mk][c] = 0;
 }
 
 /* the colour select's ALL PARTS key (a new kind of car's card, or one already in the save) */
@@ -3561,7 +3726,7 @@ static void draw_have(const menu_state *m, int clock, float fade, int bars) {
   if (!m->slide) anm_draw_ex(ID.day_ring, z + (m->card_t < 59 ? m->card_t : 59), fade, 0, 0, rings, 2);
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(CARD_TEXT + (m->keep_ask ? C_KEEP_TITLE : C_HAVE_TITLE)) };
   draw_topbar(bars, fade, &title);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 /* ---- GARAGE: the port's look at the save's cars, on the colour select's turntable in the
@@ -3640,7 +3805,7 @@ static void draw_garage(const menu_state *m, int clock, void (*draw3d)(void *), 
   anm_draw_sprite(name, 624.0f - anm_sprite_width(name), 316.0f, 1);
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(CARD_TEXT + C_GARAGE_TITLE) };
   draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
   if (bars) return;
   /* which of them: n/N */
   char num[16];
@@ -3654,7 +3819,7 @@ static void draw_garage(const menu_state *m, int clock, void (*draw3d)(void *), 
     anm_draw_sprite(anm_sprite(T_SET_DIGIT + hp / div % 10), GARAGE_HP_X + 22.0f * (float)i, GARAGE_HP_Y, 1);
   anm_draw_sprite(anm_sprite(T_SET_HP), GARAGE_HP_X + 70.0f, GARAGE_HP_Y + 20.0f, 1);
   int hint = anm_sprite(m->erase_armed ? SAVE_TEXT + S_ERASE_HINT : CARD_TEXT + C_GARAGE_HINT);
-  anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
+  draw_footer_hint(hint, 0.75f + 0.25f * cosf((float)clock * 0.1f));
 }
 
 /* ---- CARD: clSeqCardDisp1, the card's first page ("Card data confirmed (1/9)", the top bar
@@ -3665,7 +3830,8 @@ static void draw_garage(const menu_state *m, int clock, void (*draw3d)(void *), 
  * (0x7da, 0x7db: get_car_model_data +0, +4), the colour (0x7dc, after its swatch in place of
  * 0x1de2), the horsepower (0x7dd), the mileage (0x7de, getOdoCount, "%d km" with commas);
  * the mileage password and the card's plays left (0x7df, 0x7e0) are the arcade card's own.
- * A tap goes on to the car setting. ---- */
+ * Browse with the arrows or skip to the card's existing continuation. ---- */
+enum { CARD_SKIP_ACTION = 5, CARD_DRIVING_STYLE_PAGE = 6 };
 enum {
   T_CARD_NO = 0x58b, T_CARD_NAME = 0x7ff, T_CARD_TITLE = 0x800, T_CARD_CAR1 = 0x7da, T_CARD_CAR2 = 0x7db,
   T_CARD_COLOR = 0x7dc, T_CARD_HP = 0x7dd, T_CARD_ODO = 0x7de, T_CARD_PASS = 0x7df, T_CARD_LIFE = 0x7e0,
@@ -3679,10 +3845,30 @@ static const char *const CARD_PAGE_FRAME[9] = {
   "menu_layout_cardcheck_14_waku", "menu_g_cardcheck_4_waku", "menu_g_cardcheck_5_waku",
   "menu_g_cardcheck_6_waku", "menu_g_cardcheck_7_waku", "menu_g_cardcheck_8_waku"
 };
+
+/* The separately converted scene bank prefixes IDs to coexist with the
+ * complete legacy card-pages.bin. Both carry the same original page art. */
+enum { CARD_STYLE_BANK_BASE = 140000, CARD_STYLE_STARS_UNIT = 149000 };
+
+static int card_page_frame(int page) {
+  int a = anm_find(CARD_PAGE_FRAME[page - 1]);
+  if (page == CARD_DRIVING_STYLE_PAGE && (a < 0 || anm_frames(a) <= 0))
+    a = anm_find("cscene_menu_g_cardcheck_5_waku");
+  return a;
+}
+
+static int card_page_title(int page) {
+  int sid = S_CARD_TOPBAR + page - 1;
+  int title = anm_sprite(sid);
+  if (page == CARD_DRIVING_STYLE_PAGE && title < 0)
+    title = anm_sprite(CARD_STYLE_BANK_BASE + sid);
+  return title;
+}
+
 static int card_page_available(int page) {
   if (page < 1 || page > 9) return 0;
-  int a = anm_find(CARD_PAGE_FRAME[page - 1]);
-  return a >= 0 && anm_frames(a) > 0 && anm_sprite(S_CARD_TOPBAR + page - 1) >= 0;
+  int a = card_page_frame(page);
+  return a >= 0 && anm_frames(a) > 0 && card_page_title(page) >= 0;
 }
 
 static int card_pages_available(void) {
@@ -3719,7 +3905,7 @@ static void card_enter(menu_state *m, int back) {
  * is the frame's last row, under the grid's) */
 #define NAME_TAB_X 183.0f
 #define NAME_TAB_DX 68.0f
-#define NAME_TAB_Y 425.0f
+#define NAME_TAB_Y MENU_FOOTER_CENTER
 #define S_NAME_TOPBAR 6351 /* menu_p_topbar_mes_name_1 */
 #define S_NAME_RING 5587   /* menu_p_name_select_ring */
 
@@ -3841,7 +4027,7 @@ static void draw_name(const menu_state *m, int clock, int bars) {
   }
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_NAME_TOPBAR) };
   draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
   for (int k = 0; k < 5 && !bars; ++k) {
     int lit = k == 4 ? n > 0 : k == m->name_page;
     anm_draw_ex(ID.name_tab[k], lit ? 0 : anm_frames(ID.name_tab[k]) - 1, 1, NAME_TAB_X + NAME_TAB_DX * (float)k,
@@ -4010,7 +4196,9 @@ static void card_notice(const char *text, float x, float y, float fade) {
 static int card_field(int t, float *x, float *y) {
   float r[4];
   if (!anm_sprite_rect(ID.card_layout, 0, anm_sprite(t), r)) return 0;
-  *x = r[0], *y = r[1];
+  /* Card number has its own column and the colour label follows its swatch. */
+  *x = t == T_CARD_NO || t == T_CARD_COLOR ? r[0] : 200.0f;
+  *y = r[1];
   return 1;
 }
 
@@ -4076,9 +4264,8 @@ static void card_choice_sprite(int sid, float x, float y, float w, int selected,
   int s = anm_sprite(sid);
   float sw = anm_sprite_width(s), sh = anm_sprite_height(s);
   if (s < 0 || sw <= 0 || sh <= 0) return;
-  float h = sh * w / sw;
-  if (h > 30) h = 30;
-  const float src[4] = { 0, 0, sw, sh }, dst[4] = { x, y, x + w, y + h };
+  float scale = fminf(w / sw, 30.0f / sh);
+  const float src[4] = { 0, 0, sw, sh }, dst[4] = { x, y, x + sw * scale, y + sh * scale };
   anm_draw_part(s, src, dst, fade * (!available ? 0.22f : selected ? 1.0f : 0.55f));
 }
 static void card_setting_title(const char *name, float fade) {
@@ -4098,15 +4285,15 @@ static void card_settings_draw(const menu_state *m, float fade) {
     for (int i = 0; i < 3; ++i)
       card_choice_sprite(meter[i], 245 + i * 105, 315, 90, menu_card_meter(m) == i,
                          menu_card_choice_available(m, 0, i), fade);
-    card_glyphs(CARD_GLYPH2, "-,", 8, "-", 265, 218, fade);
+    card_glyphs(CARD_GLYPH2, "-,", 8, "-", 245, 218, fade);
     /* Show the actual selected car's selected meter, not a shared generic image. */
     if (m->maker >= 0 && m->maker < CARDB_ALL && m->car >= 0 &&
         m->car < CARDB_NCARS[m->maker]) {
       const cardb_car *c = &CARDB_CARS[m->maker][m->car];
       int color = m->color >= 0 && m->color < c->ncolors ? m->color : 0;
       if (c->ncolors > 0) {
-        int ready = hud_meter_preview(c->colors[color].pack, menu_card_meter(m), 270, 238, 250, 65, fade);
-        card_notice(ready ? "SELECTED" : "NO PREVIEW", 525, 260, fade);
+        int ready = hud_meter_preview(c->colors[color].pack, menu_card_meter(m), 245, 238, 250, 65, fade);
+        card_notice(ready ? "SELECTED" : "NO PREVIEW", 504, 260, fade);
       }
     }
   } else if (m->card_page == 9) {
@@ -4114,24 +4301,72 @@ static void card_settings_draw(const menu_state *m, float fade) {
     card_setting_title("menu_g_cardcheck_8_title_sound", fade);
     card_setting_title("menu_g_cardcheck_8_title_password", fade);
     for (int i = 0; i < 4; ++i)
-      card_choice_sprite(0x180e + i, 230 + i * 85, 145, 70, app_get_bgm_volume() == i, 1, fade);
+      card_choice_sprite(0x180e + i, 245 + i * 85, 145, 70, app_get_bgm_volume() == i, 1, fade);
     for (int i = 0; i < 3; ++i)
       card_choice_sprite(source[i], 245 + i * 105, 210, 90, menu_card_bgm_source(m) == i,
                          menu_card_choice_available(m, 1, i), fade);
-    card_glyphs(CARD_GLYPH2, "-,", 8, "-", 265, 280, fade);
+    card_glyphs(CARD_GLYPH2, "-,", 8, "-", 245, 280, fade);
   }
   if (m->card_save_failed && (m->card_page == 8 || m->card_page == 9)) card_notice("SAVE FAILED", 245, 350, fade);
 }
 
-static void card_number(unsigned value, int sprite_base, float right, float y, float advance, float fade) {
+static float card_number(unsigned value, int sprite_base, float x, float y, float advance, float fade) {
   char text[16];
   snprintf(text, sizeof text, "%u", value);
-  float x = right - advance * (float)(strlen(text) - 1);
   for (const char *digit = text; *digit; ++digit, x += advance) {
     int sprite = anm_sprite(sprite_base + *digit - '0');
     if (sprite < 0) sprite = anm_sprite(CARD_GLYPH2 + *digit - '0');
     anm_draw_sprite(sprite, x, y, fade);
   }
+  return x;
+}
+
+static float card_count(unsigned value, int unit, float x, float y, float fade) {
+  x = card_number(value, 0x488, x, y, 14, fade);
+  anm_draw_sprite(anm_sprite(unit), x + 2, y, fade);
+  return x;
+}
+
+/* clSeqCardDisp6::run (0x87e775c): the same two card fields read by checkAura
+ * move the point from (458,267). These offsets reproduce the original
+ * float multiply/subtract and truncation for all seven values on each axis. */
+static void card_style_draw(const menu_state *m, int clock, float fade) {
+  int mk = m->maker, car = m->car;
+  if (mk < 0 || mk >= CARDB_ALL || car < 0 || car >= CARDB_NCARS[mk]) return;
+
+  int layout = anm_find("menu_layout_cardcheck_5");
+  if (layout >= 0 && anm_frames(layout) > 0) {
+    const anm_swap hidden[] = {
+      { anm_sprite(0x7f5), -1 }, { anm_sprite(0x7f6), -1 }, { anm_sprite(0x5a8), -1 },
+      { anm_sprite(0x6b4), -1 }, { anm_sprite(0x6b5), -1 }, { anm_sprite(0x6b6), -1 },
+      { anm_sprite(0x6b7), -1 }, { anm_sprite(0x6b8), -1 },
+    };
+    anm_draw_ex(layout, 0, fade, 0, 0, hidden, (int)(sizeof hidden / sizeof *hidden));
+  } else {
+    layout = anm_find("cscene_menu_layout_cardcheck_5");
+    if (layout >= 0 && anm_frames(layout) > 0) anm_draw(layout, 0, fade);
+  }
+
+  int pulse = anm_find("menu_g_cardcheck_5_point");
+  if (pulse < 0 || anm_frames(pulse) <= 0) pulse = anm_find("cscene_menu_g_cardcheck_5_point");
+  int frames = anm_frames(pulse);
+  if (layout >= 0 && anm_frames(layout) > 0 && frames > 0) {
+    static const int offset[7] = { -75, -49, -24, 0, 25, 50, 75 };
+    int contact, wall;
+    mileage_style_decode(m->drive_style_car[mk][car], &contact, &wall);
+    anm_draw_ex(pulse, clock % frames, fade, 458 - offset[contact], 267 - offset[wall], NULL, 0);
+  }
+
+  int races = m->vs_count_car[mk][car], stars = m->vs_stars_car[mk][car];
+  float after = card_number(races > 0 ? (unsigned)races : 0, 0x488, 77, 172, 14, fade);
+  int unit = anm_sprite(0x196f);
+  if (unit < 0) unit = anm_sprite(CARD_STYLE_BANK_BASE + 0x196f);
+  if (unit >= 0) anm_draw_sprite(unit, after + 2, 172, fade);
+  else card_notice("BATTLES", after + 4, 178, fade);
+  after = card_number(stars > 0 ? (unsigned)stars : 0, 0x488, 77, 210, 14, fade);
+  unit = anm_sprite(CARD_STYLE_STARS_UNIT);
+  if (unit >= 0) anm_draw_sprite(unit, after + 2, 210, fade);
+  else card_notice("STARS", after + 4, 216, fade);
 }
 
 /* get_story_data (0x88db030), indexed after the arcade's get_story_index. */
@@ -4158,6 +4393,24 @@ static int card_story_portrait(int index, int cleared) {
   if (index == 109) return cleared ? 0x1801 : 0xac0;
   if (index >= 90) index -= 10;
   return (cleared ? 0x1522 : 0x847) + index;
+}
+
+static void card_story_art(int sprite, float x, float y, float fade) {
+  float src[4];
+  if (!anm_sprite_content_rect(sprite, src)) return;
+  /* The 128x64 plate has transparent padding and a shadow. Cover its face,
+   * leaving the edge around the image and drawing the episode number above it. */
+  const float dst[4] = { x - 40, y - 19, x + 37, y + 15 };
+  const float aspect = (dst[2] - dst[0]) / (dst[3] - dst[1]);
+  const float w = src[2] - src[0], h = src[3] - src[1];
+  if (w > h * aspect) {
+    const float inset = (w - h * aspect) * 0.5f;
+    src[0] += inset; src[2] -= inset;
+  } else {
+    const float inset = (h - w / aspect) * 0.5f;
+    src[1] += inset; src[3] -= inset;
+  }
+  anm_draw_part(sprite, src, dst, fade);
 }
 
 /* clSeqCardDisp2::run shows the current division as four rows of five. For the first
@@ -4187,26 +4440,22 @@ static void card_story_draw(const menu_state *m, float fade) {
       else if (!division && i % 5 == 4) visible = ((bits >> (i - 4)) & 15u) == 15u;
     }
     const int index = st_index((int)loop, (int)(division % 5 * 20 + i));
-    int portrait = anm_sprite(visible ? card_story_portrait(index, cleared) : 0x1a51);
-    const int original_portrait = portrait;
-    if (portrait < 0 && visible) portrait = anm_sprite(STORYSEL_IMAGE[index][cleared]);
+    const int show_art = visible && index != 110;
+    int portrait = anm_sprite(show_art ? card_story_portrait(index, cleared) : 0x1a51);
+    if (portrait < 0 && show_art) portrait = anm_sprite(STORYSEL_IMAGE[index][cleared]);
     const float x = 105.0f + 108.0f * (float)(i % 5), y = 170.0f + 60.0f * (float)(i / 5);
     const anm_swap cell[] = {
-      { anm_sprite(0x1f54), original_portrait }, { anm_sprite(0x1f97), original_portrait },
+      { anm_sprite(0x1f54), show_art ? -1 : portrait }, { anm_sprite(0x1f97), show_art ? -1 : portrait },
       { anm_sprite(0x1c16), visible ? anm_sprite(CARD_STORY_RAMPS[index]) : -1 },
       { anm_sprite(0x1e81), -1 }, { anm_sprite(0x1e82), -1 }, { anm_sprite(0x1e83), -1 },
       { anm_sprite(0x1e84), -1 }, { anm_sprite(0x1e85), -1 },
     };
     anm_draw_ex(row_anim, cleared, fade, x, y, cell, 8);
-    /* Older sidecars may lack the small card portraits but still carry the story selection art. */
-    if (original_portrait < 0 && portrait >= 0) {
-      float w = anm_sprite_width(portrait), h = anm_sprite_height(portrait);
-      const float src[4] = { 0, 0, w, h }, dst[4] = { x - 25, y - 19, x + 40, y + 11 };
-      if (w > 0 && h > 0) anm_draw_part(portrait, src, dst, fade);
-    } else if (portrait < 0 && !visible) card_notice("?", x - 4, y - 13, fade);
+    if (show_art) card_story_art(portrait, x, y, fade);
+    else if (portrait < 0) card_notice("?", x - 4, y - 13, fade);
     unsigned episode = division * 20 + i + 1;
     if (episode > 99999) episode = 99999;
-    card_number(episode, 0x1204, x + 7, y - 1, 12, fade);
+    card_number(episode, 0x1204, x - 34, y - 1, 12, fade);
   }
   /* The arcade had a separate clear-total field. Cinder's older saves retain the
    * active division's clear bits only, so use them for the total in division one. */
@@ -4214,20 +4463,17 @@ static void card_story_draw(const menu_state *m, float fade) {
     unsigned cleared = 0;
     for (unsigned i = 0; i < 20; ++i) cleared += (bits >> i) & 1u;
     anm_draw_sprite(anm_sprite(0xabd), 371, 116, fade);
-    anm_draw_sprite(anm_sprite(0x11ef), 553, 116, fade);
-    card_number(cleared, 0x488, 538, 116, 14, fade);
+    card_count(cleared, 0x11ef, 488, 116, fade);
   }
   anm_draw_sprite(anm_sprite(0x1518), 378, 96, fade);
-  anm_draw_sprite(anm_sprite(0x151a), 546, 96, fade);
-  card_number(loop < 1000 ? loop + 1 : 1000, 0x488, 524, 96, 14, fade);
+  card_count(loop < 1000 ? loop + 1 : 1000, 0x151a, 488, 96, fade);
   if (m->maker >= 0 && m->maker < CARDB_ALL && m->car >= 0 && m->car < CARDB_NCARS[m->maker]) {
     int streak = m->st_streak_car[m->maker][m->car];
     int label = anm_sprite(0x1800);
     if (streak > 0 && label >= 0) {
       anm_draw_sprite(anm_sprite(0xabe), 271, 97, fade);
       anm_draw_sprite(label, 258, 99, fade);
-      anm_draw_sprite(anm_sprite(0x11ee), 348, 112, fade);
-      card_number((unsigned)streak, 0x488, 331, 116, 14, fade);
+      card_count((unsigned)streak, 0x11ee, 270, 116, fade);
     }
   }
 }
@@ -4236,30 +4482,49 @@ static void card_ghost_draw(const menu_state *m, float fade) {
   const menu_card_ghost_stats *stats = &m->card_ghost_stats;
   int level = m->dress_lv[m->maker][m->car];
   char text[24];
-  card_notice("LV", 215, 154, fade);
-  card_number((unsigned)(level < 0 ? 0 : level), 0x488, 261, 151, 14, fade);
+  const float x = 215;
+  card_notice("LV", x, 154, fade);
+  card_number((unsigned)(level < 0 ? 0 : level), 0x488, x + 24, 151, 14, fade);
   if (level < 63) {
     snprintf(text, sizeof text, "%u/1000", (unsigned)m->dress_points[m->maker][m->car]);
-    card_notice(text, 218, 178, fade);
+    card_notice(text, x, 178, fade);
   }
   if (stats->races) {
-    card_number(stats->races > 999999 ? 999999 : stats->races, 0x488, 285, 207, 14, fade);
-    anm_draw_sprite(anm_sprite(0x196f), 298, 207, fade);
-    card_number(stats->wins > 999999 ? 999999 : stats->wins, 0x488, 402, 207, 14, fade);
-    anm_draw_sprite(anm_sprite(0x1970), 419, 207, fade);
+    float end = card_count(stats->races, 0x196f, x, 207, fade);
+    card_count(stats->wins, 0x1970, end + 36, 207, fade);
   } else {
-    anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 215, 207, fade);
+    anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), x, 207, fade);
   }
-  card_number(stats->coins, 0x488, 285, 260, 14, fade);
-  anm_draw_sprite(anm_sprite(0x492), 303, 260, fade);
-  static const int crown_frames[8] = { 0x1b59, 0x1b5e, 0x1b5f, 0x1b60, 0x1b5c, 0x1b5d, 0x1b5b, 0x1b5a };
+  card_count(stats->coins, 0x492, x, 260, fade);
+  /* Original clSeqCardDisp3::run swaps these pairs in raw clEffAreaType order.
+   * In the layout the last two positions are area 7 (Fukuoka), then 6 (Hakone). */
+  static const int crown_sprites[8][2] = {
+    {0x1b59, 0x11fc}, {0x1b5e, 0x1201}, {0x1b5f, 0x1202}, {0x1b60, 0x1203},
+    {0x1b5c, 0x11ff}, {0x1b5d, 0x1200}, {0x1b5b, 0x11fe}, {0x1b5a, 0x11fd},
+  };
+  const int layout = anm_find("menu_layout_cardcheck_3_crown");
   anm_swap crowns[8];
+  unsigned recolor = 0;
   for (unsigned area = 0; area < 8; ++area) {
-    int frame = anm_sprite(crown_frames[area]);
-    int earned = anm_sprite(0x11fc + (int)area);
-    crowns[area] = (anm_swap){ frame, (stats->crown_mask & (1u << area)) && earned >= 0 ? earned : frame };
+    int frame = anm_sprite(crown_sprites[area][0]);
+    int owned = stats->crown_mask & (1u << area);
+    int earned = owned ? anm_sprite(crown_sprites[area][1]) : frame;
+    if (owned && earned < 0) recolor |= 1u << area;
+    crowns[area] = (anm_swap){ frame, earned };
   }
-  anm_draw_ex(anm_find("menu_layout_cardcheck_3_crown"), 0, fade, 0, 0, crowns, 8);
+  anm_draw_ex(layout, 0, fade, 0, 0, crowns, 8);
+  /* Existing prepared packs have only the grey emblems, drawn at 30% alpha.
+   * Use their own silhouettes and restore opacity with a warm highlight. */
+  const float tint[4] = { 1.0f, 0.76f, 0.32f, fade * (255.0f / 77.0f) };
+  const float light[4] = { 0.12f, 0.09f, 0.03f, 0 };
+  for (unsigned area = 0; area < 8; ++area) {
+    if (!(recolor & (1u << area))) continue;
+    int sprite = crowns[area].from;
+    float dst[4];
+    if (!anm_sprite_rect(layout, 0, sprite, dst)) continue;
+    const float src[4] = { 0, 0, anm_sprite_width(sprite), anm_sprite_height(sprite) };
+    anm_draw_part_col(sprite, src, dst, tint, light);
+  }
 }
 
 static int card_ghost_match_logo(uint32_t model) {
@@ -4273,11 +4538,11 @@ static int card_ghost_match_logo(uint32_t model) {
 
 static void card_defense_draw(const menu_card_ghost_stats *stats, float fade) {
   if (!stats->defense_races) {
-    anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 260, 220, fade);
+    anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 48, 150, fade);
     return;
   }
-  card_number(stats->defense_races > 999999 ? 999999 : stats->defense_races, 0x493, 442, 130, 14, fade);
-  card_number(stats->defense_wins > 999999 ? 999999 : stats->defense_wins, 0x493, 554, 130, 14, fade);
+  float end = card_count(stats->defense_races > 999999 ? 999999 : stats->defense_races, 0x196f, 288, 130, fade);
+  card_count(stats->defense_wins > 999999 ? 999999 : stats->defense_wins, 0x1970, end + 36, 130, fade);
   static const char *const area_names[8] = { "C1", "BELT", "WANGAN", "YOKOHANE", "NAGOYA", "OSAKA", "HAKONE", "FUKUOKA" };
   const int row_anim = anm_find("menu_g_cardcheck_14_data");
   int sprites[32], count = anm_sprites(row_anim, sprites, 32);
@@ -4286,7 +4551,7 @@ static void card_defense_draw(const menu_card_ghost_stats *stats, float fade) {
   for (int k = 0; k < count && k < 32; ++k) {
     int sid = anm_sprite_id(sprites[k]);
     if ((sid < 0x9ec || sid > 0x9f5) && sid != 0x1bf2 && sid != 0x1bf3 &&
-        sid != 0x171c && sid != 0x13c3 && sid != 0xed6 && sid != 0xed4)
+        sid != 0x171c && sid != 0x13c3 && sid != 0xed6)
       swaps[n++] = (anm_swap){ sprites[k], -1 };
   }
   for (unsigned i = 0; i < stats->defense_recent_count && i < MENU_CARD_GHOST_RECENT; ++i) {
@@ -4308,7 +4573,6 @@ static void card_defense_draw(const menu_card_ghost_stats *stats, float fade) {
       swaps[row_count++] = (anm_swap){ anm_sprite(0x171c), -1 };
       swaps[row_count++] = (anm_swap){ anm_sprite(0x13c3), -1 };
     }
-    if (match->hp <= 0) swaps[row_count++] = (anm_swap){ anm_sprite(0xed4), -1 };
     anm_draw_ex(row_anim, 0, fade, 319, y, swaps, row_count);
     char text[32];
     if (match->has_gap) {
@@ -4326,24 +4590,28 @@ static void card_defense_draw(const menu_card_ghost_stats *stats, float fade) {
     int logo = card_ghost_match_logo(match->raw_model);
     float w = anm_sprite_width(logo), h = anm_sprite_height(logo);
     if (w > 0 && h > 0) {
-      float scale = fminf(128.0f / w, 25.0f / h), x = 236.0f - w * scale * 0.5f;
+      float scale = fminf(109.0f / w, 22.0f / h), x = 171.0f;
       const float src[4] = { 0, 0, w, h }, dst[4] = { x, y - h * scale * 0.5f, x + w * scale, y + h * scale * 0.5f };
       anm_draw_part(logo, src, dst, fade);
     }
     if (match->area >= 0 && match->area < 8) card_notice(area_names[match->area], 287, y - 7, fade);
-    if (match->hp > 0) card_number((unsigned)match->hp, 0x9ec, 407, y - 8, 8, fade);
+    if (match->hp > 0) {
+      float unit = card_number((unsigned)match->hp, 0x9ec, 390, y - 8, 8, fade);
+      anm_draw_sprite(anm_sprite(0xed4), unit, y - 7, fade);
+    }
   }
 }
 
 static void draw_card(const menu_state *m, int clock, float fade, int bars) {
   if (m->card_page > 1 && m->card_page <= 9 && card_page_available(m->card_page)) {
-    int a = anm_find(CARD_PAGE_FRAME[m->card_page - 1]);
+    int a = card_page_frame(m->card_page);
     int sprites[256], n = anm_sprites(a, sprites, 256), count = 0;
     anm_swap hidden[256];
     /* Only the known structural border/heading/labels are safe. In particular,
      * the page 14 animation contains literal example digits and font glyphs. */
     for (int i = 0; i < n && i < 256; ++i) {
       int id = anm_sprite_id(sprites[i]);
+      if (m->card_page == CARD_DRIVING_STYLE_PAGE && id >= CARD_STYLE_BANK_BASE) id -= CARD_STYLE_BANK_BASE;
       int safe = id == 0x8bd || id == 0x8bc || id == 0xacb || id == 0xacc ||
                  id == 0xacd || id == 0xacf || id == 0xad2 || id == 0xad3 ||
                  id == 0xc4e || id == 0xc54 || id == 0xc55 || id == 0xc56 || id == 0x8aa;
@@ -4351,7 +4619,7 @@ static void draw_card(const menu_state *m, int clock, float fade, int bars) {
        * matrix has different rows, so retaining it overlaps and mislabels them. */
       if (m->card_page == 5 && id == 0x8aa) safe = 0;
       if (m->card_page == 4 && m->card_ghost_stats.defense_races)
-        safe |= id == 0xed5 || id == 0x196f || id == 0x1970 || id == 0xab7;
+        safe |= id == 0xed5 || id == 0xab7;
       if (!safe) hidden[count++] = (anm_swap){ sprites[i], -1 };
     }
     draw_back(ID.bg, clock % 600, fade);
@@ -4365,9 +4633,9 @@ static void draw_card(const menu_state *m, int clock, float fade, int bars) {
       int value = 0;
       for (int i = 0; i < 10; ++i) for (int j = 0; j < 10; ++j)
         value += m->ten_result[i][j] == 3;
-      char text[24]; snprintf(text, sizeof text, "%d", value);
-      anm_draw_sprite(anm_sprite(SAVE_TEXT + S_MEDALS), 155, 135, fade);
-      save_glyphs(text, 390, 135, fade);
+      int label = anm_sprite(SAVE_TEXT + S_MEDALS);
+      anm_draw_sprite(label, 125, 135, fade);
+      card_number((unsigned)value, 0x488, 133 + anm_sprite_width(label), 135, 14, fade);
       /* Ten route rows and ten standard levels: B/S/G are recorded medal values. */
       card_notice("LOCAL ROUTE    LEVEL 1 TO 10", 125, 160, fade);
       static const unsigned char menu_to_record[10] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 8}; /* TEN_ORDER */
@@ -4385,21 +4653,8 @@ static void draw_card(const menu_state *m, int clock, float fade, int bars) {
           }
         }
       }
-    } else if (m->card_page == 6 && m->maker >= 0 && m->maker < CARDB_ALL &&
-               m->car >= 0 && m->car < CARDB_NCARS[m->maker]) {
-      /* These are this port's local counters; old saves may lack the fields,
-       * so a zero is shown as unknown rather than invented match history. */
-      int mk = m->maker, c = m->car;
-      const int values[3] = {m->vs_count_car[mk][c], m->vs_wins_car[mk][c], m->vs_stars_car[mk][c]};
-      const char *labels[3] = {"LOCAL VS RACES", "LOCAL VS WINS", "LOCAL VS STARS"};
-      for (int i = 0; i < 3; ++i) {
-        float y = 165.0f + 55.0f * i;
-        card_notice(labels[i], 155, y, fade);
-        if (values[i] > 0) {
-          char text[24]; snprintf(text, sizeof text, "%d", values[i]);
-          save_glyphs(text, 390, y, fade);
-        } else card_glyphs(CARD_GLYPH2, "-,", 8.0f, "-", 390, y, fade);
-      }
+    } else if (m->card_page == CARD_DRIVING_STYLE_PAGE) {
+      card_style_draw(m, clock, fade);
     } else if (m->card_page == 7 && m->maker >= 0 && m->maker < CARDB_ALL &&
                m->car >= 0 && m->car < CARDB_NCARS[m->maker] && m->color >= 0 &&
                m->color < CARDB_CARS[m->maker][m->car].ncolors) {
@@ -4410,26 +4665,23 @@ static void draw_card(const menu_state *m, int clock, float fade, int bars) {
       };
       int pack = CARDB_CARS[m->maker][m->car].colors[m->color].pack;
       card_notice("TIME ATTACK", 125, 108, fade);
-      card_notice("LOCAL MODEL BEST  MIN SEC MS", 150, 145, fade);
+      card_notice("LOCAL MODEL BEST  MIN SEC MS", 125, 145, fade);
       for (int course = 0; course < CAR_COURSES; ++course) {
-        float x = course < 6 ? 115 : 355, y = 178.0f + 28.0f * (course % 6);
+        float x = course < 6 ? 125 : 342, y = 178.0f + 28.0f * (course % 6);
         card_notice(labels[course], x, y, fade);
         int ms = app_model_ta_best_ms(pack, course);
         if (ms > 0) {
           char text[24]; snprintf(text, sizeof text, "%d:%02d:%03d", ms / 60000, ms / 1000 % 60, ms % 1000);
-          save_glyphs(text, x + 92, y, fade);
-        } else card_glyphs(CARD_GLYPH2, "-,", 8.0f, "-", x + 92, y, fade);
+          save_glyphs(text, x + 83, y, fade);
+        } else card_glyphs(CARD_GLYPH2, "-,", 8.0f, "-", x + 83, y, fade);
       }
     } else {
       /* Unknown records are not represented as a zero or an example record. */
-      anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 260, 220, fade);
-      card_glyphs(CARD_GLYPH2, "-,", 8.0f, "-", 320, 245, fade);
+      anm_draw_sprite(anm_sprite(SAVE_TEXT + S_NO_DATA), 125, 145, fade);
     }
-    anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_CARD_TOPBAR + m->card_page - 1) };
+    anm_swap title = { anm_sprite(T_TOPBAR_MES), card_page_title(m->card_page) };
     draw_topbar(bars, fade, &title);
-    anm_draw(ID.bottom, bars, fade);
-    int hint = anm_sprite(CARD_TEXT + C_CARD_HINT);
-    if (!bars && hint >= 0) anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, fade);
+    draw_bottombar(bars, fade);
     return;
   }
   const menu_own *o = &m->own[m->own_sel >= 0 ? m->own_sel : 0];
@@ -4502,14 +4754,13 @@ static void draw_card(const menu_state *m, int clock, float fade, int bars) {
     }
     text[j] = 0;
     x = card_glyphs(CARD_GLYPH2, "-,", 8.0f, text, x, y, fade);
-    anm_draw_sprite(anm_sprite(CARD_TEXT + C_KM), x + 8.0f, y, fade);
+    anm_draw_sprite(anm_sprite(CARD_TEXT + C_KM), x + 2.0f, y, fade);
   }
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_CARD_TOPBAR) };
   draw_topbar(bars, fade, &title);
-  anm_draw(ID.bottom, bars, fade);
-  if (!card_pages_available()) card_notice("PAGES UNAVAILABLE", 245, 385, fade);
-  int hint = anm_sprite(CARD_TEXT + C_CARD_HINT);
-  if (!bars) anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, fade * (0.75f + 0.25f * cosf((float)clock * 0.1f)));
+  draw_bottombar(bars, fade);
+  if (!card_pages_available() && !card_page_available(CARD_DRIVING_STYLE_PAGE))
+    card_notice("PAGES UNAVAILABLE", 245, 385, fade);
 }
 
 /* ---- the race's pause menu: the arcade's continue dialog (clSeqContinueThread sets up
@@ -4813,6 +5064,8 @@ static void result_setup(const menu_state *m) {
 }
 
 void menu_finish_open(menu_state *m, int goal, const menu_result *res) {
+  m->mileage.active = 0;
+  m->crown_award.active = 0;
   m->finish = 1;
   m->finish_goal = goal != 0;
   m->finish_wait = goal ? FINISH_GOAL_WAIT : FINISH_TIMEUP_WAIT;
@@ -4825,6 +5078,19 @@ void menu_finish_open(menu_state *m, int goal, const menu_result *res) {
     m->result = *res;
     result_setup(m);
   }
+}
+
+void menu_ta_finish_records(menu_state *m, const uint32_t best_ms[3], unsigned rank, unsigned flags) {
+  menu_result *r=&m->result;
+  r->course_record=((float)best_ms[0]+0.5f)*0.001f;
+  r->car_record=((float)best_ms[1]+0.5f)*0.001f;
+  r->personal=((float)best_ms[2]+0.5f)*0.001f;
+  r->new_course=!!(flags&1u);
+  r->new_car=!!(flags&2u);
+  r->new_personal=!!(flags&4u);
+  r->rank=(int)rank;
+  r->cloud_status=MENU_TA_RESULT_ONLINE;
+  result_setup(m);
 }
 
 void menu_finish_vs(menu_state *m, int place, int n) {
@@ -5209,9 +5475,90 @@ static int congrats_at(const menu_result *r) {
   return r->new_course ? RES_COURSE_BEST : r->new_car ? RES_CAR_BEST : r->new_personal ? RES_PERSONAL : -1;
 }
 
+enum { MILEAGE_COUNT_TICKS = 5, MILEAGE_HOLD_TICKS = 300, MILEAGE_FADE_TICKS = 10 };
+
+static int mileage_km(double metres) {
+  if (!isfinite(metres) || metres <= 0.0) return 0;
+  return (int)fmin(metres / 1000.0, 16777215.0); /* the original card's 24-bit km field */
+}
+
+void menu_finish_set_mileage(menu_state *m, double before_m, double after_m) {
+  if (!m->finish) return;
+  m->mileage.total_km = mileage_km(before_m);
+  m->mileage.remaining_km = mileage_km(after_m) - m->mileage.total_km;
+  if (m->mileage.remaining_km < 0) m->mileage.remaining_km = 0;
+  m->mileage.hold = m->mileage.fade_out = 0;
+  m->mileage.active = 1;
+}
+
+static void mileage_step(menu_state *m, int tap) {
+  if (m->mileage.fade_out) {
+    if (++m->mileage.fade_out > MILEAGE_FADE_TICKS) {
+      m->mileage.active = 0;
+      back_from_race(m, 0);
+    }
+    return;
+  }
+  if (m->t <= MILEAGE_FADE_TICKS) return;
+  if (m->mileage.remaining_km > 0) {
+    if (tap) {
+      m->mileage.total_km += m->mileage.remaining_km;
+      m->mileage.remaining_km = 0;
+    } else if ((m->t - MILEAGE_FADE_TICKS - 1) % MILEAGE_COUNT_TICKS == 0) {
+      snd_effect("odo_count", 1.0f);
+      ++m->mileage.total_km;
+      --m->mileage.remaining_km;
+    }
+    return;
+  }
+  if (tap || ++m->mileage.hold >= MILEAGE_HOLD_TICKS) m->mileage.fade_out = 1;
+}
+
+enum { CROWN_AWARD_FADE = 10, CROWN_AWARD_REVEAL = 47, CROWN_AWARD_MOVE = 191,
+       CROWN_AWARD_LAND = 222, CROWN_AWARD_NORMAL = 341, CROWN_AWARD_ALL = 471,
+       CROWN_RESULT_WAIT = 120 };
+
+void menu_finish_set_crown_award(menu_state *m, int area, unsigned owned, int pending) {
+  if (!m->finish || m->finish_ghost != MENU_GHOST_RESULT_WIN || !m->finish_goal ||
+      (unsigned)area >= MENU_GHOST_DIRECTORY_AREAS) return;
+  m->crown_award.area = area;
+  m->crown_award.owned = owned & ((1u << MENU_GHOST_DIRECTORY_AREAS) - 1u);
+  m->crown_award.pending = pending != 0;
+  m->crown_award.active = 1;
+}
+
+static int crown_award_all(const menu_state *m) {
+  return !m->crown_award.pending &&
+         (m->crown_award.owned | (1u << m->crown_award.area)) == (1u << MENU_GHOST_DIRECTORY_AREAS) - 1u;
+}
+
+static void finish_continue(menu_state *m) {
+  if (m->mileage.active && m->finish_story != 3) {
+    go(m, MENU_MILEAGE);
+    m->tap = m->key = m->back = m->key_held = 0;
+  } else back_from_race(m, 0);
+}
+
+static void crown_award_step(menu_state *m) {
+  int t = m->t - CROWN_AWARD_FADE;
+  if (t == CROWN_AWARD_MOVE) snd_menu(SND_FINISH); /* original one-shot 0x24 */
+  if (t == CROWN_AWARD_LAND) snd_menu(SND_RESULT_PASS); /* original one-shot 0x36 */
+  int end = crown_award_all(m) ? CROWN_AWARD_ALL : CROWN_AWARD_NORMAL;
+  if (t >= end + CROWN_AWARD_FADE) {
+    m->crown_award.active = 0;
+    finish_continue(m);
+  }
+}
+
 static int finish_leave(menu_state *m) {
   m->finish = m->finish_out = 0;
-  back_from_race(m, 0);
+  if (m->crown_award.active && !m->crown_award.pending) {
+    go(m, MENU_CROWN_AWARD);
+    m->tap = m->key = m->back = m->key_held = 0;
+  } else {
+    m->crown_award.active = 0;
+    finish_continue(m);
+  }
   return MENU_LEAVE;
 }
 
@@ -5253,6 +5600,8 @@ int menu_finish_update(menu_state *m, float dt) {
       st_result_step(m, t);
       if (t >= ST_RES_LEN) {
         snd_menu_loop(SND_TUNING_BAR, 0);
+        if (m->crown_award.active && m->crown_award.pending && t < ST_RES_LEN + CROWN_RESULT_WAIT)
+          continue;
         m->finish_out = 1;
       }
       continue;
@@ -5269,17 +5618,18 @@ int menu_finish_update(menu_state *m, float dt) {
 
 static void draw_result(const menu_state *m, int t) {
   const menu_result *r = &m->result;
+  int pending=r->cloud_status==MENU_TA_RESULT_PENDING;
   if (t < RES_FINISH_LEN) anm_draw(ID.finish[1], t, 1);
   if (t >= RES_COURSE) anm_draw_ex(ID.res_course, 0, 1, 0, 0, RES.course, 2);
   static const int AT[3] = { RES_COURSE_BEST, RES_CAR_BEST, RES_PERSONAL };
   const int news[3] = { r->new_course, r->new_car, r->new_personal };
   for (int k = 0; k < 3; ++k) {
-    if (t < AT[k]) continue;
+    if (pending || t < AT[k]) continue;
     /* a new record's row loops (its NEW mark pulses), the others play once and hold */
     int f = t - AT[k];
     anm_draw_ex(ID.res_best[k], news[k] ? f % RES_ROW_LEN : f < RES_ROW_LEN ? f : RES_ROW_LEN - 1, 1, 0, 0, RES.best[k], 8);
   }
-  int c = congrats_at(r);
+  int c = pending ? -1 : congrats_at(r);
   if (c >= 0 && t >= c) {
     c = t - c;
     anm_draw(ID.res_congrats, c < RES_CONGRATS_LEN ? c : RES_CONGRATS_LOOP + (c - RES_CONGRATS_LEN) % (RES_CONGRATS_LEN - RES_CONGRATS_LOOP), 1);
@@ -5297,7 +5647,12 @@ static void draw_result(const menu_state *m, int t) {
   if (t >= RES_SPEED) {
     anm_draw_ex(ID.res_speed, 0, 1, 0, 0, RES.speed, 3);
     /* the ranking only for a place in the top 100 (the password only with a card) */
-    if (r->rank >= 1 && r->rank <= 100) anm_draw_ex(ID.res_rank, 0, 1, 0, 0, RES.rank, 3);
+    if (!pending && r->rank >= 1 && r->rank <= 100) anm_draw_ex(ID.res_rank, 0, 1, 0, 0, RES.rank, 3);
+  }
+  if (t >= RES_COURSE_BEST) {
+    const char *source = pending ? "SYNCING ONLINE RECORDS" :
+        r->cloud_status==MENU_TA_RESULT_ONLINE ? "ONLINE RANKING" : "LOCAL RECORDS";
+    ta_ui_notice(source,1.0f);
   }
 }
 
@@ -5760,23 +6115,29 @@ static void draw_chapters(const menu_state *m, float screen_w, float screen_h) {
   hud_ui_end();
 }
 
-/* ---- the time attack's TRAFFIC key: the course select's bottom bar, in its middle (as
- * UNLOCK ALL CHAPTERS), a tap turns the traffic on or off for the race ---- */
+/* Centered footer button for Traffic and card confirmation. */
+static const float FOOTER_BUTTON[4] = { 205.0f, MENU_FOOTER_CENTER - 17.5f, 230.0f, 35.0f };
+
 static int traffic_tap(menu_state *m) {
-  if (!ch_hit(m, CH_KEY)) return 0;
+  if (!ch_hit(m, FOOTER_BUTTON)) return 0;
   snd_menu(SND_CURSOR);
   m->ta_traffic = !m->ta_traffic;
   m->options_dirty = 1;
   return 1;
 }
-static void draw_traffic(const menu_state *m, float screen_w, float screen_h) {
+static void draw_footer_button(const char *text, float screen_w, float screen_h, int held, float green, float blue) {
   const float k = 1.6f, px = 3.0f;
-  const char *t = m->ta_traffic ? "TRAFFIC: ON" : "TRAFFIC: OFF";
+  const float *r = FOOTER_BUTTON;
   hud_ui_begin(screen_w, screen_h);
-  hud_ui_button(CH_KEY[0] * k, CH_KEY[1] * k, CH_KEY[2] * k, CH_KEY[3] * k, 0);
-  hud_ui_text(t, (CH_KEY[0] + 0.5f * CH_KEY[2]) * k - 0.5f * hud_ui_text_width(t, px), (CH_KEY[1] + 0.5f * CH_KEY[3]) * k - 3.5f * px, px,
-              1, m->ta_traffic ? 0.8f : 1, m->ta_traffic ? 0.3f : 1, 1);
+  hud_ui_button(r[0] * k, r[1] * k, r[2] * k, r[3] * k, held);
+  hud_ui_text(text, (r[0] + 0.5f * r[2]) * k - 0.5f * hud_ui_text_width(text, px),
+              (r[1] + 0.5f * r[3]) * k - 3.5f * px, px, 1, green, blue, 1);
   hud_ui_end();
+}
+
+static void draw_traffic(const menu_state *m, float screen_w, float screen_h) {
+  draw_footer_button(m->ta_traffic ? "TRAFFIC: ON" : "TRAFFIC: OFF", screen_w, screen_h,
+                     0, m->ta_traffic ? 0.8f : 1, m->ta_traffic ? 0.3f : 1);
 }
 
 static void st_step(menu_state *m, int tap, int key) {
@@ -6131,7 +6492,7 @@ static void draw_st_tune(const menu_state *m, int clock, float fade, int bars) {
   anm_draw_ex(ID.st_tune_serifu, 12, fade, 0, 0, ln, 4);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), top > 0 ? anm_sprite(top) : -1 };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 static void draw_st_level(const menu_state *m, int clock, float fade, int bars) {
@@ -6172,7 +6533,7 @@ static void draw_st_level(const menu_state *m, int clock, float fade, int bars) 
   }
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_MES_LEVEL) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 static void draw_st_rival(const menu_state *m, int clock, float fade, int bars) {
@@ -6231,7 +6592,7 @@ static void draw_st_rival(const menu_state *m, int clock, float fade, int bars) 
   anm_draw_ex(ID.st_rival_ramp, 0, fade, 0, 0, rp, 3);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_MES_RIVAL) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 /* clSeqTaModeSelectThread's spin box puts a car (clSpriteAnimeCarModel, setImageReplace) where
@@ -6401,7 +6762,7 @@ static void draw_ten_level(const menu_state *m, int clock, float fade, int bars)
   }
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_MES_OR_LV) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 void menu_init(menu_state *m) {
@@ -6413,13 +6774,21 @@ void menu_init(menu_state *m) {
   ID.logo = anm_find("menu_g_bg_logo");
   ID.top = anm_find("menu_g_topbar_bar");
   ID.bottom = anm_find("menu_g_bottombar_bar");
+  ID.mileage = anm_find("menu_layout_milage");
+  ID.crown_award_bg = anm_sprite(140000 + 1191);
+  ID.crown_award_title = anm_find("cscene_menu_g_crown_get_title");
+  ID.crown_award_frame = anm_find("cscene_menu_g_crown_waku");
+  ID.crown_award_a = anm_find("cscene_menu_layout_crown_get_a");
+  ID.crown_award_b = anm_find("cscene_menu_layout_crown_get_b");
+  ID.crown_award_message = anm_find("cscene_menu_layout_crown_saikyo");
+  ID.crown_award_complete = anm_find("cscene_menu_layout_crown_saikyo_all");
+  ID.attract_crown_bg = anm_find("cscene_menu_g_crown_bg");
+  ID.attract_crown_panels = anm_find("cscene_menu_g_crown_atract");
   ID.mode = anm_find("menu_layout_ta_carsel");
   ID.mode_ring = anm_find("menu_layout_ta_carsel_ring");
   for (int k = 0; k < 2; ++k) mode_cars[k] = (anm_swap){ anm_sprite(MODE_CAR_TEMPLATE[k]), -1 };
   ID.game = anm_find("menu_layout_mode_sel");
-  ID.game_image = anm_find("menu_layout_mode_image");
   ID.game_ring = anm_find("menu_layout_mode_ring");
-  ID.vs_sel_image = anm_find("menu_layout_mode_sel_3_image");
   ID.vs_course = anm_find("menu_layout_vs_course1");
   ID.vs_icon = anm_find("menu_g_vs_icon");
   ID.vs_icon_omakase = anm_find("menu_g_vs_icon_omakase");
@@ -6722,6 +7091,7 @@ void menu_garage_reset(menu_state *m) {
   memset(m->vs_wins_car, 0, sizeof m->vs_wins_car);
   memset(m->vs_stars_car, 0, sizeof m->vs_stars_car);
   memset(m->vs_count_car, 0, sizeof m->vs_count_car);
+  memset(m->drive_style_car, 0, sizeof m->drive_style_car);
   m->title_n = 0;
   memset(m->name, -1, sizeof m->name);
 }
@@ -6754,12 +7124,14 @@ void menu_open(menu_state *m) {
   m->key = m->key_held = 0;
 }
 
-static int in_attract(const menu_state *m) { return m->screen <= MENU_PROLOGUE; }
+int menu_in_attract(const menu_state *m) {
+  return m->screen<=MENU_PROLOGUE || m->screen==MENU_ATTRACT_CROWNS;
+}
 
 int menu_booting(const menu_state *m) { return m->demo < 0; }
 
 void menu_start(menu_state *m) {
-  if (!in_attract(m) || menu_booting(m)) return;
+  if (!menu_in_attract(m) || menu_booting(m)) return;
   snd_menu(SND_START);
   go(m, MENU_START);
   m->music = 0;
@@ -6769,6 +7141,45 @@ int menu_movie(const menu_state *m) { return m->screen == MENU_MOVIE ? m->demo %
 
 void menu_movie_done(menu_state *m) {
   if (m->screen == MENU_MOVIE) go(m, MENU_TITLE);
+}
+
+static int menu_arrow_keys(const menu_state *m) {
+#ifdef __ANDROID__
+  if (m->deciding) return 0;
+  switch (m->screen) {
+  case MENU_OPTION:
+    return m->opt_page == OPTION_CONTROLS ? HUD_MENU_RIGHT_KEY : HUD_MENU_LEFT_KEY;
+  case MENU_SETTING:
+    return setting_power_selectable(m) ? HUD_MENU_BOTH_KEYS : 0;
+  case MENU_GARAGE:
+    return m->n_own > 1 ? HUD_MENU_BOTH_KEYS : 0;
+  case MENU_BGM:
+    return m->vs.day && m->vs.day_voted ? 0 : HUD_MENU_BOTH_KEYS;
+  case MENU_ST_TUNE:
+    return m->tune.fixed ? 0 : HUD_MENU_BOTH_KEYS;
+  case MENU_TG_AERO: case MENU_TG_PART: case MENU_TG_WHEEL: case MENU_TG_VINYL:
+    return m->tg.n > 1 ? HUD_MENU_BOTH_KEYS : 0;
+  case MENU_VS_AREA:
+    return !m->vs.voted && m->vs.area_final < 0 ? HUD_MENU_BOTH_KEYS : 0;
+  case MENU_CAR: case MENU_SAVE: case MENU_NAME: case MENU_HAVE: case MENU_CARD:
+  case MENU_GAME: case MENU_MODE: case MENU_COURSE: case MENU_TEN_COURSE:
+  case MENU_TEN_LEVEL: case MENU_VS_SEL: case MENU_ST_LEVEL: case MENU_ST_RIVAL:
+  case MENU_TG_SELECT: case MENU_TG_MAKER: case MENU_BODY_COLOR: case MENU_GHOST:
+    return HUD_MENU_BOTH_KEYS;
+  default:
+    return 0;
+  }
+#else
+  switch (m->screen) {
+  case MENU_OPTION: return m->gyro == HUD_STEER_GYRO;
+  case MENU_SETTING: return setting_power_selectable(m);
+  case MENU_GARAGE: return m->n_own > 1;
+  case MENU_MAKER: case MENU_COLOR: return 0;
+  case MENU_ST_TUNE: return !m->tune.fixed;
+  case MENU_TG_AERO: case MENU_TG_PART: case MENU_TG_WHEEL: case MENU_TG_VINYL: return m->tg.n > 1;
+  default: return 1;
+  }
+#endif
 }
 
 void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
@@ -6833,25 +7244,27 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
   if (m->screen == MENU_CARD) {
     int k = hud_menu_key(x, y);
     float px = x * 640.0f / 1024.0f, py = y * 480.0f / 768.0f;
+    const float *skip = FOOTER_BUTTON;
     int action = (k == -1 || k == 1 || k == HUD_MENU_BACK) ? k :
-                 (px >= 220 && px <= 420 && py >= 400 && py <= 455 ? 3 : 0);
+                 (!m->bars && px >= skip[0] && px < skip[0] + skip[2] &&
+                  py >= skip[1] && py < skip[1] + skip[3] ? CARD_SKIP_ACTION : 0);
     if (!action && m->card_page == 8 && py >= 138 && py < 180 && px >= 245 && px < 460)
       action = 10 + (px >= 370);
     if (!action && m->card_page == 8 && py >= 307 && py < 350 && px >= 245 && px < 545) {
       int i = (int)((px - 245) / 105); if (i < 3) action = 20 + i;
     }
-    if (!action && m->card_page == 9 && py >= 138 && py < 185 && px >= 230 && px < 555) {
-      int i = (int)((px - 230) / 85); if (i < 4) action = 30 + i;
+    if (!action && m->card_page == 9 && py >= 138 && py < 185 && px >= 245 && px < 585) {
+      int i = (int)((px - 245) / 85); if (i < 4) action = 30 + i;
     }
     if (!action && m->card_page == 9 && py >= 202 && py < 250 && px >= 245 && px < 545) {
       int i = (int)((px - 245) / 105); if (i < 3) action = 40 + i;
     }
-    if (phase == TOUCH_BEGAN && id && !m->card_touch && !m->deciding && action) {
+    if (phase == TOUCH_BEGAN && id && !m->card_touch && !m->card_action && !m->deciding && action) {
       m->card_touch = id;
       m->card_touch_action = action;
-      m->key_held = action == 3 ? 0 : action;
+      m->key_held = action;
     } else if (id && id == m->card_touch && phase == TOUCH_MOVED) {
-      m->key_held = action == m->card_touch_action && action != 3 ? action : 0;
+      m->key_held = action == m->card_touch_action ? action : 0;
     } else if (id && id == m->card_touch && phase == TOUCH_ENDED) {
       int chosen = action == m->card_touch_action ? action : 0;
       m->card_touch = NULL;
@@ -6859,8 +7272,7 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
       m->key_held = 0;
       if (chosen == HUD_MENU_BACK) m->back = 1;
       else if (chosen == -1 || chosen == 1) m->key = chosen;
-      else if (chosen == 3) m->tap = 1;
-      else if (chosen >= 10) m->card_action = chosen;
+      else if (chosen == CARD_SKIP_ACTION || chosen >= 10) m->card_action = chosen;
     }
     return;
   }
@@ -6887,7 +7299,7 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
   if (phase == TOUCH_ENDED && id && id == m->key_touch) { m->key_touch = 0; if (!m->back_touch) m->key_held = 0; }
   else if (phase == TOUCH_ENDED && !m->back_touch && !m->key_touch) m->key_held = 0;
   if (phase != TOUCH_BEGAN) return;
-  if (in_attract(m)) {
+  if (menu_in_attract(m)) {
     m->tap = 1; /* anywhere: the start button */
     return;
   }
@@ -6947,10 +7359,17 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
   }
   /* the maker and colour screens have no keys: their items are tapped */
   if ((key == 1 || key == -1) && m->screen != MENU_MAKER && m->screen != MENU_COLOR) {
+#ifdef __ANDROID__
+    if (!(menu_arrow_keys(m) & (key < 0 ? HUD_MENU_LEFT_KEY : HUD_MENU_RIGHT_KEY))) return;
+#endif
     m->key = m->key_held = key;
     m->key_touch = id;
     return;
   }
+#ifdef __ANDROID__
+  /* Bottom corners are decorative. Don't pass them to tap-anywhere carousels. */
+  if (menu_arrow_keys(m) && y >= MENU_FOOTER_TOP * (768.0f / 480.0f) && (x < 212 || x > 812)) return;
+#endif
   /* to the arcade's 640x480 screen */
   m->tap_x = x * 640.0f / 1024.0f;
   m->tap_y = y * 480.0f / 768.0f;
@@ -7110,6 +7529,10 @@ const char *menu_wheel_get(int wheel) {
 }
 
 const char *menu_wheel_pack(int wheel, int *set) {
+  if (wheel == MENU_WHEEL_LEMANS) {
+    *set = 0;
+    return "gem_lman_wheel";
+  }
   for (size_t i = 0; wheel > 0 && i < sizeof DRESS_WHEELS / sizeof DRESS_WHEELS[0]; ++i)
     if (DRESS_WHEELS[i].model == wheel - 1) {
       *set = DRESS_WHEELS[i].set;
@@ -7636,7 +8059,7 @@ static void draw_tg_wheel(const menu_state *m, float fade, int bars, void (*draw
   anm_draw(ID.tg_wheel_arrow[mk], (sel == n - 1 ? WHEEL_LEFT_ARROW[mk][win] : 100 * win) + t % 59, fade);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(column ? S_WHEEL_MES : S_WHEEL_MES_ONE) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 /* the decided place worn (wk_s + 4) */
@@ -7869,7 +8292,7 @@ static void draw_tg_vinyl(const menu_state *m, float fade, int bars, void (*draw
   anm_draw(m->tg.gem ? ID.tg_mirror_arrow : ID.tg_vinyl_arrow, arrow + t % 60, fade);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(cols ? S_VINYL_MES_COL : S_VINYL_MES) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 /* the decided sticker worn (wk_s + 4) */
@@ -8087,7 +8510,7 @@ static void draw_tg_select(const menu_state *m, int bars, void (*draw3d)(void *)
   body_tab_draw(m);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_SEL_MES) };
   draw_topbar(bars, 1, &mes);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
 }
 
 /* the chosen kind's screen: the wheel maker select (the gem cars' bar at once), the aero
@@ -8172,7 +8595,7 @@ static void draw_tg_maker(const menu_state *m, int bars) {
   anm_draw(ID.wmaker_sel, tg_maker_frame(m, 0), 1);
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_MAKER_MES) };
   draw_topbar(bars, 1, &mes);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
 }
 
 /* the maker's newest wheel won (where its bar opens), 0 none */
@@ -8909,7 +9332,7 @@ static void draw_shogo(const menu_state *m, int clock) {
     int bars = m->title_out ? 160 + (m->title_out < 10 ? m->title_out : 10) : m->bars ? 188 + m->bars : clock % 160;
     anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(T_SHOGO_MES) };
     draw_topbar(bars, 1, &mes);
-    anm_draw(ID.bottom, bars, 1);
+    draw_bottombar(bars, 1);
   }
   anm_fill(0, 0, 0, 1.0f - fade);
 }
@@ -9230,7 +9653,7 @@ static void draw_tg_part(const menu_state *m, int clock, float fade, int bars, v
   (void)clock;
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(l == 4 && spot ? TG_SPOT_TOPBAR : d->topbar) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 static void draw_tg_aero(const menu_state *m, int clock, float fade, int bars, void (*draw3d)(void *), void *ctx) {
@@ -9251,7 +9674,7 @@ static void draw_tg_aero(const menu_state *m, int clock, float fade, int bars, v
   }
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_TG_TOPBAR) };
   draw_topbar(bars, fade, &mes);
-  anm_draw(ID.bottom, bars, fade);
+  draw_bottombar(bars, fade);
 }
 
 /* MENU_VS shows nearby rooms and hosting controls for LAN, or a managed
@@ -9318,10 +9741,9 @@ void menu_name_ascii(const menu_state *m, char *out, int n) {
 }
 
 /* menupack.py's VS_TEXT_BASE (VERSUS at +0, LAN and ONLINE at +2/+3),
- * VS_ICON_BASE and VS_LINE_BASE (the versus select's discs, tools/vsdiscs.py) */
+ * and VS_ICON_BASE (the versus select's discs, tools/vsdiscs.py) */
 #define VS_TEXT 107000
 #define VS_ICON 107010
-#define VS_LINE 107020
 enum { VS_CONNECT = MENU_VS_FOUND, VS_RAMP_L, VS_RAMP_R, VS_KM_L, VS_KM_R, VS_START, VS_BUTTONS };
 #define VS_LEFT 60.0f
 #define VS_RIGHT 520.0f
@@ -9462,7 +9884,7 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
   anm_draw(ID.line, 0, 1);
   anm_swap title = { anm_sprite(T_TOPBAR_MES), anm_sprite(VS_TEXT + 2 + m->vs.kind) };
   draw_topbar(bars, 1, &title);
-  anm_draw(ID.bottom, bars, 1);
+  draw_bottombar(bars, 1);
   hud_ui_begin(screen_w, screen_h);
   const float O[3] = { 1.0f, 0.55f, 0.1f }; /* the arcade's orange */
   float r[4];
@@ -9851,8 +10273,8 @@ static void draw_vs_area(const menu_state *m, int clock, int bars, float screen_
   anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(A_TOPBAR) };
   draw_topbar_timed(bars, fade, &mes);
   vs_timer(m->vs.timer, bars, fade);
-  anm_draw(ID.bottom, bars, fade);
-  if (!m->vs.voted && m->vs.area_final < 0) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 0);
+  draw_bottombar(bars, fade);
+  if (!m->vs.voted && m->vs.area_final < 0) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 0);
   draw_vs_omakase(m, screen_w, screen_h);
 }
 
@@ -10083,18 +10505,35 @@ static void step(menu_state *m) {
   m->tap = m->key = m->back = m->option = m->dress = m->erase = m->hidden = 0;
   if (m->flash) m->flash--;
   if (m->bars && ++m->bars > 11) m->bars = 0;
-  if (in_attract(m)) {
+  if (menu_in_attract(m)) {
     if ((tap || key) && !menu_booting(m)) {
       menu_start(m);
       return;
     }
     if (m->screen == MENU_TITLE && m->t >= TITLE_LEN + FADE) go(m, MENU_RANKING);
-    else if (m->screen == MENU_RANKING && m->t >= RANKING_LEN + FADE) go(m, MENU_LOGO);
-    else if (m->screen == MENU_LOGO && m->t >= 3 * LOGO_LEN) go(m, MENU_PROLOGUE);
+    else if (m->screen == MENU_RANKING && m->t >= RANKING_LEN + FADE) {
+      /* mseqDemo at 0x88c9f81 calls seqChampionDisp after the TA board. */
+      int first=attract_crown_find(m,0);
+      m->attract_crown_slot=first>=0 ? first : 0;
+      go(m,MENU_ATTRACT_CROWNS);
+    } else if (m->screen==MENU_ATTRACT_CROWNS && m->t>=attract_crown_length(m)) {
+      int current=attract_crown_find(m,m->attract_crown_slot);
+      int next=current>=0 ? attract_crown_find(m,current+1) : -1;
+      if (next>=0) m->attract_crown_slot=next,m->t=0;
+      else go(m,MENU_LOGO);
+    } else if (m->screen == MENU_LOGO && m->t >= 3 * LOGO_LEN) go(m, MENU_PROLOGUE);
     else if (m->screen == MENU_PROLOGUE && m->t >= 2 * PROLOGUE_LEN) {
       m->demo++;
       go(m, MENU_MOVIE);
     }
+    return;
+  }
+  if (m->screen == MENU_CROWN_AWARD) {
+    crown_award_step(m);
+    return;
+  }
+  if (m->screen == MENU_MILEAGE) {
+    mileage_step(m, tap || back);
     return;
   }
   if (m->screen == MENU_GHOST_PRE) {
@@ -10186,6 +10625,7 @@ static void step(menu_state *m) {
     if (option && !m->save_confirm) {
       snd_menu(SND_SELECT);
       m->opt_from = MENU_SAVE;
+      m->opt_page = 0;
       go(m, MENU_OPTION);
       return;
     }
@@ -10248,8 +10688,9 @@ static void step(menu_state *m) {
   }
   if (m->screen == MENU_CARD) {
     int complete = card_pages_available();
+    int style_only = !complete && card_page_available(CARD_DRIVING_STYLE_PAGE);
     if (m->card_page < 1 || m->card_page > 9) m->card_page = 1;
-    if (!complete && m->card_page != 1) {
+    if (!complete && m->card_page != 1 && !(style_only && m->card_page == CARD_DRIVING_STYLE_PAGE)) {
       /* Returning to page 1 must not reuse a touch from the missing page. */
       m->card_page = 1;
       m->card_action = 0;
@@ -10278,7 +10719,7 @@ static void step(menu_state *m) {
     }
     if (back && m->card_page > 1) {
       snd_menu(SND_CANCEL);
-      m->card_page--;
+      m->card_page = style_only ? 1 : m->card_page - 1;
       return;
     }
     if (back) {
@@ -10301,21 +10742,27 @@ static void step(menu_state *m) {
       else car_select_enter(m, m->card_back == MENU_SETTING ? MENU_SETTING : MENU_COLOR);
       return;
     }
-    if (!complete && m->card_page == 1 && (tap || key)) {
-      /* Sidecar absent or partial: only the explicit continue commits. */
+    if (action == CARD_SKIP_ACTION) {
+      snd_menu(SND_SELECT);
+      m->deciding = FADE;
+      return;
+    }
+    if (!complete && !style_only && (tap || key)) {
+      /* The basic card is still usable when the page art is missing. */
       if (tap) { snd_menu(SND_SELECT); m->deciding = FADE; }
       else snd_menu(SND_CANCEL);
       return;
     }
     if (key < 0 && m->card_page > 1) {
       snd_menu(SND_CURSOR);
-      m->card_page--;
+      m->card_page = style_only ? 1 : m->card_page - 1;
     } else if (key > 0 || tap) {
-      if (m->card_page == 9) {
-        if (tap) { snd_menu(SND_SELECT); m->deciding = FADE; }
-      } else if (card_page_available(m->card_page + 1)) {
+      if (m->card_page == 9 || (style_only && m->card_page == CARD_DRIVING_STYLE_PAGE)) {
+        snd_menu(SND_SELECT);
+        m->deciding = FADE;
+      } else if (style_only || card_page_available(m->card_page + 1)) {
         snd_menu(SND_CURSOR);
-        m->card_page++;
+        m->card_page = style_only ? CARD_DRIVING_STYLE_PAGE : m->card_page + 1;
       } else {
         /* Do not masquerade as a page whose assets were not loaded. */
         snd_menu(SND_CANCEL);
@@ -10343,6 +10790,7 @@ static void step(menu_state *m) {
     snd_menu(SND_SELECT);
     m->opt_sel = m->sel;
     m->opt_from = MENU_MAKER;
+    m->opt_page = 0;
     go(m, MENU_OPTION);
     return;
   }
@@ -10607,12 +11055,17 @@ int menu_update(menu_state *m, float dt) {
   if (m->acc > 0.25f) m->acc = 0.25f;
   while (m->acc >= 1.0f / 60.0f) {
     m->acc -= 1.0f / 60.0f;
-    if (m->screen != MENU_TITLE && m->screen != MENU_RANKING &&
-        m->screen != MENU_LOGO && m->screen != MENU_PROLOGUE &&
-        m->screen != MENU_START && m->screen != MENU_MOVIE) ++menu_visual_clock;
+    if (!menu_in_attract(m) && m->screen != MENU_START) ++menu_visual_clock;
     int was_deciding = m->deciding;
     step(m);
     if (menu_ghost_preparing(m) && m->ready && !m->ghost.pre_go) {
+      if (ghost_intro_rival(m) && m->ghost.intro_t<ghost_intro_end(m)+GHOST_INTRO_FADE) {
+        int t=++m->ghost.intro_t;
+        if (t==GHOST_INTRO_PLATES) snd_menu(SND_RESULT_PASS);
+        if (t==GHOST_INTRO_VS) snd_menu(ghost_intro_crown(m)?SND_RESULT_PASS:SND_CUTIN2);
+        if (t==GHOST_INTRO_CROWN && ghost_intro_crown(m)) snd_menu(SND_CUTIN2);
+        continue;
+      }
       m->ghost.pre_go = 1;
       return 1; /* caller also requires its validated Ghost engine capability */
     }
@@ -10746,8 +11199,8 @@ int menu_update(menu_state *m, float dt) {
         m->ten_course = m->sel;
         ten_level_enter(m);
       } else if (m->screen == MENU_TEN_LEVEL) {
-        /* the level's time zone (clEffTenCourseType::getDayTime, as the title page's) and a
-         * song at random */
+        /* The level's time zone (clEffTenCourseType::getDayTime) and a fallback
+         * song for platforms or resource packs without the Ten soundtrack. */
         m->ten_level = m->sel;
         m->zone = ten_night(m->ten_course, m->ten_level);
         m->song = 1 + rand() % (card_bgm_lines(m) - 2);
@@ -10916,7 +11369,7 @@ static void game_picture(int id, const float crop[4], float edge, float alpha) {
 
 static void game_mode_label(int id, menu_mode_rect r, float alpha) {
   int sprite = anm_sprite(id);
-  /* All three authored mode descriptions share this alpha-content rectangle.
+  /* The authored mode descriptions share this alpha-content rectangle.
    * Keeping transparent atlas padding made Japanese text needlessly tiny. */
   const float src[4] = {86, 2, 426, 62};
   if (anm_sprite_width(sprite) < src[2] || anm_sprite_height(sprite) < src[3] || alpha <= 0) return;
@@ -10927,7 +11380,36 @@ static void game_mode_label(int id, menu_mode_rect r, float alpha) {
   anm_draw_part(sprite, src, dst, alpha);
 }
 
-static void draw_game_modes(const menu_state *m, float fade, float screen_w, float screen_h) {
+/* VS has no original caption. Use the same Japanese glyphs and panel style. */
+static void game_mode_japanese(menu_mode_rect r, const uint32_t *first, float alpha) {
+  int panel = anm_sprite(2318);
+  /* Use the text-free margins of the Time Attack caption, including its right fade. */
+  if (anm_sprite_width(panel) >= 426 && anm_sprite_height(panel) >= 62) {
+    float split = r.x + r.w * 0.6f;
+    const float left_src[4] = {86, 2, 108, 62}, right_src[4] = {290, 2, 426, 62};
+    const float left_dst[4] = {r.x, r.y, split, r.y + r.h};
+    const float right_dst[4] = {split, r.y, r.x + r.w, r.y + r.h};
+    anm_draw_part(panel, left_src, left_dst, alpha);
+    anm_draw_part(panel, right_src, right_dst, alpha);
+  }
+
+  const uint32_t *const lines[] = {first, U"対戦できるモードです"};
+  for (int i = 0; i < 2; ++i) {
+    float x = r.x + 24.0f, y = r.y + 10.0f + 20.0f * i;
+    for (const uint32_t *c = lines[i]; *c; ++c, x += 17.0f) {
+      int glyph = title_glyph_index(*c);
+      if (glyph < 0) continue;
+      int sprite = anm_sprite(TITLE_GLYPH7 + glyph);
+      float w = anm_sprite_width(sprite), h = anm_sprite_height(sprite);
+      if (w <= 0.0f || h <= 0.0f) continue;
+      const float src[4] = {0, 0, w, h};
+      const float dst[4] = {x, y, x + 18.0f, y + 18.0f};
+      anm_draw_part(sprite, src, dst, alpha);
+    }
+  }
+}
+
+static void draw_game_modes(const menu_state *m, float fade) {
   menu_mode_rect r[GAME_SLOTS];
   if (!game_rects(m, r)) return;
   int selected = m->sel;
@@ -10951,19 +11433,7 @@ static void draw_game_modes(const menu_state *m, float fade, float screen_w, flo
   }
   menu_mode_rect detail = menu_mode_detail(edge);
   if (GAME_MODE[selected].label) game_mode_label(GAME_MODE[selected].label, detail, fade);
-  else {
-    float cx = detail.x + detail.w * 0.5f;
-    hud_ui_begin(screen_w, screen_h);
-    if (GAME_MODE[selected].game == MENU_GAME_GHOST) {
-      game_text("GHOST BATTLE", cx, detail.y + 12, 2.8f, fade);
-      game_text("CHALLENGE RECORDED RIVALS", cx, detail.y + 40, 1.8f, fade);
-    } else {
-      game_text("VS MODE", cx, detail.y + 8, 3.2f, fade);
-      game_text("RACE LIVE PLAYERS", cx, detail.y + 36, 2.0f, fade);
-      game_text("LAN / ONLINE", cx, detail.y + 58, 1.7f, fade);
-    }
-    hud_ui_end();
-  }
+  else game_mode_japanese(detail, U"ほかのプレイヤーと通信で", fade);
 }
 
 static void ghost_name_template(int anim,int frame,int tmpl,const uint16_t name[5],float fade) {
@@ -11164,7 +11634,8 @@ static void draw_ghost_hub(const menu_state *m,int clock,int bars,float screen_w
                u->page==GHOST_UI_COURSE?6640:u->page==GHOST_UI_NAME?S_NAME_TOPBAR:
                u->page==GHOST_UI_RIVAL?(m->ghost.search_kind==1?7146:m->ghost.search_kind==2?7373:6839):0x1beb;
   anm_swap title={anm_sprite(0x1ab5),anm_sprite(title_id)};
-  draw_topbar(bars,1,&title);anm_draw(ID.bottom,bars,1);
+  draw_topbar(bars, 1, &title);
+  draw_bottombar(bars, 1);
   int frame=ghost_original_frame(u);
   if(u->page==GHOST_UI_SEARCH && ghost_original_available(a)) {
     anm_swap unavailable[4];int n=0;
@@ -11198,21 +11669,37 @@ static void draw_ghost_hub(const menu_state *m,int clock,int bars,float screen_w
      m->ghost.directory.rows[m->ghost.directory_row].source_kind==MENU_GHOST_SOURCE_CLOUD)
     game_text(m->ghost.directory.rows[m->ghost.directory_row].record_index<MENU_GHOST_CLOUD_RECORDS ?
               "CLOUD REPLAY" : "LOCAL PLAYER REPLAY",320,365,1.8f,fade);
+  if(!m->ghost.note[0] && m->ghost.search_kind==0 &&
+     ((u->page==GHOST_UI_LEVEL && u->sel==9) || (u->page==GHOST_UI_COURSE && m->ghost.level==9))) {
+    int area=u->page==GHOST_UI_COURSE?menu_ghost_course_area(u->sel):-1;
+    const char *label="LOCAL CROWNS";
+    if(m->ghost.directory.cloud_crowns) {
+      label="SERVER CROWNS";
+      if(!m->ghost.directory.cloud_crowns_ready)label="WAITING FOR SERVER CROWNS";
+      else if(area>=0 && (m->ghost.directory.cloud_crown_occupied&(1u<<area)) && ghost_champion(m,area)<0)
+        label="SERVER CROWN REPLAY UNAVAILABLE";
+    }
+    game_text(label,320,MENU_FOOTER_CENTER-5,2.5f,fade);
+  }
   if(m->ghost.note[0]) {
     float width=hud_ui_text_width(m->ghost.note,1);
-    game_text(m->ghost.note,320,410,width>0?fminf(1.9f,568.0f*(1024.0f/640.0f)/width):1.9f,fade);
+    const float k = 1024.0f / 640.0f;
+    float px = width > 0 ? fminf(2.65f, 568.0f * k / width) : 2.65f;
+    game_text(m->ghost.note, 320, MENU_FOOTER_CENTER - 3.5f * px / k, px, fade);
   }
   hud_ui_end();
   int held=m->ghost.held==1000?-1:m->ghost.held==1001?1:m->key_held;
-  hud_draw_menu_keys(screen_w,screen_h,held,1,1);
+  hud_draw_menu_keys(screen_w,screen_h,held,menu_arrow_keys(m),1);
 }
+
+#include "menu_ghost_intro_draw.inc"
 
 static void draw_ghost_pre(const menu_state *m, int clock, float screen_w, float screen_h) {
   float fade = m->t < FADE ? (float)(m->t + 1) / FADE : 1.0f;
   draw_back(ID.bg, clock % 600, 1);
   anm_draw(ID.line, 0, 1);
   draw_topbar(0, 1, NULL);
-  anm_draw(ID.bottom, 0, 1);
+  draw_bottombar(0, 1);
   game_sprite(2827, (menu_mode_rect){240, 100, 160, 160}, fade);
   hud_ui_begin(screen_w, screen_h);
   game_text(m->ghost.completed_action == MENU_GHOST_RECORD_LOCAL ? "RECORD LOCAL GHOST" : "GHOST CHALLENGE", 320, 78, 3.2f, fade);
@@ -11225,6 +11712,141 @@ static void draw_ghost_pre(const menu_state *m, int clock, float screen_w, float
   draw_pre_loading(f < LOADING_POP ? f : LOADING_POP, fade);
   hud_draw_menu_keys(screen_w, screen_h, m->key_held, 0, 1);
 }
+
+static void draw_attract_crowns(const menu_state *m, void (*draw3d)(void *),void *ctx) {
+  enum { CROWN_SPRITE_BASE=140000 };
+  static const int panel_id[]={4675,4680,4681,4682,4678,4679,4677,4676};
+  const int area=attract_crown_area(m);
+  const int frames=anm_frames(ID.attract_crown_panels);
+  photo_bg=1;
+  anm_fill(.018f,.02f,.025f,1);
+  if (ID.attract_crown_bg>=0 && frames>0) {
+    draw_back(ID.attract_crown_bg,0,1);
+    /* The grey composite always lies behind the eight colour overlays.
+     * Hide every overlay except the current holder's route. */
+    anm_swap panels[MENU_GHOST_DIRECTORY_AREAS];
+    int count=0;
+    for (int i=0;i<(int)MENU_GHOST_DIRECTORY_AREAS;++i)
+      if (i!=area) panels[count++]=(anm_swap){anm_sprite(CROWN_SPRITE_BASE+panel_id[i]),-1};
+    anm_draw_ex(ID.attract_crown_panels,m->t%frames,1,0,0,panels,count);
+  } else {
+    /* Old prepared packs still get the verified board and original emblems. */
+    static const char *const labels[]={"C1","NEW BELT","WANGAN","YOKOHANE","NAGOYA","OSAKA","HAKONE","FUKUOKA"};
+    card_notice("KING OF THE AREA",248,22,1);
+    for (int slot=0;slot<(int)MENU_GHOST_DIRECTORY_AREAS;++slot) {
+      int i=ATTRACT_CROWN_ORDER[slot];
+      const ghost_crown_art *art=ghost_original_crown((unsigned)i);
+      float alpha=i==area?1.0f:0.26f;
+      if (anm_sprite(art->menu)>=0) game_sprite(art->menu,(menu_mode_rect){31+slot*75,62,51,51},alpha);
+      else card_notice(labels[i],56.5f+slot*75-(float)strlen(labels[i])*4.5f,85,alpha);
+    }
+  }
+  if (draw3d) draw3d(ctx);
+  if (area>=0) {
+    const short *glyphs=m->attract_crowns[area].glyphs;
+    float width=0, scale=1.15f;
+    for (int i=0;i<5 && glyphs[i]>=0;++i)
+      width+=anm_sprite_width(anm_sprite(NAME_GLYPH5+glyphs[i]))*scale;
+    float x=320-width*.5f;
+    for (int i=0;i<5 && glyphs[i]>=0;++i) {
+      int sprite=anm_sprite(NAME_GLYPH5+glyphs[i]);
+      float w=anm_sprite_width(sprite),h=anm_sprite_height(sprite);
+      if (w<=0 || h<=0)continue;
+      const float src[]={0,0,w,h},dst[]={x,249,x+w*scale,249+h*scale};
+      anm_draw_part(sprite,src,dst,1);
+      x+=w*scale;
+    }
+  }
+  const char *status=m->attract_crown_status==MENU_ATTRACT_CROWN_PENDING ? "SERVER CROWNS UNAVAILABLE" :
+    m->attract_crown_status==MENU_ATTRACT_CROWN_LOCAL ? (area>=0?"LOCAL CROWNS":"NO LOCAL CROWNS") :
+    area>=0 ? NULL : m->attract_crown_occupied ? "NO COMPATIBLE CROWNS" : "NO SERVER CROWNS";
+  if (status) card_notice(status,320-(float)strlen(status)*4.5f,area>=0?451:313,1);
+  int remaining=attract_crown_length(m)-m->t;
+  int shade=m->t<remaining?m->t:remaining;
+  if (shade<ATTRACT_CROWN_FADE)
+    anm_fill(0,0,0,1-fmaxf(0,(float)shade/ATTRACT_CROWN_FADE));
+}
+
+/* clSeqMileageResultThread: keep the arcade's background, title band, digit
+ * positions and separators. Font and password placeholders are explicit swaps. */
+#define MILEAGE_SPRITE_BASE 120000
+static void draw_mileage(const menu_state *m, float screen_w, float screen_h,
+                         void (*draw3d)(void *), void *ctx) {
+  int bg = anm_sprite(MILEAGE_SPRITE_BASE + 1557);
+  int title = anm_sprite(MILEAGE_SPRITE_BASE + 5584);
+  float edge = anm_edge() * (640.0f / 1024.0f);
+  int original = ID.mileage >= 0 && anm_frames(ID.mileage) > 0 &&
+                 anm_sprite_width(bg) >= 1024 && anm_sprite_height(bg) >= 512 &&
+                 anm_sprite(MILEAGE_SPRITE_BASE + 1439) >= 0 && anm_sprite(MILEAGE_SPRITE_BASE + 1440) >= 0;
+  if (original) {
+    /* The arcade places this 1024x512 sprite at (-192, -16).
+     * The central 640x480 is fully opaque. Widen that part over the phone,
+     * keeping the car and the result glyphs in the original coordinates. */
+    const float src[4] = {192.5f, 16.5f, 831.5f, 495.5f};
+    const float dst[4] = {-edge, 0, 640.0f + edge, 480};
+    anm_draw_part(bg, src, dst, 1);
+  } else draw_back(ID.bg, m->t % 600, 1);
+  if (draw3d) draw3d(ctx);
+
+  char km[12];
+  snprintf(km, sizeof km, "%d", m->mileage.total_km);
+  int nkm = (int)strlen(km);
+  const cardb_car *car = chosen_car(m, m->car);
+  if (original) {
+    /* The header in menu_layout_milage has the same horizontal padding.
+     * Retain its original y=14 and 9/8 vertical scale. */
+    if (title >= 0) {
+      const float src[4] = {192.5f, 0, 831.5f, 64};
+      const float dst[4] = {-edge, 14, 640.0f + edge, 86};
+      anm_draw_part(title, src, dst, 1);
+    }
+    anm_swap swaps[14] = {
+      {bg, -1},
+      {title, -1},
+      {anm_sprite(MILEAGE_SPRITE_BASE + 2823),
+       m->mileage.remaining_km >= 10 ? anm_sprite(MILEAGE_SPRITE_BASE + 1224 + m->mileage.remaining_km / 10 % 10) : -1},
+      {anm_sprite(MILEAGE_SPRITE_BASE + 1224), anm_sprite(MILEAGE_SPRITE_BASE + 1224 + m->mileage.remaining_km % 10)}
+    };
+    int count = 4, pos = nkm, separator = 0;
+    for (int slot = 0; slot < 10; ++slot) {
+      int digit = -1;
+      if (pos > 0) {
+        if (separator == 3) { digit = 2823; separator = 0; }
+        else { digit = 1224 + km[--pos] - '0'; ++separator; }
+      }
+      swaps[count++] = (anm_swap){anm_sprite(MILEAGE_SPRITE_BASE + 1234 - slot),
+                                  digit < 0 ? -1 : anm_sprite(MILEAGE_SPRITE_BASE + digit)};
+    }
+    anm_draw_ex(ID.mileage, m->t % anm_frames(ID.mileage), 1, 0, 0, swaps, count);
+    for (int i = 0; i < 5 && m->name[i] >= 0; ++i)
+      anm_draw_sprite(anm_sprite(NAME_GLYPH8 + m->name[i]), 12.0f + 25.0f * i, 35, 1);
+    int plate = anm_sprite(car->plate);
+    float w = anm_sprite_width(plate), h = anm_sprite_height(plate);
+    if (w > 0 && h > 0) {
+      float scale = fminf(188.0f / w, 30.0f / h);
+      const float src[4] = {0, 0, w, h};
+      const float dst[4] = {245, 38, 245 + w * scale, 38 + h * scale};
+      anm_draw_part(plate, src, dst, 1);
+    }
+  } else {
+    /* Legacy converted packs lack the original mileage animation. Keep their
+     * race results and count usable until resources are refreshed. */
+    char line[48];
+    hud_ui_begin(screen_w, screen_h);
+    hud_ui_rect(-anm_edge(), 44, screen_w + 2 * anm_edge(), 66, 0, 0, 0, 0.85f);
+    hud_ui_text("MILEAGE", 24, 61, 4, 1, 1, 1, 1);
+    snprintf(line, sizeof line, "THIS RACE   %d KM", m->mileage.remaining_km);
+    hud_ui_text(line, 24, 140, 3.2f, 0.08f, 0.08f, 0.08f, 1);
+    snprintf(line, sizeof line, "TOTAL   %s KM", km);
+    hud_ui_text(line, 24, 195, 3.2f, 0.08f, 0.08f, 0.08f, 1);
+    hud_ui_end();
+  }
+  float shade = m->mileage.fade_out ? m->mileage.fade_out / (float)MILEAGE_FADE_TICKS
+                                   : 1.0f - m->t / (float)MILEAGE_FADE_TICKS;
+  if (shade > 0.0f) anm_fill(0, 0, 0, shade);
+}
+
+#include "menu_crown_award.inc"
 
 void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3d)(void *), void *ctx,
                void (*mini3d)(void *, float)) {
@@ -11240,6 +11862,16 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   }
   case MENU_RANKING:
     draw_ranking(m, screen_w, screen_h);
+    return;
+  case MENU_ATTRACT_CROWNS:
+    draw_attract_crowns(m, draw3d, ctx);
+    return;
+  case MENU_MILEAGE:
+    photo_bg = 1;
+    draw_mileage(m, screen_w, screen_h, draw3d, ctx);
+    return;
+  case MENU_CROWN_AWARD:
+    draw_crown_award(m, screen_w, screen_h, draw3d, ctx);
     return;
   case MENU_LOGO:
     anm_draw(ID.maker[m->t / LOGO_LEN < 3 ? m->t / LOGO_LEN : 2], m->t % LOGO_LEN, 1.0f);
@@ -11259,8 +11891,8 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   if (m->screen == MENU_BODY_COLOR) {
     draw_body_color(m, draw3d, ctx);
     anm_swap mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(7767) };
-    draw_topbar(bars, 1, &mes); anm_draw(ID.bottom, bars, 1);
-    hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    draw_topbar(bars, 1, &mes); draw_bottombar(bars, 1);
+    hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (m->body_edit.confirm > 30) anm_fill(0,0,0,(m->body_edit.confirm-30)/10.0f);
     return;
   }
@@ -11269,22 +11901,22 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     draw_car_select(m, clock, draw3d, ctx);
     draw_topbar(bars, 1, NULL);
     if (!bars) anm_draw(m->screen == MENU_MAKER ? ID.mes_maker : m->screen == MENU_CAR ? ID.mes_car : ID.mes_color, 0, 1);
-    anm_draw(ID.bottom, bars, 1);
+    draw_bottombar(bars, 1);
     /* cars on show still loading: none of them yet, NOW LOADING (its pop-in, then held) */
     if (m->loading) anm_draw_xf(ID.loading, m->loading - 1, 1, LOADING_DX, LOADING_DY, 1, NULL, 0);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->screen == MENU_CAR, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (!m->deciding && m->screen == MENU_MAKER) {
       hud_draw_menu_option(screen_w, screen_h, m->key_held == HUD_MENU_OPTION);
-      /* the hidden cars key, its caption centred on it (the bottom bar's middle: 320, 425) */
+      /* the hidden cars key and its centred caption */
       hud_draw_menu_hidden(screen_w, screen_h, m->key_held == HUD_MENU_HIDDEN);
       int cap = anm_sprite(OPT_TEXT + O_HIDDEN);
-      if (cap >= 0) anm_draw_sprite(cap, 320.0f - 0.5f * anm_sprite_width(cap), 415.0f, 1);
+      draw_footer_hint(cap, 1);
     }
     if (!m->deciding && all_parts_shown(m)) {
       /* the ALL PARTS key: held down while on */
       hud_draw_menu_hidden(screen_w, screen_h, m->all_parts || m->key_held == HUD_MENU_HIDDEN);
       int cap = anm_sprite(OPT_TEXT + (m->all_parts ? O_ALL_ON : O_ALL_OFF));
-      if (cap >= 0) anm_draw_sprite(cap, 320.0f - 0.5f * anm_sprite_width(cap), 415.0f, 1);
+      draw_footer_hint(cap, 1);
     }
     /* leaving for the title screen, it fades to white instead */
     float c = m->leaving ? 1.0f : 0.0f;
@@ -11300,7 +11932,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
       fade = t < DECIDE_DAY ? 1.0f : (float)m->deciding / FADE;
     }
     draw_have(m, clock, fade, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     return;
   }
   if (m->screen == MENU_GARAGE) {
@@ -11308,7 +11940,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     draw_garage(m, clock, draw3d, ctx, bars);
     /* its car still loading: NOW LOADING, as the car select's (a blank turntable before, Allan 10-25) */
     if (m->loading) anm_draw_xf(ID.loading, m->loading - 1, 1, LOADING_DX, LOADING_DY, 1, NULL, 0);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->n_own > 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (!m->deciding) hud_draw_menu_erase(screen_w, screen_h, m->key_held == HUD_MENU_OPTION, m->erase_armed);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
@@ -11316,27 +11948,30 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   if (m->screen == MENU_CARD) {
     if (m->t < FADE && !m->deciding) fade = (float)(m->t + 1) / FADE;
     draw_card(m, clock, 1, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) {
+      hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
+      if (!bars) draw_footer_button("SKIP CARD DATA", screen_w, screen_h, m->key_held == CARD_SKIP_ACTION, 1, 1);
+    }
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_NAME) {
     if (m->t < FADE && !m->deciding) fade = (float)(m->t + 1) / FADE;
     draw_name(m, clock, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_INFO) {
     draw_save(m, clock, bars); /* Reserved legacy state renders no declaration. */
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_SAVE) {
     /* out of START's white; to black for the maker select, to white for the title screen */
     draw_save(m, clock, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (!m->deciding && !m->save_confirm) hud_draw_menu_option(screen_w, screen_h, m->key_held == HUD_MENU_OPTION);
     float c = m->leaving ? 1.0f : 0.0f;
     anm_fill(c, c, c, 1.0f - fade);
@@ -11346,13 +11981,14 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   if (m->screen == MENU_LAYOUT) { draw_layout(m, clock, screen_w, screen_h); hud_draw_menu_keys(screen_w, screen_h, m->key_held, 0, 1); return; }
   if (m->screen == MENU_OPTION) {
     if (m->t < FADE) fade = (float)(m->t + 1) / FADE;
+#ifdef __ANDROID__
+    draw_option(m, clock, bars, screen_w, screen_h);
+#else
     draw_option(m, clock, bars);
     draw_option_layout_key(m, screen_w, screen_h);
     if (m->res_row) draw_option_res(m, screen_w, screen_h);
-#ifdef __ANDROID__
-    draw_option_fps(m, screen_w, screen_h);
 #endif
-    hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->gyro == HUD_STEER_GYRO, 1);
+    hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
@@ -11360,8 +11996,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     /* out of the colour select's black, and back into it */
     if (m->t < FADE && !m->deciding) fade = (float)(m->t + 1) / FADE;
     draw_setting(m, clock, draw3d, ctx, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held,
-                                        setting_power_selectable(m), 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (!m->deciding && !m->new_card && !pre_tune_context(m)) hud_draw_menu_dress(screen_w, screen_h, m->key_held == HUD_MENU_OPTION);
     anm_fill(0, 0, 0, 1.0f - fade);
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
@@ -11372,7 +12007,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     /* the screen fades in from the course select's black */
     if (m->t < FADE && !m->deciding) fade = (float)(m->t + 1) / FADE;
     draw_day_select(m, clock, fade, bars);
-    if (!m->deciding && !(m->vs.day && m->vs.day_voted)) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, !m->vs.day);
+    if (!m->deciding && !(m->vs.day && m->vs.day_voted)) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), !m->vs.day);
     if (m->vs.day) draw_vs_omakase(m, screen_w, screen_h);
 #ifdef __ANDROID__
     draw_vs_day_wait_note(m, screen_w, screen_h);
@@ -11385,7 +12020,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     if (m->card_t < FADE && !m->deciding) fade = (float)(m->card_t + 1) / FADE;
     if (m->screen == MENU_ST_LEVEL) draw_st_level(m, clock, fade, bars);
     else draw_st_rival(m, clock, fade, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (!m->deciding && m->screen == MENU_ST_LEVEL && m->from < 0) draw_chapters(m, screen_w, screen_h);
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
     return;
@@ -11393,7 +12028,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   if (m->screen == MENU_ST_TUNE) {
     if (m->card_t < FADE && !m->deciding) fade = (float)(m->card_t + 1) / FADE;
     draw_st_tune(m, clock, fade, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, !m->tune.fixed, 0);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 0);
     return;
   }
   if (m->screen == MENU_LVUP) {
@@ -11423,21 +12058,21 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     /* clMenuFade: in over 10 frames, out over 10 */
     fade = m->deciding ? (float)m->deciding / TG_FADE : m->card_t < TG_FADE ? (float)(m->card_t + 1) / TG_FADE : 1.0f;
     draw_tg_part(m, clock, 1, bars, draw3d, ctx);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->tg.n > 1, m->dress_free);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), m->dress_free);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_TG_WHEEL) {
     fade = m->deciding ? (float)m->deciding / TG_FADE : m->card_t < TG_FADE ? (float)(m->card_t + 1) / TG_FADE : 1.0f;
     draw_tg_wheel(m, 1, bars, draw3d, ctx);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->tg.n > 1, m->dress_free);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), m->dress_free);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_TG_VINYL) {
     fade = m->deciding ? (float)m->deciding / TG_FADE : m->card_t < TG_FADE ? (float)(m->card_t + 1) / TG_FADE : 1.0f;
     draw_tg_vinyl(m, 1, bars, draw3d, ctx);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->tg.n > 1, m->dress_free);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), m->dress_free);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
@@ -11460,21 +12095,21 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
                        : m->card_t < TG_FADE ? (float)(m->card_t + 1) / TG_FADE : 1.0f;
     if (m->screen == MENU_TG_SELECT) draw_tg_select(m, bars, draw3d, ctx);
     else draw_tg_maker(m, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_TG_AERO) {
     if (m->card_t < TG_FADE && !m->deciding) fade = (float)(m->card_t + 1) / TG_FADE;
     draw_tg_aero(m, clock, 1, bars, draw3d, ctx);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->tg.n > 1, m->dress_free);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), m->dress_free);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
   if (m->screen == MENU_TEN_LEVEL) {
     if (m->card_t < FADE && !m->deciding) fade = (float)(m->card_t + 1) / FADE;
     draw_ten_level(m, clock, fade, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     return;
   }
   if (m->screen == MENU_PRE) {
@@ -11495,7 +12130,9 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     return;
   }
   if (m->screen == MENU_GHOST_PRE) {
-    draw_ghost_pre(m, clock, screen_w, screen_h);
+    if (m->ready && m->ghost.intro_t && ghost_intro_rival(m))
+      draw_ghost_intro(m,screen_w,screen_h,draw3d,ctx);
+    else draw_ghost_pre(m, clock, screen_w, screen_h);
     return;
   }
   if (m->screen == MENU_GHOST) {
@@ -11518,27 +12155,26 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   anm_draw(ID.line, 0, fade);
   draw_bg_logo(chosen_car(m, m->car), clock % 240, fade);
   if (m->screen == MENU_GAME) {
-    draw_game_modes(m, fade, screen_w, screen_h);
+    draw_game_modes(m, fade);
     draw_topbar(bars, fade, NULL);
-    anm_draw(ID.bottom, bars, fade);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    draw_bottombar(bars, fade);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
     return;
   }
   int arrow;
   int f = layout_frame(m, &arrow);
   if (m->screen == MENU_VS_SEL) {
-    const anm_swap preview[] = {
-      {anm_sprite(3224), anm_sprite(3226)}, {anm_sprite(2317), anm_sprite(VS_LINE + 1)},
-      {anm_sprite(3223), anm_sprite(3226)}, {anm_sprite(2316), anm_sprite(VS_LINE + 2)},
-    };
     const anm_swap cards[] = {
       {anm_sprite(2950), anm_sprite(VS_ICON + 1)}, {anm_sprite(4960), anm_sprite(VS_ICON + 2)},
       {anm_sprite(1716), -1}, {anm_sprite(1717), -1},
     };
-    anm_draw_ex(ID.vs_sel_image, f, fade, 0, 0, preview, 4);
+    float edge = anm_edge() * (640.0f / 1024.0f);
+    game_picture(GAME_BATTLE_PHOTO, (const float[])GAME_BATTLE_CROP, edge, fade);
     anm_draw_ex(ID.mode, f, fade, 0, 0, cards, 4);
     if (m->from < 0 && !m->deciding && m->t < 60) anm_draw(ID.mode_ring, m->sel * 100 + m->t, fade);
+    game_mode_japanese(menu_mode_detail(edge), m->sel == MENU_VS_LAN ?
+                       U"同じネットワークの相手と" : U"インターネットの相手と", fade);
   } else if (m->screen == MENU_MODE) {
     anm_draw_ex(ID.mode, f, fade, 0, 0, mode_cars, 2);
     if (m->from < 0 && !m->deciding && m->t < 60) anm_draw(ID.mode_ring, m->sel * 100 + m->t, fade);
@@ -11561,8 +12197,8 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   anm_swap or_mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(S_MES_OR_COURSE) };
   anm_swap vs_mes = { anm_sprite(T_TOPBAR_MES), anm_sprite(VS_TEXT) };
   draw_topbar(bars, fade, m->screen == MENU_TEN_COURSE ? &or_mes : m->screen == MENU_VS_SEL ? &vs_mes : NULL);
-  anm_draw(ID.bottom, bars, fade);
-  if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+  draw_bottombar(bars, fade);
+  if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, menu_arrow_keys(m), 1);
   if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
   if (!m->deciding && m->screen == MENU_COURSE && m->from < 0) draw_traffic(m, screen_w, screen_h);
 }

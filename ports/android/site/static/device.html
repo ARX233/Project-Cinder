@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>设备验证 — Project Cinder</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap site-inner">
+    <a class="brand" href="/"><span class="mark"></span>PROJECT CINDER<small>ONLINE</small></a>
+    <nav class="main">
+      <a href="/">首页</a>
+      <a href="/ta">计时榜</a>
+      <a href="/ghost">店内鬼王</a>
+      <a href="/device" class="active">设备验证</a>
+      <a href="https://afdian.com/a/ProjectCinder">赞助</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap" style="max-width:720px">
+    <p class="eyebrow">Device</p>
+    <h1>设备验证</h1>
+    <p class="lead">
+      只有被授权的设备才能连接云端、上传成绩与化身。输入设备 ID 查询状态，未授权可以在本页自助开通。
+    </p>
+
+    <div class="card">
+      <label class="small muted" for="id">设备 ID（32 位十六进制）</label>
+      <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
+        <input id="id" type="text" placeholder="例如 9f2c4a7b1e8d0356..." maxlength="32"
+               autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+        <button class="primary" id="go">查询</button>
+      </div>
+      <div class="result" id="result"></div>
+    </div>
+
+    <h2 class="mt">设备 ID 在哪</h2>
+    <div class="card">
+      <p>打开启动器，进入「选择资源」，页面底部有「联网设备登记」，那里显示的就是本机设备 ID，长按可复制。</p>
+      <p class="mt small muted">设备 ID 在安装时生成，与应用更新、资源包替换无关；卸载或清除应用数据后会重新生成一个。</p>
+    </div>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">Project Cinder · 玩家自建服务</div>
+</footer>
+
+<script>
+const input = document.getElementById('id');
+const result = document.getElementById('result');
+const button = document.getElementById('go');
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function show(kind, headline, body) {
+  result.className = 'result show ' + kind;
+  result.innerHTML = `<div class="headline">${esc(headline)}</div>${body || ''}`;
+}
+
+async function register(id) {
+  const btn = document.getElementById('self');
+  if (btn) { btn.disabled = true; btn.textContent = '开通中…'; }
+  try {
+    const r = await fetch('/api/device/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '开通失败');
+    show('ok', '已授权', `这台设备现在可以连接云端。<div class="mono small muted mt">${esc(id)}</div>`);
+  } catch (e) {
+    show('no', '开通失败', esc(e.message));
+  }
+}
+
+async function check() {
+  const id = input.value.trim().toLowerCase();
+  result.className = 'result';
+  if (!/^[0-9a-f]{32}$/.test(id)) {
+    show('no', '格式不对', '设备 ID 应该是 32 位小写十六进制字符。');
+    return;
+  }
+  button.disabled = true;
+  try {
+    const r = await fetch('/api/device/' + id);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '查询失败');
+    if (d.approved) {
+      show('ok', '已授权', `这台设备可以正常连接云端。<div class="mono small muted mt">${esc(id)}</div>`);
+    } else {
+      show('no', '尚未授权', `
+        <p style="margin:0 0 14px">设备 ID 有效，但还没有开通。可以直接自助开通，立即生效。</p>
+        <button class="primary" id="self">自助授权此设备</button>
+        <div class="mono small muted mt">${esc(id)}</div>`);
+      const btn = document.getElementById('self');
+      if (btn) btn.onclick = () => register(id);
+    }
+  } catch (e) {
+    show('no', '查询失败', esc(e.message));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+button.onclick = check;
+input.addEventListener('keydown', e => { if (e.key === 'Enter') check(); });
+input.addEventListener('input', () => {
+  input.value = input.value.replace(/[^0-9a-fA-F]/g, '').slice(0, 32);
+});
+</script>
+</body>
+</html>

@@ -57,8 +57,9 @@ static void app_replay_directory(void) {
       car_ghost_arcade_binding binding;
       unsigned index=app_replay_index(area,slot);
       int duplicate=0;
-      for (unsigned i=0;i<GC.count;++i) {
-        const ghost_crown_record *shared=&GC.rows[i].record;
+      const app_cloud_snapshot *snapshot=app_cloud_visible();
+      for (unsigned i=0;i<snapshot->count;++i) {
+        const ghost_crown_record *shared=&snapshot->rows[i].record;
         if (shared->revision==record.revision && shared->race.trail_bytes==record.race.trail_bytes &&
             !memcmp(shared->race.trail,record.race.trail,record.race.trail_bytes)) {duplicate=1;break;}
       }

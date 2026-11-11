@@ -4,6 +4,7 @@ from http.client import HTTPConnection
 import itertools
 import json
 from pathlib import Path
+import sqlite3
 import struct
 import tempfile
 import threading
@@ -60,14 +61,14 @@ def _record(name="ＡＲＸ", area=0, timestamp=100, ta=None, step=3, count=2):
     return _crc(record)
 
 
-def community_record(seconds=181.203, attempt=1, owner=2, traffic=0):
+def community_record(seconds=181.203, attempt=1, owner=2, traffic=0, date=1780000000000, model=21):
     record = bytearray(community_timing.ROW_BYTES)
     record[:68] = b"CTA1" + bytes.fromhex(community_timing.RULES + community_timing.PHYSICS)
     struct.pack_into("<II16s16sQfI", record, 68, 0, traffic, bytes([owner]) * 16, bytes([attempt]) * 16,
-                     1780000000000, seconds, 1)
+                     date, seconds, 1)
     struct.pack_into("<f", record, 124, 40.0)
     struct.pack_into("<3I2f5I", record, 152, 363, 0, 28, 1535000, 15306708, 0, 6, 2, 8, 1)
-    struct.pack_into("<11I", record, 192, ord("Ａ"), ord("Ｒ"), ord("Ｘ"), 0, 0, 10, 1, 21, 5, 17, 17)
+    struct.pack_into("<11I", record, 192, ord("Ａ"), ord("Ｒ"), ord("Ｘ"), 0, 0, 10, 1, model, 5, 17, 17)
     return bytes(record)
 
 
@@ -224,6 +225,99 @@ class CloudHTTPTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual([], official["rows"])
         self.assertEqual(503, self.request("POST", "/v1/ta/attempts", body=raw)[0])
+
+    def test_community_result_uses_original_model_class_and_card_best(self):
+        endpoint = "/v1/ta/community/result"
+
+        def finish(body, token=TOKEN_A):
+            status, receipt, _ = self.request("POST", endpoint, body=body, token=token)
+            self.assertEqual(status, 200)
+            self.assertEqual(receipt["sha256"], hashlib.sha256(body).hexdigest())
+            self.assertFalse(receipt["verified"])
+            result = receipt["result"]
+            return tuple(result[k] for k in ("course_best_ms", "car_best_ms", "personal_best_ms", "rank", "new_records"))
+
+        self.assertEqual(finish(community_record(180, 1)), (180000, 180000, 180000, 1, 7))
+        self.assertEqual(finish(community_record(177, 2, model=0), TOKEN_B), (177000, 177000, 177000, 1, 7))
+        self.assertEqual(finish(community_record(190, 3, model=22), TOKEN_C), (177000, 180000, 190000, 3, 4))
+        self.assertEqual(finish(community_record(185, 4, model=22)), (177000, 180000, 180000, 0, 0))
+        self.assertEqual(finish(community_record(175, 5, traffic=1)), (175000, 175000, 175000, 1, 7))
+        self._stop()
+        self._start()
+        self.assertEqual(finish(community_record(179, 6, model=22)), (177000, 179000, 179000, 2, 6))
+
+    def test_community_crown_time_changes_only_on_a_faster_new_holder(self):
+        path = "/v1/ta/community"
+        first_date = 1780000000000
+        for token, seconds, attempt, owner, traffic in (
+                (TOKEN_A, 180, 1, 2, 0),
+                (TOKEN_A, 170, 2, 2, 0),
+                (TOKEN_B, 170, 3, 4, 0),
+                (TOKEN_B, 160, 4, 4, 1)):
+            body = community_record(seconds, attempt, owner, traffic, first_date + attempt)
+            self.assertEqual(200, self.request("POST", path, body=body, token=token)[0])
+        database = Path(self.directory.name) / "timing-community.sqlite3"
+        with sqlite3.connect(database) as state:
+            self.assertEqual(("account-a", first_date + 1), state.execute(
+                "SELECT subject, acquired_at FROM community_crown_v1 WHERE course=0").fetchone())
+        body = community_record(169, 5, 4, date=first_date + 5)
+        self.assertEqual(200, self.request("POST", path, body=body, token=TOKEN_B)[0])
+        self._stop()
+        self._start()
+        with sqlite3.connect(database) as state:
+            self.assertEqual(("account-b", first_date + 5), state.execute(
+                "SELECT subject, acquired_at FROM community_crown_v1 WHERE course=0").fetchone())
+
+    def test_community_ghost_crown_is_shared_by_web_and_game(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cinder_site", Path(__file__).parents[1] / "site/app.py")
+        site = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(site)
+        site.GHOSTS_DB = str(Path(self.directory.name) / "shared-ghosts.sqlite3")
+        site.CARS = site.load_cars(Path(__file__).parents[1] / "site/cars.json")
+        board = "/v1/ghosts/crowns?physics_sha256=" + PHYSICS
+        claim = "/v1/ghosts/crowns?area=0&previous="
+        seed = "0" * 32
+        card = {"X-Cinder-Card-ID": "a" * 32}
+        first, next_record = _record(), _record(name="ＢＢ")
+        self.assertEqual(self.request("GET", board)[1], b"\0\0")
+        self.assertTrue(site.ghost_kings()[0]["idle"])
+        self.assertEqual(self.upload(record=first)[0], 201)
+        self.assertEqual(self.request("GET", board)[1], b"\0\0")
+        self.assertEqual(self.request("POST", claim + seed, body=first)[0], 400)
+        self.assertEqual(self.request("POST", claim + seed, body=_record(ta=0), headers=card)[0], 422)
+        status, king, _ = self.request("POST", claim + seed, body=first, headers=card)
+        self.assertEqual(status, 200)
+        self.assertFalse(king["verified"])
+        self.assertEqual(self.request("POST", claim + seed, body=first, headers=card)[1], king)
+        self.assertEqual(self.request("GET", board, headers=card)[1],
+                         struct.pack("<3B16sI", 1, 1, 0, bytes.fromhex(king["id"]), len(first)) + first)
+        self.assertEqual(self.request("GET", board, token=TOKEN_B, headers=card)[1][0], 0)
+        self.assertEqual(self.request("GET", board.replace(PHYSICS, "f" * 64))[1],
+                         struct.pack("<3B16sI", 0, 1, 0, bytes.fromhex(king["id"]), 0))
+        self.assertEqual((site.ghost_kings()[0]["id"], site.ghost_kings()[0]["name"]), (king["id"], "ＡＲＸ"))
+        self.assertEqual(self.request("POST", claim + seed, token=TOKEN_B, body=next_record, headers=card)[0], 409)
+        wrong_route = bytearray(next_record)
+        struct.pack_into("<I", wrong_route, 36, 1)
+        self.assertEqual(self.request("POST", claim + king["id"], token=TOKEN_B,
+                                      body=_crc(wrong_route), headers=card)[0], 422)
+        status, winner, _ = self.request("POST", claim + king["id"], token=TOKEN_B, body=next_record, headers=card)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(king["id"], winner["id"])
+        self.assertEqual(self.request("POST", claim + king["id"], token=TOKEN_C, body=first, headers=card)[0], 409)
+        self._stop()
+        self._start()
+        self.assertEqual(self.request("GET", board, token=TOKEN_B, headers=card)[1][23:], next_record)
+        self.assertEqual((site.ghost_kings()[0]["id"], site.ghost_kings()[0]["name"]), (winner["id"], "ＢＢ"))
+
+        def try_win(name):
+            return self.request("POST", claim + winner["id"], body=_record(name=name), headers=card)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+            responses = list(workers.map(try_win, ("ＣＣ", "ＤＤ")))
+        self.assertEqual(sorted(response[0] for response in responses), [200, 409])
+        new_id = next(response[1]["id"] for response in responses if response[0] == 200)
+        self.assertEqual(site.ghost_kings()[0]["id"], new_id)
+
 
     def test_archive_search_and_distinct_card_discovery(self):
         card_a, card_b = "1" * 32, "2" * 32

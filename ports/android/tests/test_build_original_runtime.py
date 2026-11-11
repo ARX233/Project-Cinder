@@ -55,9 +55,11 @@ class Fixture:
   recipe={'schema':'wmmt-original-recipe-v1','profile_id':'synthetic-reviewed','runtime':m.EXPECTED_RUNTIME.copy(),'native':{'liboa_native.so':sha(self.ao),'liboc_media_overlay.so':sha(self.media)},'raw':[],'wheels':{},'cars':{},'extras':{},'media':{},'outputs':outputs}
   rs=m._canonical(readset);rp=m._canonical(recipe)
   self.profile=('WMMT-ORIGINAL-PROFILE-1\nprofileId\tsynthetic-reviewed\nreadsetSha256\t'+sha(rs)+'\nrecipeSha256\t'+sha(rp)+'\nsrc\tdata/a\t1\t'+'1'*64+'\nsrc\tmain\t2\t'+m.MAIN_SHA+'\nout\tcars/a.ao\t8\t-\tao\nout\tcars/a.wpk\t8\t'+'2'*64+'\tfixed\nEND\n').encode()
-  self.pins={'aar':'','ao':sha(self.ao),'media':sha(self.media),'profile':sha(self.profile)}
+  self.pins={'aar':'','ao':sha(self.ao),'ao_recipe':sha(self.ao),'media':sha(self.media),'profile':sha(self.profile)}
   for relative in m.SOURCE_PATHS:
    p=self.repo/relative;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'"""Synthetic reviewed source, never executed."""\n')
+  (self.repo/'tools/original_convert/ao.py').write_text(
+   f'SERIAL_AO_SHA256={self.pins["ao_recipe"]!r}\nPARALLEL_AO_SHA256={self.pins["ao"]!r}\n')
   release="import base64,zlib\nREADSET_B64=%r\nRECIPE_B64=%r\nPINS=%r\ndef load_bundle():\n raise RuntimeError('must not execute')\n"%(base64.b64encode(zlib.compress(rs)).decode(),base64.b64encode(zlib.compress(rp)).decode(),{'profile_id':'synthetic-reviewed','readset_sha256':sha(rs),'recipe_sha256':sha(rp),'profile_sha256':sha(self.profile)})
   (self.repo/'tools/original_convert/release_assets.py').write_text(release)
   for source,destination in m.LICENSE_PATHS:

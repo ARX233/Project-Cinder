@@ -10,6 +10,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -27,6 +28,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -213,12 +215,49 @@ public final class OriginalConversionService extends Service {
         if(manager.isLowRamDevice()||memory.lowMemory||memory.availMem<MIN_AVAILABLE_MEMORY)
             throw new IOException("Low-RAM/low-memory device state; need at least 256MiB available before runtime bootstrap");
     }
+    static int conversionWorkerBudget(int cores,int ceiling,long available,long threshold,int thermalStatus) {
+        // Reserve 256 MiB above Android's low-memory threshold. Each worker
+        // has a 256 MiB allowance, matching the native AO heap ceiling.
+        long workerBytes = 256L * 1024 * 1024;
+        long memoryWorkers = (available - threshold) / workerBytes - 1;
+        int limit = (int)Math.max(1, Math.min(Math.min(cores, ceiling), memoryWorkers));
+        if (thermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL) return 1;
+        if (thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE) return Math.min(limit, 2);
+        if (thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE || limit < 6) return Math.min(limit, 4);
+        if (thermalStatus >= PowerManager.THERMAL_STATUS_LIGHT || limit < 8) return 6;
+        return 8;
+    }
+
+    private int conversionWorkerCount(int ceiling) {
+        int cores = Runtime.getRuntime().availableProcessors();
+        if (cores < 2) return 1;
+        ActivityManager manager = (ActivityManager)getSystemService(Context.ACTIVITY_SERVICE);
+        if (manager == null || manager.isLowRamDevice()) return 1;
+        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+        manager.getMemoryInfo(memory);
+        if (memory.lowMemory) return 1;
+
+        int thermalStatus = PowerManager.THERMAL_STATUS_NONE;
+        if (Build.VERSION.SDK_INT >= 29) {
+            PowerManager power = getSystemService(PowerManager.class);
+            if (power != null) thermalStatus = power.getCurrentThermalStatus();
+        }
+        return conversionWorkerBudget(cores,ceiling,memory.availMem,memory.threshold,thermalStatus);
+    }
+
     private void run(Job active) {
         try {
             JavaProgressObject callback=new JavaProgressObject(this,active);
             if(callback.isCancelled()) throw new IOException("Cancelled before runtime bootstrap");
             memoryAdmission();
-            String json=OriginalRuntime.runJob(this,active.dir.getPath(),callback);
+            String json;
+            Path lockPath=active.dir.toPath().resolve("converter.lock");
+            try(FileChannel file=FileChannel.open(lockPath,StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);
+                    FileLock lock=file.tryLock()) {
+                if(lock==null) throw new IOException("上次转换仍在结束，请稍后继续");
+                json=OriginalRuntime.runJob(this,active.dir.getPath(),callback);
+            }
             if(callback.isCancelled()) throw new IOException("Cancelled before report handoff");
             byte[] bytes=json.getBytes(StandardCharsets.UTF_8);
             if(bytes.length==0 || bytes.length>MAX_REPORT_BYTES) throw new IOException("Engine report must be nonempty and at most 2MiB");
@@ -239,7 +278,7 @@ public final class OriginalConversionService extends Service {
                 else terminal(active,MSG_FINISHED,result,"转换已完成，等待主进程校验");
             });
         } catch(Throwable e) {
-            Log.e(TAG,"Original conversion worker stopped",e);
+            Log.e(TAG,"Original conversion worker stopped at "+active.stage+" "+active.done+"/"+active.total,e);
             final String code=active.cancelled.get()?cancelCode(active):
                     (e instanceof OriginalRuntime.EntryPointException?"ENGINE_ENTRY_MISSING":
                     e instanceof OriginalRuntime.BootstrapException?"RUNTIME_BOOTSTRAP_FAILED":"ENGINE_FAILED");
@@ -256,6 +295,11 @@ public final class OriginalConversionService extends Service {
             if(SystemClock.elapsedRealtime()>=job.deadline && markCancelled(job,"DEADLINE_EXCEEDED"))
                 owner.main.post(() -> owner.requestCancel(job,"DEADLINE_EXCEEDED"));
             return job.cancelled.get();
+        }
+        public int aoWorkerCount() { return owner.conversionWorkerCount(8); }
+        public int mediaWorkerCount() { return owner.conversionWorkerCount(4); }
+        public long aoWallBudgetMillis() {
+            return Math.max(1L, job.deadline - SystemClock.elapsedRealtime());
         }
         public String getNativeLibraryDir() throws IOException { return OriginalRuntime.getNativeLibraryDir(owner); }
     }
@@ -350,6 +394,14 @@ public final class OriginalConversionService extends Service {
             case "convert-media": return "正在转换音视频";
             case "bake-ambient-occlusion": return "正在烘焙车辆阴影";
             case "verify-original-output": case "reverify-original-input": return "正在核对转换结果";
+            case "pack-mileage-aura": return "正在转换里程光焰";
+            case "pack-finish-menu": return "正在转换终点距离提示";
+            case "pack-ten-bgm": return "正在转换十人斩音乐";
+            case "pack-crown-scenes": return "正在转换皇冠与驾驶风格画面";
+            case "pack-ghost-wheel": return "正在转换分身轮毂";
+            case "pack-ghost-match": return "正在转换分身对战入场素材";
+            case "pack-mileage-menu": return "正在转换里程结算画面";
+            case "write-original-completion": return "正在写入转换完成凭据";
             default: return "正在转换原版资源";
         }
     }

@@ -31,8 +31,8 @@ class CarryoverPatchTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_main(self, source, dest):
-        with patch.object(MOD, 'EXPECTED', self.digest), \
-             patch('sys.argv', ['story_carryover_patch.py', str(source), str(dest), '--private-root', str(self.root)]), \
+        with patch.object(MOD, 'ROOT', self.root), patch.object(MOD, 'EXPECTED', self.digest), \
+             patch('sys.argv', ['story_carryover_patch.py', str(source), str(dest)]), \
              patch('sys.stdout', new_callable=io.StringIO):
             MOD.main()
 

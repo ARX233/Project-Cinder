@@ -1,10 +1,11 @@
-import hashlib,json,os
+import errno,hashlib,json,os
 from pathlib import Path
 import struct,sys,tempfile,unittest,uuid
+from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
 if not (ROOT/'tools/original_convert/engine.py').is_file():ROOT=Path('/Volumes/MacSave/WMMT3 Phone/Re3DXPlus-github-sync/ports/android')
 sys.path.insert(0,str(ROOT/'tools'))
-from original_convert import engine,validation
+from original_convert import checkpoint,engine,validation
 from original_convert.source import OriginalInputError,OwnedOutput,SourceEntry,MAIN_SHA256
 
 def encoded(obj):return (json.dumps(obj,sort_keys=True,separators=(',',':'))+'\n').encode()
@@ -39,6 +40,25 @@ class EngineTests(unittest.TestCase):
             with self.subTest(field=field),self.assertRaises(OriginalInputError):engine.validate_job(root,self.bundle)
         (root/'job.json').write_bytes(encoded(job));(root/'completion.tsv').write_text('partial')
         with self.assertRaises(OriginalInputError):engine.validate_job(root,self.bundle)
+    def test_completion_publish_on_android_without_hardlinks(self):
+        root,_=self.job()
+        record=root/'completion.tsv'
+        original=b'complete and verified\n'
+        with patch.object(os,'link',side_effect=PermissionError(errno.EACCES,'SELinux denied link')) as link:
+            checkpoint.write_record(record,original,replace=False)
+            with self.assertRaises(FileExistsError):
+                checkpoint.write_record(record,b'unknown completion',replace=False)
+            link.assert_not_called()
+        self.assertEqual(record.read_bytes(),original)
+        self.assertEqual(list(root.glob('completion.tsv-*.tmp')),[])
+    def test_interrupted_completion_rename_keeps_job_resumable(self):
+        root,job=self.job()
+        record=root/'completion.tsv'
+        with patch.object(os,'replace',side_effect=OSError(errno.EIO,'interrupted rename')):
+            with self.assertRaises(OSError):
+                checkpoint.write_record(record,b'verified',replace=False)
+        self.assertEqual(engine.validate_job(root,self.bundle),(root,job))
+        self.assertEqual(list(root.glob('completion.tsv-*.tmp')),[])
     def test_private_metadata_symlink_and_fifo(self):
         target=self.root/'target';target.write_bytes(b'a');link=self.root/'link';link.symlink_to(target)
         with self.assertRaises(OSError):engine._small(link,16)

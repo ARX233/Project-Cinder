@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Cinder — 线上服务</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap site-inner">
+    <a class="brand" href="/"><span class="mark"></span>PROJECT CINDER<small>ONLINE</small></a>
+    <nav class="main">
+      <a href="/" class="active">首页</a>
+      <a href="/ta">计时榜</a>
+      <a href="/ghost">店内鬼王</a>
+      <a href="/device">设备验证</a>
+      <a href="https://afdian.com/a/ProjectCinder">赞助</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <p class="eyebrow">Online Service</p>
+    <h1>Project Cinder<br>线上服务</h1>
+    <p class="lead">
+      Project Cinder 的配套在线服务。
+      这里提供计时赛成绩榜、店内鬼王榜，以及每台设备的联网授权。
+    </p>
+
+    <div class="toolbar">
+      <span class="pill" id="status-pill"><span class="dot" id="status-dot"></span><span id="status-text">检查服务状态…</span></span>
+      <span class="pill">计时赛 12 条</span>
+      <span class="pill">鬼王 8 区</span>
+      <span class="pill">成绩未核验 · 社区榜</span>
+    </div>
+
+    <div class="grid three mt">
+      <a class="card link" href="/ta">
+        <h3>计时赛排行榜</h3>
+        <p>按赛道分组，记录每位车手在无交通车条件下的最快成绩。</p>
+        <div class="go">查看榜单 →</div>
+      </a>
+      <a class="card link" href="/ghost">
+        <h3>店内鬼王</h3>
+        <p>按原版八区展示现任鬼王和车辆外观。</p>
+        <div class="go">查看鬼王 →</div>
+      </a>
+      <a class="card link" href="/device">
+        <h3>设备验证</h3>
+        <p>查询本机设备 ID 是否已获得云端授权，未授权可在页面内直接自助开通。</p>
+        <div class="go">验证设备 →</div>
+      </a>
+    </div>
+
+    <h2 class="mt">关于这套服务</h2>
+    <div class="grid three">
+      <div class="card">
+        <h3>成绩来源</h3>
+        <p>成绩由客户端在正常计时赛完赛后提交，服务端只做格式与规则校验，不重放核验，
+           所以榜单标记为「社区成绩」。</p>
+      </div>
+      <div class="card">
+        <h3>鬼王规则</h3>
+        <p>八个区域各有一个席位。击败当前联网鬼王后，服务器确认胜利录像并更新席位。</p>
+      </div>
+      <div class="card">
+        <h3>设备授权</h3>
+        <p>设备 ID 在安装时生成，与应用更新无关。填进设备验证页即可自助开通，
+           也可由管理员代为批准。</p>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    Project Cinder · 玩家自建服务
+  </div>
+</footer>
+
+<script>
+fetch('/api/status').then(r => r.json()).then(d => {
+  const c = d.capabilities || {};
+  const on = c.ghost_sharing !== undefined;
+  document.getElementById('status-dot').className = 'dot ' + (on ? 'on' : 'off');
+  document.getElementById('status-text').textContent = on
+    ? '云端 API 在线 · 化身 ' + (c.ghost_sharing ? '开' : '关') +
+      ' · 计时榜 ' + (c.ta_leaderboard ? '开' : '关')
+    : '云端 API 离线';
+}).catch(() => {
+  document.getElementById('status-dot').className = 'dot off';
+  document.getElementById('status-text').textContent = '云端 API 离线';
+});
+</script>
+</body>
+</html>

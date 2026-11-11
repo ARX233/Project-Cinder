@@ -14,6 +14,7 @@
 #include "ui_native_vk_resources.inc"
 #endif
 #include "mathx.h"
+#include "menu_mode_layout.h"
 #include "meterdb.h"
 #include "meterdb_v2.h"
 #include "meter_pack.h"
@@ -56,14 +57,19 @@ void hud_set_stick_deadzone_percent(int percent) {
 static const rect G_BRAKE = { 16, 604, 250, 150 };
 static const rect G_SHIFT_UP = { 812, 610, 96, 68 };
 static const rect G_SHIFT_DOWN = { 812, 686, 96, 68 };
-/* menu keys: in the two ends of the arcade's bottom bar (menu_g_bottombar_bar, x 25..996,
- * y 642..718 on screen), each taking a tap a little beyond its edges */
-static const rect MENU_LEFT = { 36, 648, 176, 64 };
-static const rect MENU_RIGHT = { 812, 648, 176, 64 };
+/* Android's selectors sit in the side lanes on the middle row. */
+#if defined(__ANDROID__) || defined(WMMT_MID_MENU_KEYS_TEST)
+static const rect MENU_LEFT = { 8, 344, 64, 80 };
+static const rect MENU_RIGHT = { 952, 344, 64, 80 };
+#define MENU_KEY_SLOP 4
+#else
+static const rect MENU_LEFT = { 36, MENU_FOOTER_CENTER * (768.0f / 480.0f) - 32.0f, 176, 64 };
+static const rect MENU_RIGHT = { 812, MENU_FOOTER_CENTER * (768.0f / 480.0f) - 32.0f, 176, 64 };
 #define MENU_KEY_SLOP 14
+#endif
 static const rect MENU_BACK = { 722, 46, 84, 60 }; /* in the top bar, left of the TIME badge */
 static const rect MENU_OPTION = { 628, 46, 84, 60 }; /* left of back */
-static const rect MENU_HIDDEN = { 328, 652, 368, 56 }; /* between the left and right keys */
+static const rect MENU_HIDDEN = { 328, MENU_FOOTER_CENTER * (768.0f / 480.0f) - 28.0f, 368, 56 }; /* centre of the bottom bar */
 /* A screen wider than 4:3 (an iPhone's 3:2, hud_wide): EDGE more layout px on each side of
  * the 1024x768 layout, which stays in the middle; the race's touch keys go out to the
  * screen's sides and grow by KEY_K about their corner there (a phone's are small). */
@@ -75,6 +81,31 @@ static rect menu_place(rect r, int side) {
   r.x += side == KEY_LEFT ? -EDGE : side == KEY_RIGHT ? EDGE : 0;
   return r;
 }
+static rect menu_arrow_place(rect r, int direction) {
+#if defined(__ANDROID__) || defined(WMMT_MID_MENU_KEYS_TEST)
+  /* On phones use the space between the authored UI and the edge. */
+  r.x += direction * EDGE * 0.5f;
+  return r;
+#else
+  return menu_place(r, direction < 0 ? KEY_LEFT : KEY_RIGHT);
+#endif
+}
+
+#if defined(__ANDROID__) || defined(WMMT_MID_MENU_KEYS_TEST)
+/* Two solid chevrons. The same triangles are submitted by GLES and native Vulkan. */
+static void menu_arrow_vertices(rect r, int direction, float offset_y, float v[48]) {
+  static const float glyph[24] = {
+    -12,-22, -1,-22, 20,0,   -12,-22, 20,0, 9,0,
+    9,0, 20,0, -1,22,       9,0, -1,22, -12,22,
+  };
+  float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f + offset_y;
+  for (int band = 0; band < 2; ++band)
+    for (int i = 0; i < 24; i += 2) {
+      v[band * 24 + i] = cx + direction * (glyph[i] + band * 16 - 12);
+      v[band * 24 + i + 1] = cy + glyph[i + 1];
+    }
+}
+#endif
 static float USER_K[3] = {1,1,1}, USER_DX[3], USER_DY[3];
 static int shift_separate;
 static struct { int separate; float k, dx, dy; } button_layout[HUD_EDIT_GROUPS - HUD_EDIT_SHIFT_UP];
@@ -3429,7 +3460,7 @@ void hud_fade(const hud_state *h, float grey, float alpha) {
 
 int hud_menu_key(float x, float y) {
   const float k = MENU_KEY_SLOP;
-  rect left = menu_place(MENU_LEFT, KEY_LEFT), right = menu_place(MENU_RIGHT, KEY_RIGHT);
+  rect left = menu_arrow_place(MENU_LEFT, -1), right = menu_arrow_place(MENU_RIGHT, 1);
   if (inside((rect){ left.x - k, left.y - k, left.w + 2 * k, left.h + 2 * k }, x, y)) return -1;
   if (inside((rect){ right.x - k, right.y - k, right.w + 2 * k, right.h + 2 * k }, x, y)) return 1;
   if (inside(menu_place(MENU_BACK, KEY_RIGHT), x, y)) return HUD_MENU_BACK;
@@ -3546,7 +3577,7 @@ void hud_draw_menu_erase(float screen_w, float screen_h, int held, int armed) {
 
 #ifndef WMMT_NATIVE_VK
 void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int back) {
-  rect left = menu_place(MENU_LEFT, KEY_LEFT), right = menu_place(MENU_RIGHT, KEY_RIGHT);
+  rect left = menu_arrow_place(MENU_LEFT, -1), right = menu_arrow_place(MENU_RIGHT, 1);
   rect ret = menu_place(MENU_BACK, KEY_RIGHT);
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
@@ -3559,6 +3590,22 @@ void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int 
   glDisableVertexAttribArray(1);
   glDisableVertexAttribArray(2);
   glEnableVertexAttribArray(0);
+#if defined(__ANDROID__) || defined(WMMT_MID_MENU_KEYS_TEST)
+  for (int i = 0; i < 2; ++i) {
+    if (!(keys & (1 << i))) continue;
+    int direction = i ? 1 : -1;
+    rect r = i ? right : left;
+    float v[48];
+    menu_arrow_vertices(r, direction, 2, v);
+    color(0.13f, 0.13f, 0.15f, 0.65f);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v);
+    glDrawArrays(GL_TRIANGLES, 0, 24);
+    menu_arrow_vertices(r, direction, 0, v);
+    float shade = held == direction ? 0.78f : 1.0f;
+    color(shade, shade, shade, 0.97f);
+    glDrawArrays(GL_TRIANGLES, 0, 24);
+  }
+#else
   if (keys) {
     button(left, held < 0);
     button(right, held == 1);
@@ -3566,6 +3613,7 @@ void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int 
     chevron(left.x + left.w / 2 - 6, left.y + left.h / 2, 22, -1, 0);
     chevron(right.x + right.w / 2 + 6, right.y + right.h / 2, 22, 1, 0);
   }
+#endif
   if (back) {
     /* a return arrow: shaft and hook, with a chevron head pointing left */
     button(ret, held == HUD_MENU_BACK);
@@ -3606,6 +3654,7 @@ static float ui_v[UI_QUADS * 12];
 static int ui_n;
 static float ui_rgba[4];
 #ifdef WMMT_NATIVE_VK
+static void ui_flush(void);
 static void ui_color(float r, float g, float b, float a);
 static void ui_quad(float x, float y, float w, float h);
 #endif
@@ -3659,6 +3708,16 @@ void hud_ui_end(void) {
   glDisable(GL_BLEND);
 }
 #endif
+
+void hud_ui_quad(const float xy[8], float r, float g, float b, float a) {
+  ui_color(r, g, b, a);
+  if (ui_n == UI_QUADS) ui_flush();
+  float *v = ui_v + ui_n++ * 12;
+  memcpy(v,xy,6*sizeof *v);
+  memcpy(v+6,xy+2,2*sizeof *v);
+  memcpy(v+8,xy+6,2*sizeof *v);
+  memcpy(v+10,xy+4,2*sizeof *v);
+}
 
 void hud_ui_rect(float x, float y, float w, float h, float r, float g, float b, float a) {
   ui_color(r, g, b, a);

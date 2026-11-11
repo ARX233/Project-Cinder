@@ -38,11 +38,15 @@ public final class OriginalJobStore {
         public final Path root;
         private Job(String i,String n,Path r,String h) { id=i; nonce=n; root=r; profileSha256=h; }
     }
+    static final String FINISH_MENU_MISSING = "终点 600 米提示资源缺失，请重新选择完整的原版 ZIP 或目录转换。";
     public static final class Ready {
-        public final Path dataDirectory;
+        public final Path dataDirectory, mileageAura, mileageMenu, ghostMatch, ghostWheel, finishMenu;
         public final String installId;
         public final List<String> warnings;
-        private Ready(Path p,String id,List<String> w) { dataDirectory=p; installId=id; warnings=Collections.unmodifiableList(new ArrayList<String>(w)); }
+        private Ready(Path p,Path aura,Path menu,Path match,Path wheel,Path finish,String id,List<String> w) {
+            dataDirectory=p; mileageAura=aura; mileageMenu=menu; ghostMatch=match; ghostWheel=wheel; finishMenu=finish; installId=id;
+            warnings=Collections.unmodifiableList(new ArrayList<String>(w));
+        }
     }
     /** Package-private deterministic failure hooks; production always uses DEFAULT. */
     interface Hooks {
@@ -189,6 +193,44 @@ public final class OriginalJobStore {
         if(!id.toString().equals(jobId)) throw bad("Owner UUID mismatch");
         return checkedJob(new Job(jobId,nonce,root,hash));
     }
+    /** An explicit retry may reuse the newest sealed private source. A completed
+     * job stays with the existing publication/recovery flow. */
+    Job latestResumableJob(Cancel cancel) throws IOException {
+        check(cancel); preflight();
+        if (!exists(jobs)) return null;
+        directory(jobs,false,true);
+        Job latest=null;
+        FileTime newest=null;
+        try (DirectoryStream<Path> entries=Files.newDirectoryStream(jobs)) {
+            for (Path path:entries) {
+                check(cancel);
+                String name=path.getFileName().toString();
+                Path envelope=path.resolve("job.json");
+                if (!name.matches(UUID_RE) || !Files.isDirectory(path,NOFOLLOW)
+                        || !Files.isRegularFile(envelope,NOFOLLOW)
+                        || exists(path.resolve("completion.tsv"))) continue;
+                try {
+                    FileTime modified=Files.getLastModifiedTime(envelope,NOFOLLOW);
+                    if (newest!=null && modified.compareTo(newest)<=0) continue;
+                    Job candidate=loadJob(UUID.fromString(name));
+                    String kind=sealedKind(candidate);
+                    BasicFileAttributes source=attrs(path.resolve(kind.equals("zip")?"incoming.zip":"incoming"));
+                    if (kind.equals("zip") ? !source.isRegularFile() || source.size()==0 : !source.isDirectory())
+                        continue;
+                    latest=candidate; newest=modified;
+                } catch (IOException invalid) {
+                    // An incomplete copy or a different profile cannot be resumed.
+                }
+            }
+        }
+        check(cancel);
+        return latest;
+    }
+
+    boolean resumeUsesZip(Job job) throws IOException {
+        return sealedKind(checkedJob(job)).equals("zip");
+    }
+
     private String jobJson(Job j,String kind) {
         return "{\"schema\":\"wmmt-original-job-v1\",\"job_id\":\""+j.id+"\",\"nonce\":\""+j.nonce+
                 "\",\"profile_sha256\":\""+profile.sha256+"\",\"readset_sha256\":\""+profile.readsetSha256+
@@ -395,6 +437,61 @@ public final class OriginalJobStore {
                 "\nsourceBytes\t"+profile.sourceBytes+"\njob\t"+j.id+"\nnonce\t"+j.nonce+
                 "\nsourceKind\t"+sourceKind+"\njobSha256\t"+jobDigest+"\ncompletion\t"+c.digest+"\nlegacyEpoch\t"+epoch+"\n";
     }
+    private static byte[] optionalBankBytes(Path path,long length,String sha256) {
+        try {
+            byte[] bytes=small(path,Math.toIntExact(length));
+            if(bytes.length==length && digest(bytes).equals(sha256)) return bytes;
+        } catch(IOException absentOrDamaged) { /* Older installations have no optional bank. */ }
+        return null;
+    }
+
+    private static Path resolveOptionalBank(Path installation,String name,long length,String sha256) {
+        Path path=installation.resolve(name);
+        return optionalBankBytes(path,length,sha256)==null?null:path;
+    }
+
+    private static Path copyOptionalBank(Path job,Path installation,String name,long length,String sha256) {
+        byte[] bytes=optionalBankBytes(job.resolve(name),length,sha256);
+        if(bytes==null) return null;
+        Path candidate=installation.resolve(name);
+        Path temp=installation.resolve(name+"-"+UUID.randomUUID()+".tmp");
+        try {
+            writeNew(temp,bytes,false);
+            moveAtomic(temp,candidate,false);
+            return candidate;
+        } catch(IOException failed) {
+            // The signed 0.74 core data remains publishable without this extra.
+            return null;
+        } finally {
+            try { Files.deleteIfExists(temp); }
+            catch(IOException ignored) { /* Private, unselected sidecar temporary file. */ }
+        }
+    }
+
+    private void copyTenBgm(Path job,Path installation,Cancel cancel,Progress progress) throws IOException {
+        String name=ResourceMetadata.TEN_BGM_PATH;
+        Path input=job.resolve(name);
+        if(!Files.isRegularFile(input,LinkOption.NOFOLLOW_LINKS)) return;
+        Path temp=installation.resolve(name+"-"+UUID.randomUUID()+".tmp");
+        try {
+            Entry entry=new Entry(name,ResourceMetadata.TEN_BGM_LENGTH,ResourceMetadata.TEN_BGM_SHA256);
+            room(installation,entry.length);
+            try(FileChannel out=newFile(temp,false)) {
+                streamFile(input,entry,out,cancel,progress,"copy-ten-bgm");
+                hooks.force(out);
+            }
+            check(cancel);
+            moveAtomic(temp,installation.resolve(name),false);
+        } catch(InterruptedIOException cancelled) {
+            throw cancelled;
+        } catch(IOException unavailable) {
+            check(cancel);
+        } finally {
+            try { Files.deleteIfExists(temp); }
+            catch(IOException ignored) { /* Private, unselected sidecar temporary file. */ }
+        }
+    }
+
     public Ready publish(Job job,Cancel cancel,Progress progress) throws IOException {
         check(cancel); preflight(); checkedJob(job); String sourceKind=sealedKind(job); String epoch=legacyEpoch();
         byte[] jobRecord=small(job.root.resolve("job.json"),1024*1024);
@@ -413,7 +510,23 @@ public final class OriginalJobStore {
             try(FileChannel out=newFile(target,false)) { streamFile(member(source,e.path),e,out,cancel,progress,"copy-output"); hooks.force(out); }
             stage("copy:files",data,cancel,progress,++count,c.files.size());
         }
-        verify(data,c,cancel,progress,"verify-published"); syncTree(data,cancel); sync(install); sync(published);
+        verify(data,c,cancel,progress,"verify-published"); syncTree(data,cancel);
+        check(cancel); checkedJob(job);
+        // Keep the sidecar outside data so exact completion and install identities stay stable.
+        Path mileageAura=copyOptionalBank(job.root,install,ResourceMetadata.MILEAGE_AURA_PATH,
+                ResourceMetadata.MILEAGE_AURA_LENGTH,ResourceMetadata.MILEAGE_AURA_SHA256);
+        Path mileageMenu=copyOptionalBank(job.root,install,ResourceMetadata.MILEAGE_MENU_PATH,
+                ResourceMetadata.MILEAGE_MENU_LENGTH,ResourceMetadata.MILEAGE_MENU_SHA256);
+        Path ghostMatch=copyOptionalBank(job.root,install,ResourceMetadata.GHOST_MATCH_PATH,
+                ResourceMetadata.GHOST_MATCH_LENGTH,ResourceMetadata.GHOST_MATCH_SHA256);
+        Path ghostWheel=copyOptionalBank(job.root,install,ResourceMetadata.GHOST_WHEEL_PATH,
+                ResourceMetadata.GHOST_WHEEL_LENGTH,ResourceMetadata.GHOST_WHEEL_SHA256);
+        Path finishMenu=copyOptionalBank(job.root,install,ResourceMetadata.FINISH_MENU_PATH,
+                ResourceMetadata.FINISH_MENU_LENGTH,ResourceMetadata.FINISH_MENU_SHA256);
+        copyTenBgm(job.root,install,cancel,progress);
+        copyOptionalBank(job.root,install,ResourceMetadata.CROWN_SCENES_PATH,
+                ResourceMetadata.CROWN_SCENES_LENGTH,ResourceMetadata.CROWN_SCENES_SHA256);
+        sync(install); sync(published);
         checkedJob(job);
         if(!Arrays.equals(jobRecord,small(job.root.resolve("job.json"),1024*1024)) || !Arrays.equals(c.bytes,small(job.root.resolve("completion.tsv"),COMPLETION_LIMIT))) throw bad("Private completion/job changed during publish");
         directory(installations,true,true); Path registration=installations.resolve(installId); createDirectory(registration,true);
@@ -441,7 +554,9 @@ public final class OriginalJobStore {
         });
         List<String> warnings=new ArrayList<String>();
         if(!durable) warnings.add("Resources selected, but final directory sync failed; next launch will reverify");
-        return new Ready(data,installId,warnings);
+        if(ghostMatch==null) warnings.add("分身入场素材未转换。请重新选择完整的原版 ZIP 或目录。");
+        if(finishMenu==null) warnings.add(FINISH_MENU_MISSING);
+        return new Ready(data,mileageAura,mileageMenu,ghostMatch,ghostWheel,finishMenu,installId,warnings);
     }
     /** Missing/prepared central choice delegates to unchanged ResourceStore.
      * A corrupt original choice never falls back to another tree or old selection. */
@@ -474,9 +589,21 @@ public final class OriginalJobStore {
         Completion c=completion(small(registration.resolve("completion.tsv"),COMPLETION_LIMIT),null);
         if(!c.digest.equals(s.digest) || !c.digest.equals(completionDigest) || !c.jobId.equals(jobId) || !c.nonce.equals(nonce) ||
                 !digest(utf8(jobJson(new Job(jobId,nonce,jobs.resolve(jobId),profile.sha256),sourceKind))).equals(jobDigest)) throw bad("Registered completion/input identity mismatch");
-        Path data=published.resolve(s.id).resolve("data"); verify(data,c,cancel,progress,"resolve-original");
+        Path install=published.resolve(s.id),data=install.resolve("data");
+        verify(data,c,cancel,progress,"resolve-original");
+        Path aura=resolveOptionalBank(install,ResourceMetadata.MILEAGE_AURA_PATH,
+                ResourceMetadata.MILEAGE_AURA_LENGTH,ResourceMetadata.MILEAGE_AURA_SHA256);
+        Path menu=resolveOptionalBank(install,ResourceMetadata.MILEAGE_MENU_PATH,
+                ResourceMetadata.MILEAGE_MENU_LENGTH,ResourceMetadata.MILEAGE_MENU_SHA256);
         if(!Arrays.equals(s.bytes,small(choice.resolve("selection"),2048))) throw bad("Selection changed during verification");
-        check(cancel); return new Ready(data,s.id,Collections.<String>emptyList());
+        Path match=resolveOptionalBank(install,ResourceMetadata.GHOST_MATCH_PATH,
+                ResourceMetadata.GHOST_MATCH_LENGTH,ResourceMetadata.GHOST_MATCH_SHA256);
+        Path wheel=resolveOptionalBank(install,ResourceMetadata.GHOST_WHEEL_PATH,
+                ResourceMetadata.GHOST_WHEEL_LENGTH,ResourceMetadata.GHOST_WHEEL_SHA256);
+        Path finish=resolveOptionalBank(install,ResourceMetadata.FINISH_MENU_PATH,
+                ResourceMetadata.FINISH_MENU_LENGTH,ResourceMetadata.FINISH_MENU_SHA256);
+        List<String> warnings=finish==null?Collections.singletonList(FINISH_MENU_MISSING):Collections.<String>emptyList();
+        check(cancel); return new Ready(data,aura,menu,match,wheel,finish,s.id,warnings);
     }
     /** Call ONLY after old ResourceStore import has succeeded under the same lock.
      * No old Store state is written. There is no cancellation after atomic commit. */

@@ -20,7 +20,8 @@ public final class ResourceStore {
     private static final String ID="re3dxplus-data-v1", MARKER=".re3dxplus-install-v1", SELECTION="selection";
     private static final String UUID_PATTERN="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
     private static final String CLEAR_PENDING="resource-clear.pending";
-    private final Path external,noBackup,state,oldState,legacy,imported;
+    private static final String COMPANION_SELECTION="companion-selection";
+    private final Path external,noBackup,state,oldState,legacy,imported,companions;
     private final DataManifest.Limits limits;
     private final DataBaselines baselines;
     private final ResourceMetadata metadata;
@@ -35,9 +36,10 @@ public final class ResourceStore {
     }
     public ResourceStore(Path externalRoot,Path noBackupRoot,DataManifest.Limits limits,DataBaselines baselines,ResourceMetadata metadata) {
         external=Objects.requireNonNull(externalRoot).toAbsolutePath().normalize(); noBackup=Objects.requireNonNull(noBackupRoot).toAbsolutePath().normalize();
-        this.limits=Objects.requireNonNull(limits); this.baselines=Objects.requireNonNull(baselines); this.metadata=Objects.requireNonNull(metadata).withFrontHalo();
+        this.limits=Objects.requireNonNull(limits); this.baselines=Objects.requireNonNull(baselines); this.metadata=Objects.requireNonNull(metadata).withFixedEffects();
         state=noBackup.resolve("resource-import-v1"); oldState=noBackup.resolve("game-data-state");
         legacy=external.resolve("re3dxplus-data"); imported=external.resolve("re3dxplus-imported");
+        companions=external.resolve("re3dxplus-addons");
     }
     static void check(Cancel c) throws IOException { if(Thread.currentThread().isInterrupted() || (c!=null&&c.cancelled())) throw new InterruptedIOException("已取消；若旧更新尚未完成，请使用同一原始来源重试恢复"); }
     static MessageDigest sha() { try { return MessageDigest.getInstance("SHA-256"); } catch(NoSuchAlgorithmException e) { throw new AssertionError(e); } }
@@ -77,7 +79,7 @@ public final class ResourceStore {
         directory(external, false);
         directory(noBackup, false);
         List<Path> roots = new ArrayList<>();
-        for (String name : new String[]{"re3dxplus-imported", "re3dxplus-data", "re3dxplus-original", "wmmt-sidecars"})
+        for (String name : new String[]{"re3dxplus-imported", "re3dxplus-addons", "re3dxplus-data", "re3dxplus-original", "wmmt-sidecars"})
             roots.add(external.resolve(name));
         for (String name : new String[]{"re3dxplus-original-jobs", "original-convert-ui-v1",
                 "original-convert-v1", "resource-import-v1", "resource-choice-v2", "game-data-state",
@@ -304,13 +306,92 @@ public final class ResourceStore {
             return true;
         } catch(InterruptedIOException e) { throw e; } catch(IOException e) { check(cancel); return false; }
     }
+    private static final class Sidecars {
+        final Map<String,Path> files=new TreeMap<>();
+        Path card;
+        void fill(Sidecars other) {
+            other.files.forEach(files::putIfAbsent);
+            if(card==null) card=other.card;
+        }
+    }
+
+    public Ready resolveOriginal(OriginalJobStore.Ready original,Cancel cancel,Progress progress) throws IOException {
+        Path data=original.dataDirectory;
+        Sidecars sidecars=readSidecars(data.getParent(),false,cancel,progress);
+        fillCompanion(sidecars,cancel,progress);
+        // A previously selected prepared pack remains registered when the
+        // original converter is selected. Reuse only its independently pinned sidecars.
+        if(!hasCompleteSidecars(sidecars)) {
+            try {
+                if(exists(state.resolve(SELECTION))) {
+                    Selection prior=readSelection();
+                    Path root=child(prior.kind.equals("legacy")?legacy:imported,prior.name);
+                    sidecars.fill(readSidecars(root,prior.kind.equals("legacy"),cancel,progress));
+                } else sidecars.fill(readSidecars(legacy,true,cancel,progress));
+            } catch(InterruptedIOException cancelled) { throw cancelled; }
+            catch(IOException unavailable) { check(cancel); }
+        }
+        return assembled(data,sidecars);
+    }
+
+    private Path companionRoot() throws IOException {
+        if(!exists(state.resolve(COMPANION_SELECTION))) return null;
+        String name=text(state.resolve(COMPANION_SELECTION),64);
+        if(!name.matches(UUID_PATTERN)) throw new IOException("附加资源登记损坏");
+        return child(companions,name);
+    }
+
+    private static boolean hasCompleteSidecars(Sidecars sidecars) {
+        return sidecars.card!=null && ResourceMetadata.OPTIONAL_PATHS.subList(0,4).stream().allMatch(sidecars.files::containsKey)
+                && ResourceMetadata.CONVERTED_PATHS.stream().allMatch(sidecars.files::containsKey)
+                && ResourceMetadata.FRONT_HALO_PATHS.stream().allMatch(sidecars.files::containsKey)
+                && sidecars.files.containsKey(ResourceMetadata.TEN_BGM_PATH)
+                && sidecars.files.containsKey(ResourceMetadata.CROWN_SCENES_PATH);
+    }
+
+    private void fillCompanion(Sidecars sidecars,Cancel cancel,Progress progress) throws IOException {
+        if(hasCompleteSidecars(sidecars)) return;
+        try {
+            Path root=companionRoot();
+            if(root!=null) sidecars.fill(readSidecars(root,false,cancel,progress));
+        } catch(InterruptedIOException cancelled) { throw cancelled; }
+        catch(IOException unavailable) { check(cancel); }
+    }
+
+    private static Ready assembled(Path data,Sidecars sidecars) {
+        List<String> warnings=new ArrayList<>();
+        Map<String,Path> files=sidecars.files;
+        if(!files.containsKey("story-cutin.bin")) warnings.add("缺少剧情演出资源");
+        if(!files.containsKey("card-pages.bin")) warnings.add("缺少完整卡片页面资源");
+        if(!files.containsKey("backfire.wpk")) warnings.add("缺少完整的回火特效资源");
+        if(sidecars.card==null) warnings.add("缺少扩展表盘与音乐");
+        if(!warnings.isEmpty()) warnings.add("可通过「导入已转换的资源 ZIP」补齐附加资源，无需重转主资源。");
+        for(String name:ResourceMetadata.CONVERTED_PATHS) {
+            if(files.containsKey(name) || (name.equals(ResourceMetadata.FINISH_MENU_PATH) && files.containsKey("card-pages.bin"))) continue;
+            warnings.add("缺少转换附加资源 " + name);
+        }
+        if(!files.containsKey(ResourceMetadata.TEN_BGM_PATH)) warnings.add("缺少十人斩原版音乐");
+        if(!files.containsKey(ResourceMetadata.CROWN_SCENES_PATH)) warnings.add("缺少原版皇冠与驾驶风格画面素材");
+        Path optional=files.get("story-cutin.bin");
+        if(optional!=null) {
+            optional=optional.getParent();
+            for(String name:ResourceMetadata.OPTIONAL_PATHS.subList(0,4))
+                if(!optional.resolve(name).equals(files.get(name))) { optional=null; break; }
+        }
+        return new Ready(data,optional,sidecars.card,warnings,files);
+    }
+
     private Ready ready(Path root,boolean old,Cancel cancel,Progress progress) throws IOException {
-        List<String> warnings=new ArrayList<String>(); Path optional=null,card=null;
-        Map<String,Path> optionalFiles=new TreeMap<String,Path>();
+        Sidecars sidecars=readSidecars(root,old,cancel,progress);
+        fillCompanion(sidecars,cancel,progress);
+        return assembled(root,sidecars);
+    }
+    private Sidecars readSidecars(Path root,boolean old,Cancel cancel,Progress progress) throws IOException {
+        Sidecars sidecars=new Sidecars();
+        Map<String,Path> optionalFiles=sidecars.files;
         Path side=old?external.resolve("wmmt-sidecars"):root;
         for(String name:ResourceMetadata.OPTIONAL_PATHS.subList(0,2)) {
             if(group(side,Collections.singletonList(name),false,cancel,progress)) optionalFiles.put(name,side.resolve(name));
-            else warnings.add(name.equals("story-cutin.bin")?"剧情演出资源未通过校验，已禁用该附加演出":"卡片页面资源未通过校验，已禁用该附加演出");
         }
         Path backfire=side;
         if(old) {
@@ -322,12 +403,17 @@ public final class ResourceStore {
         }
         List<String> pair=ResourceMetadata.OPTIONAL_PATHS.subList(2,4);
         if(backfire!=null&&group(backfire,pair,false,cancel,progress)) for(String name:pair) optionalFiles.put(name,backfire.resolve(name));
-        else warnings.add("回火资源对不完整或未通过校验，已禁用回火特效");
-        if(optionalFiles.size()==4 && side.equals(backfire)) optional=side;
         if(metadata.find(ResourceMetadata.GHOST_UI_PATH)!=null && group(side,Collections.singletonList(ResourceMetadata.GHOST_UI_PATH),false,cancel,progress))
             optionalFiles.put(ResourceMetadata.GHOST_UI_PATH,side.resolve(ResourceMetadata.GHOST_UI_PATH));
         if(group(side,ResourceMetadata.FRONT_HALO_PATHS,false,cancel,progress))
             for(String name:ResourceMetadata.FRONT_HALO_PATHS) optionalFiles.put(name,side.resolve(name));
+        for(String name:ResourceMetadata.CONVERTED_PATHS)
+            if(group(side,Collections.singletonList(name),false,cancel,progress)) optionalFiles.put(name,side.resolve(name));
+        String tenBgm=ResourceMetadata.TEN_BGM_PATH;
+        if(group(side,Collections.singletonList(tenBgm),false,cancel,progress)) optionalFiles.put(tenBgm,side.resolve(tenBgm));
+        String crownScenes=ResourceMetadata.CROWN_SCENES_PATH;
+        if(group(side,Collections.singletonList(crownScenes),false,cancel,progress))
+            optionalFiles.put(crownScenes,side.resolve(crownScenes));
         if(old) {
             Path cards=side.resolve("card-resources-v1"); List<Path> valid=new ArrayList<Path>();
             try {
@@ -336,12 +422,11 @@ public final class ResourceStore {
                     for(Path p:ds) { check(cancel); if(p.getFileName().toString().startsWith("ready-") && group(p,ResourceMetadata.CARD_PATHS,true,cancel,progress)) { valid.add(p); if(valid.size()==2) break; } }
                 }
             } catch(InterruptedIOException e) { throw e; } catch(IOException e) { check(cancel); }
-            if(valid.size()==1) card=valid.get(0); else if(valid.size()>1) warnings.add("发现多份有效卡片资源，未自动选择；可重新导入以明确选择");
+            if(valid.size()==1) sidecars.card=valid.get(0);
         } else {
-            Path c=root.resolve("card-resources"); if(group(c,ResourceMetadata.CARD_PATHS,true,cancel,progress)) card=c;
+            Path c=root.resolve("card-resources"); if(group(c,ResourceMetadata.CARD_PATHS,true,cancel,progress)) sidecars.card=c;
         }
-        if(card==null) warnings.add("卡片与扩展音乐资源不完整或未通过校验，已禁用相关功能");
-        return new Ready(root,optional,card,warnings,optionalFiles);
+        return sidecars;
     }
     /** A capability minted only after a bounded digest check. No public path constructor. */
     public static final class VerifiedOptional {
@@ -423,9 +508,13 @@ public final class ResourceStore {
         long total=0; for(ResourceMetadata.Entry e:metadata.files().values()) { if(e.length>EXTRA_LIMIT-total) throw new IOException("APK 附加资源校验目录大小超限"); total+=e.length; } return total;
     }
     private int zipEntries() { return (int)Math.min(16384L,(long)limits.maxEntries+8192); }
-    private void extract(SafeResourceZip zip,SafeResourceZip.Member member,Path target,Cancel cancel,Progress progress) throws IOException {
+    private String extract(SafeResourceZip zip,SafeResourceZip.Member member,Path target,Cancel cancel,Progress progress) throws IOException {
         directory(target.getParent(),true); safeChain(target); Files.createFile(target);
-        try(FileOutputStream out=new FileOutputStream(target.toFile())) { zip.consume(member,out,cancel,progress,"extract"); out.getFD().sync(); }
+        try(FileOutputStream out=new FileOutputStream(target.toFile())) {
+            String digest=zip.consume(member,out,cancel,progress,"extract");
+            out.getFD().sync();
+            return digest;
+        }
     }
     private DataManifest importMain(SafeResourceZip zip,Path root,Cancel cancel,Progress progress) throws IOException {
         if(rawArcade(zip.members.values())) throw new IOException("原版需要转换，本版不直接运行；请选择转换后的资源包");
@@ -433,7 +522,7 @@ public final class ResourceStore {
         long total=0,extraBytes=0;
         for(SafeResourceZip.Member m:zip.members.values()) {
             check(cancel); if(m.directory) { zip.consume(m,null,cancel,progress,"verify-zip"); continue; }
-            if(ResourceMetadata.allowed(m.name) || ResourceMetadata.FRONT_HALO_PATHS.contains(m.name) ||
+            if(ResourceMetadata.companionPath(m.name) ||
                     (m.name.equals(ResourceMetadata.GHOST_UI_PATH)&&metadata.find(m.name)!=null)) { if(m.length>EXTRA_LIMIT-extraBytes) throw new IOException("附加资源解压大小超过安全上限"); extraBytes+=m.length; extras.add(m); continue; }
             if(m.length>mainLimit()-total) throw new IOException("主资源解压大小超过安全上限"); total+=m.length; main.put(m.name,m);
         }
@@ -483,15 +572,104 @@ public final class ResourceStore {
         // never a misleading failed-import result after the old selection has been replaced.
         try { sync(state); return true; } catch(IOException | RuntimeException durabilityFailure) { return false; }
     }
+    private boolean isCompanion(SafeResourceZip zip) {
+        return zip.members.values().stream().anyMatch(m->!m.directory) &&
+                zip.members.values().stream().allMatch(m->m.directory || ResourceMetadata.companionPath(m.name));
+    }
+
+    private void importCompanion(SafeResourceZip zip,Path staging,Cancel cancel,Progress progress) throws IOException {
+        List<String> required=new ArrayList<>(ResourceMetadata.OPTIONAL_PATHS.subList(0,4));
+        required.addAll(ResourceMetadata.CARD_PATHS);
+        required.addAll(ResourceMetadata.CONVERTED_PATHS);
+        required.addAll(ResourceMetadata.FRONT_HALO_PATHS);
+        for(String name:required) {
+            SafeResourceZip.Member m=zip.members.get(name);
+            if(m==null || m.directory) throw new IOException("附加资源包缺少 " + name);
+        }
+        long bytes=extraTotal();
+        room(staging,bytes);
+        for(SafeResourceZip.Member m:zip.members.values()) {
+            check(cancel);
+            if(m.directory) { zip.consume(m,null,cancel,progress,"verify-zip"); continue; }
+            ResourceMetadata.Entry entry=metadata.find(m.name);
+            if(entry==null || entry.length!=m.length) throw new IOException("附加资源大小不符 " + m.name);
+            Path file=child(staging,m.name);
+            if(!entry.sha256.equals(extract(zip,m,file,cancel,progress)))
+                throw new IOException("附加资源内容不符 " + m.name);
+        }
+        syncTree(staging,cancel);
+        Path old=null;
+        try { old=companionRoot(); } catch(IOException invalid) { check(cancel); }
+        directory(companions,true);
+        String name=UUID.randomUUID().toString();
+        Path target=companions.resolve(name);
+        Files.move(staging,target,StandardCopyOption.ATOMIC_MOVE);
+        Path pointer=null;
+        boolean committed=false;
+        try {
+            sync(companions);
+            sync(external);
+            directory(state,true);
+            pointer=Files.createTempFile(state,"companion-",".tmp");
+            try(FileOutputStream out=new FileOutputStream(pointer.toFile())) {
+                out.write(name.getBytes(StandardCharsets.US_ASCII));
+                out.getFD().sync();
+            }
+            check(cancel);
+            Files.move(pointer,state.resolve(COMPANION_SELECTION),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
+            committed=true;
+        } finally {
+            if(!committed) try {
+                if(pointer!=null) Files.deleteIfExists(pointer);
+                deleteOwnedTree(target);
+            } catch(IOException ignored) { /* Original selection is still intact. */ }
+        }
+        try {
+            sync(state);
+            if(old!=null) deleteOwnedTree(old);
+        } catch(IOException ignored) { /* The selection was already committed. */ }
+    }
+
+    private static void deleteOwnedTree(Path root) throws IOException {
+        safeChain(root);
+        if(!exists(root)) return;
+        Files.walkFileTree(root,new SimpleFileVisitor<Path>() {
+            @Override public FileVisitResult visitFile(Path file,BasicFileAttributes attrs) throws IOException {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+            @Override public FileVisitResult postVisitDirectory(Path dir,IOException error) throws IOException {
+                if(error!=null) throw error;
+                Files.delete(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
     public Ready importArchive(InputStream input,Cancel cancel,Progress progress) throws IOException {
+        return importArchive(input,cancel,progress,false);
+    }
+
+    /** A null result in this overload means a companion was registered, with no main selection change. */
+    public Ready importArchive(InputStream input,Cancel cancel,Progress progress,boolean allowCompanion) throws IOException {
         if(input==null) throw new IOException("未选择导入文件"); check(cancel); preflight(true);
         Pending pending=readPending(cancel,progress); directory(imported,true); room(imported,RESERVE);
         String name=UUID.randomUUID().toString(); Path root=imported.resolve(name); Files.createDirectory(root); sync(imported); sync(external);
         // All cache files and failed/abandoned outputs stay within this unique owned root.
         Path cache=root.resolve(".source.zip"); Files.createFile(cache); copySource(input,cache,cancel,progress);
         DataManifest chosen;
+        boolean companion=false;
         try(SafeResourceZip zip=new SafeResourceZip(cache,zipEntries(),mainLimit()+EXTRA_LIMIT,cancel)) {
+            companion=allowCompanion && isCompanion(zip);
+            if(companion) {
+                Path staging=Files.createTempDirectory(root,"addons-");
+                importCompanion(zip,staging,cancel,progress);
+                return null;
+            }
             chosen=importMain(zip,root,cancel,progress);
+        } finally {
+            if(companion) try { deleteOwnedTree(root); }
+            catch(IOException ignored) { /* A temporary tree can be removed by clear resources. */ }
         }
         Ready result=ready(root,false,cancel,progress); syncTree(root,cancel); sync(imported); check(cancel);
         // Existing registered recovery is a separate controlled transaction, never a repair

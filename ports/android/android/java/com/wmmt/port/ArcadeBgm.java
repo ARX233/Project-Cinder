@@ -11,6 +11,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
 
 /** Decodes the first pass ahead of playback, then loops PCM in a single AudioTrack.
@@ -33,14 +35,30 @@ final class ArcadeBgm {
     };
 
     private final File source, cacheDir;
+    private final String tenCue;
     private final Listener listener;
     private final Thread worker;
     private volatile boolean closed, playing;
     private volatile float volume = 1;
+    private volatile Fade fade;
+
+    private static final class Fade {
+        final boolean in;
+        final long duration;
+        Fade(boolean in, int millis) {
+            this.in = in;
+            duration = millis * 1_000_000L;
+        }
+    }
 
     ArcadeBgm(File source, File cacheDir, Listener listener) {
+        this(source, cacheDir, null, listener);
+    }
+
+    ArcadeBgm(File source, File cacheDir, String tenCue, Listener listener) {
         this.source = source;
         this.cacheDir = cacheDir;
+        this.tenCue = tenCue;
         this.listener = listener;
         worker = new Thread(this::run, "cinder-bgm");
         worker.setDaemon(true);
@@ -48,6 +66,10 @@ final class ArcadeBgm {
 
     static boolean supports(String name) {
         return originalFrames(name) != 0 || name.matches("wm[2r]_[0-9][0-9]");
+    }
+
+    static boolean isTenCue(String name) {
+        return name != null && name.matches("ten_[a-e][1-9]");
     }
 
     /** Length of the arcade PCM data chunk in stereo frames at 44.1 kHz. */
@@ -78,7 +100,13 @@ final class ArcadeBgm {
 
     void start() { worker.start(); }
 
+    synchronized void fade(boolean in, int millis) {
+        fade = new Fade(in, millis);
+        notifyAll();
+    }
+
     synchronized void playback(boolean play, float gain) {
+        if (closed) return;
         playing = play;
         volume = gain;
         notifyAll();
@@ -100,13 +128,20 @@ final class ArcadeBgm {
     private void run() {
         File cache = null;
         try {
+            if (tenCue != null) {
+                try (RandomAccessFile bank = new RandomAccessFile(source, "r")) {
+                    TenCue cue = TenCue.read(bank.getChannel(), tenCue);
+                    output(bank.getChannel(), null, cue.offset, cue.length, cue.rate, 2);
+                }
+                return;
+            }
             cache = File.createTempFile("cinder-bgm-", ".pcm", cacheDir);
             try (RandomAccessFile pcm = new RandomAccessFile(cache, "rw");
                  Decoder decoder = new Decoder(source)) {
                 // On Android an open file remains accessible after unlink.
                 // A crash or replacement then leaves no decoded soundtrack in cache.
                 cache.delete();
-                output(pcm.getChannel(), decoder);
+                output(pcm.getChannel(), decoder, 0, 0, decoder.rate, decoder.channels);
             }
         } catch (Exception error) {
             if (!closed) listener.failed(this, error);
@@ -115,11 +150,55 @@ final class ArcadeBgm {
         }
     }
 
-    private void output(FileChannel pcm, Decoder decoder) throws IOException, InterruptedException {
-        int frameBytes = decoder.channels * 2;
-        int second = decoder.rate * frameBytes;
-        int mask = decoder.channels == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
-        int minimum = AudioTrack.getMinBufferSize(decoder.rate, mask, AudioFormat.ENCODING_PCM_16BIT);
+    private static void readFully(FileChannel channel, ByteBuffer bytes, long offset) throws IOException {
+        while (bytes.hasRemaining()) {
+            int read = channel.read(bytes, offset);
+            if (read <= 0) throw new IOException("Incomplete BGM stream");
+            offset += read;
+        }
+    }
+
+    private static final class TenCue {
+        final long offset;
+        final int length, rate;
+
+        TenCue(long offset, int length, int rate) {
+            this.offset = offset;
+            this.length = length;
+            this.rate = rate;
+        }
+
+        static TenCue read(FileChannel bank, String requested) throws IOException {
+            int tracks = 38;
+            ByteBuffer index = ByteBuffer.allocate(8 + tracks * 16).order(ByteOrder.LITTLE_ENDIAN);
+            readFully(bank, index, 0);
+            index.flip();
+            if (index.getInt() != 0x31425457 || index.getInt() != tracks)
+                throw new IOException("Invalid 10-rival BGM index");
+            long offset = index.limit(), size = bank.size();
+            TenCue found = null;
+            byte[] name = new byte[6];
+            for (int i = 0; i < tracks; ++i) {
+                index.get(name);
+                int pad = index.getShort(), rate = index.getInt(), length = index.getInt();
+                if (pad != 0 || (rate != 28000 && rate != 44100)
+                        || length <= 0 || length % 4 != 0 || length > size - offset)
+                    throw new IOException("Invalid 10-rival BGM range");
+                if (requested.equals(new String(name, StandardCharsets.US_ASCII)))
+                    found = new TenCue(offset, length, rate);
+                offset += length;
+            }
+            if (found == null || offset != size) throw new IOException("10-rival BGM cue unavailable");
+            return found;
+        }
+    }
+
+    private void output(FileChannel pcm, Decoder decoder, long sourceOffset, long sourceLength, int rate,
+                        int channels) throws IOException, InterruptedException {
+        int frameBytes = channels * 2;
+        int second = rate * frameBytes;
+        int mask = channels == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
+        int minimum = AudioTrack.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT);
         if (minimum <= 0) throw new IOException("Unsupported BGM output format");
         int bufferBytes = Math.max(minimum, second / 4);
         bufferBytes = (bufferBytes + frameBytes - 1) / frameBytes * frameBytes;
@@ -129,7 +208,7 @@ final class ArcadeBgm {
                         .setUsage(AudioAttributes.USAGE_GAME)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
                 .setAudioFormat(new AudioFormat.Builder().setChannelMask(mask)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(decoder.rate).build())
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate).build())
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setBufferSizeInBytes(bufferBytes)
                 .build();
@@ -141,40 +220,55 @@ final class ArcadeBgm {
             long stall = System.nanoTime() + STALL_NS;
             boolean ready = false, started = false;
             float applied = -1;
+            Fade activeFade = null;
+            long fadeTime = 0, fadeTick = 0;
             while (!closed) {
                 boolean progress = false;
-                if (!decoder.done && decoder.written - cursor < ahead) {
+                if (decoder != null && !decoder.done && decoder.written - cursor < ahead) {
                     progress = decoder.pump(pcm);
                     if (progress) stall = System.nanoTime() + STALL_NS;
                     else if (System.nanoTime() >= stall) throw new IOException("BGM decoder stalled");
                 } else stall = System.nanoTime() + STALL_NS;
-                boolean priming = !ready && (decoder.written >= bufferBytes || decoder.done);
-                if (priming && decoder.written < frameBytes) throw new IOException("Empty BGM stream");
+                long written = decoder == null ? sourceLength : decoder.written;
+                boolean complete = decoder == null || decoder.done;
+                boolean priming = !ready && (written >= bufferBytes || complete);
+                if (priming && written < frameBytes) throw new IOException("Empty BGM stream");
                 boolean wantPlay = ready && playing && !closed;
+                long now = System.nanoTime();
+                Fade currentFade = fade;
+                if (currentFade != activeFade) {
+                    activeFade = currentFade;
+                    fadeTime = 0;
+                } else if (started && wantPlay && activeFade != null) {
+                    fadeTime += now - fadeTick;
+                }
+                fadeTick = now;
+                float gain = volume;
+                if (activeFade != null) {
+                    float part = Math.min(1, (float) fadeTime / activeFade.duration);
+                    if (part == 1 && !activeFade.in) break;
+                    gain *= activeFade.in ? part : 1 - part;
+                }
                 if (started != wantPlay) {
                     if (wantPlay) {
-                        track.setVolume(volume);
-                        applied = volume;
+                        track.setVolume(gain);
+                        applied = gain;
                         track.play();
                     } else track.pause();
                     started = wantPlay;
                 }
                 if (started || priming) {
-                    float gain = volume;
                     if (gain != applied) {
                         track.setVolume(gain);
                         applied = gain;
                     }
                     if (!block.hasRemaining()) {
-                        if (decoder.done && cursor == decoder.written) cursor = 0;
-                        int size = (int) Math.min(block.capacity(), decoder.written - cursor);
+                        if (complete && cursor == written) cursor = 0;
+                        int size = (int) Math.min(block.capacity(), written - cursor);
                         if (size > 0) {
                             block.clear();
                             block.limit(size);
-                            while (block.hasRemaining()) {
-                                int read = pcm.read(block, cursor + block.position());
-                                if (read <= 0) throw new IOException("Incomplete decoded BGM");
-                            }
+                            readFully(pcm, block, sourceOffset + cursor);
                             cursor += size;
                             block.flip();
                         }
@@ -192,7 +286,7 @@ final class ArcadeBgm {
                         }
                     }
                 }
-                if (!progress) idle(ready && (decoder.done || decoder.written - cursor >= ahead));
+                if (!progress) idle(ready && (complete || written - cursor >= ahead));
             }
         } finally {
             track.release();

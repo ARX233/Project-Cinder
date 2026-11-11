@@ -77,10 +77,10 @@ public class MediaCodec {
 import java.nio.ByteBuffer;
 public class AudioTrack {
  public static final int MODE_STREAM=1,STATE_INITIALIZED=1,WRITE_NON_BLOCKING=1;
- public static volatile int count,bytes,plays,pauses,releases;
+ public static volatile int count,bytes,plays,pauses,releases,rate;
  public static final byte[] written=new byte[256];
  private boolean playing;
- public static int getMinBufferSize(int a,int b,int c){return 16;}
+ public static int getMinBufferSize(int a,int b,int c){rate=a;return 16;}
  public static class Builder {
   public Builder setAudioAttributes(AudioAttributes a){return this;}
   public Builder setAudioFormat(AudioFormat a){return this;}
@@ -106,6 +106,10 @@ package com.wmmt.port;
 import android.media.AudioTrack;
 import android.media.MediaCodec;
 import java.io.File;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -142,7 +146,33 @@ public class ArcadeBgmPcmTest {
   } finally {player.close();}
   await(()->AudioTrack.releases==1);
   check(failure.get()==null && temp.list().length==0);
-  System.out.println("PCM tail trim, continuous wrap, priming, pause/resume and cache cleanup passed");
+  File bank=new File(temp,"ten-bgm.bin");
+  ByteBuffer pcm=ByteBuffer.allocate(8+38*(16+8)).order(ByteOrder.LITTLE_ENDIAN);
+  pcm.putInt(0x31425457).putInt(38);
+  for(int i=0;i<38;++i){
+   String name=i==1?"ten_a2":"ten_xx";
+   pcm.put(name.getBytes(StandardCharsets.US_ASCII)).putShort((short)0).putInt(28000).putInt(8);
+  }
+  for(int i=0;i<38;++i)pcm.putInt(i+3).putInt(i+4);
+  Files.write(bank.toPath(),pcm.array());
+  AudioTrack.bytes=0;
+  CountDownLatch rawReady=new CountDownLatch(1);
+  ArcadeBgm raw=new ArcadeBgm(bank,temp,"ten_a2",new ArcadeBgm.Listener(){
+   public void ready(ArcadeBgm b){rawReady.countDown();}
+   public void failed(ArcadeBgm b,Exception e){failure.set(e);rawReady.countDown();}
+  });
+  raw.start();
+  try {
+   check(rawReady.await(3,TimeUnit.SECONDS)&&failure.get()==null);
+   raw.playback(true,.5f);
+   await(()->AudioTrack.bytes==AudioTrack.written.length);
+   for(int i=0;i<AudioTrack.written.length;i+=4)check(AudioTrack.written[i]==4+(i/4)%2);
+   check(AudioTrack.rate==28000&&MediaCodec.starts==1);
+   raw.fade(false,35);
+   await(()->AudioTrack.releases==2);
+  } finally {raw.close();}
+  check(failure.get()==null && temp.list().length==1);
+  System.out.println("AAC and original Ten PCM playback, continuous wrap, fade, pause/resume and cache cleanup passed");
  }
 }
 """

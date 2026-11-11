@@ -22,17 +22,15 @@ def parse(path):
     assert pos==len(b)
     return b,sprites,animations
 
-def check_original(new, old, root):
-    b,sprites,anims=parse(new/'junction-pages.wcp'); _,prev,prev_anims=parse(old/'junction-pages.wcp')
+def main():
+    new,old,root=map(Path,sys.argv[1:4]); b,sprites,anims=parse(new/'junction-pages.wcp'); _,prev,prev_anims=parse(old/'junction-pages.wcp')
     assert hashlib.sha256(b).hexdigest()=='79b1a23f907a3fe23878600591aa0f253c50e6c5ef3bf6c6dea67931831e1d62'
     assert anims==prev_anims and all(sprites[k]==v for k,v in prev.items())
     assert set(sprites)-set(prev)==set(m.BARRIER_SPRITES)
     for sid,(path,wh) in m.BARRIER_SPRITES.items():
         image=m.read_barrier_sprite(sid,path,root/path,wh)
         assert sprites[sid]==(*wh,image.tobytes())
-    print('old bytes and 3 original TGA pixels verified')
-
-def check_synthetic(work):
+    work=Path(tempfile.mkdtemp(prefix='junction-barrier-test-',dir='/Volumes/CodexWork'))
     path=work/'sample.tga'; png=work/'not-tga.tga'; small=work/'small.tga'
     Image.new('RGB',(256,256),(2,3,4)).save(path,format='TGA')
     Image.new('RGB',(256,256)).save(png,format='PNG')
@@ -43,15 +41,5 @@ def check_synthetic(work):
         try: m.read_barrier_sprite(sid,source,image,size)
         except ValueError: pass
         else: raise AssertionError('invalid barrier accepted')
-    print('synthetic barrier image validation passed')
-
-def main():
-    with tempfile.TemporaryDirectory(prefix='junction-barrier-test-') as tmp:
-        check_synthetic(Path(tmp))
-    if len(sys.argv) == 1:
-        print('SKIP original pack verification: supply NEW_PACK OLD_PACK GAME_ROOT')
-    elif len(sys.argv) == 4:
-        check_original(*map(Path, sys.argv[1:]))
-    else:
-        raise SystemExit('usage: test_junction_barrier_pack.py [NEW_PACK OLD_PACK GAME_ROOT]')
+    print('old bytes preserved; 3 original TGA pixels and validation failures verified:',work)
 if __name__=='__main__': main()

@@ -170,6 +170,7 @@ def _claim(output,name,targets,cancel):
 
 
 def _native_directory(feedback,recipe):
+    from .ao import PARALLEL_AO_SHA256,SERIAL_AO_SHA256
     path=Path(str(feedback.getNativeLibraryDir()))
     if not path.is_absolute() or not path.is_dir():raise OriginalInputError('Packaged extracted native-library directory unavailable')
     # No job/source path, environment command or dynamic downloaded library is used.
@@ -180,11 +181,13 @@ def _native_directory(feedback,recipe):
         if not isinstance(expected,str) or not HASH.fullmatch(expected):raise OriginalInputError('Missing native-library release pin')
         with p.open('rb') as library:
             actual=hashlib.file_digest(library,'sha256').hexdigest()
-        if actual!=expected:raise OriginalInputError('Native converter library differs from signed recipe: '+name)
+        if name=='liboa_native.so' and expected==SERIAL_AO_SHA256:
+            expected=PARALLEL_AO_SHA256
+        if actual!=expected:raise OriginalInputError('Native converter library differs from pinned implementation: '+name)
     return path
 
 
-def _convert_snapshot(snapshot,output,recipe,targets,scratch_parent,native_dir,*,cancel=None,progress=None):
+def _convert_snapshot(snapshot,output,recipe,targets,scratch_parent,native_dir,*,cancel=None,progress=None,ao_workers=None,ao_wall_budget=lambda:None,media_workers=None,checkpoint=None):
     """Trusted pipeline core; host integration can exercise it without claiming Android."""
     import gc
     from . import wheels,extras,cars,media,maps,player_paints,smoke
@@ -193,57 +196,114 @@ def _convert_snapshot(snapshot,output,recipe,targets,scratch_parent,native_dir,*
     from .menu_car_data import from_elf
     from .menu_components import pack_hud,pack_meters,pack_navi
     from .full_menu import pack_full_menu
-    from .ao import Backend,bake_owned
+    from .ao import Backend,MAX_AO_WORKERS,bake_owned_many
     start=time.monotonic();stages=[]
+    def saved(name):
+        return checkpoint is not None and checkpoint.has(name)
+    def record(name):
+        if checkpoint is not None:
+            checkpoint.save(name)
     def done(name,count):
         stages.append({'component':name,'files':count,'elapsed_seconds':round(time.monotonic()-start,3)})
         if progress:progress('completed-'+name,count,count)
         gc.collect()
     with FileTreeSource(snapshot.root,snapshot.readset) as source:
-        for index,row in enumerate(recipe['raw']):
-            output.copy_from(source,row['source'],row['path'],cancel=cancel)
-            if progress:progress('copy-original-runtime-data',index+1,len(recipe['raw']))
+        if not saved('raw'):
+            for index,row in enumerate(recipe['raw']):
+                output.copy_from(source,row['source'],row['path'],cancel=cancel)
+                if progress:progress('copy-original-runtime-data',index+1,len(recipe['raw']))
+            record('raw')
         done('raw',1030)
-        convert_physics_image(snapshot.root/'main',output.target('phys.img'),cancel=cancel,progress=progress)
-        _claim(output,'phys.img',targets,cancel);done('physics',1)
-        smoke.convert(snapshot,output,smoke.parse_plan(_canonical(recipe['smoke']),expected_sha256=recipe['smoke_plan_sha256']),cancel=cancel,progress=progress)
-        _claim(output,smoke.DEST,targets,cancel);done('tire-smoke',1)
-        cars.convert_cars(snapshot,output,_component_plan(cars,recipe['cars']),cancel=cancel,progress=progress);done('cars',265)
-        paint_plan=player_paints.parse_plan(_canonical(recipe['player_paints']),
-                                           expected_sha256=recipe['player_paints_plan_sha256'])
-        player_paints.convert(snapshot,output,paint_plan,cancel=cancel,progress=progress)
-        _claim(output,'player-body-paints.bin',targets,cancel);done('player-paints',1)
-        wheels.convert_wheels(snapshot,output,_component_plan(wheels,recipe['wheels']),cancel=cancel,progress=progress);done('wheels',149)
+        if not saved('physics'):
+            convert_physics_image(snapshot.root/'main',output.target('phys.img'),cancel=cancel,progress=progress)
+            _claim(output,'phys.img',targets,cancel)
+            record('physics')
+        done('physics',1)
+        if not saved('tire-smoke'):
+            smoke.convert(snapshot,output,smoke.parse_plan(_canonical(recipe['smoke']),expected_sha256=recipe['smoke_plan_sha256']),cancel=cancel,progress=progress)
+            _claim(output,smoke.DEST,targets,cancel)
+            record('tire-smoke')
+        done('tire-smoke',1)
+        if not saved('cars'):
+            cars.convert_cars(snapshot,output,_component_plan(cars,recipe['cars']),cancel=cancel,progress=progress)
+            record('cars')
+        done('cars',265)
+        if not saved('player-paints'):
+            paint_plan=player_paints.parse_plan(_canonical(recipe['player_paints']),
+                                               expected_sha256=recipe['player_paints_plan_sha256'])
+            player_paints.convert(snapshot,output,paint_plan,cancel=cancel,progress=progress)
+            _claim(output,'player-body-paints.bin',targets,cancel)
+            record('player-paints')
+        done('player-paints',1)
+        if not saved('wheels'):
+            wheels.convert_wheels(snapshot,output,_component_plan(wheels,recipe['wheels']),cancel=cancel,progress=progress)
+            record('wheels')
+        done('wheels',149)
         maps.check_dependencies()
         for city in ('tokyo','oosaka','hakone','nagoya','fukuoka'):
             for zone in ('daytime','night'):
+                stage=f'maps-{city}-{zone}'
+                if saved(stage):
+                    continue
                 plan=maps.plan_maps(snapshot,city,zone,cancel=cancel)
                 maps.convert_maps(plan,output,scratch_parent=scratch_parent,cancel=cancel,progress=progress,route_arrow_order=recipe['route_arrow_order'])
                 for name in plan.outputs:_claim(output,name,targets,cancel)
+                record(stage)
                 gc.collect()
         done('maps',40)
-        extras.convert_extras(snapshot,output,_component_plan(extras,recipe['extras']),scratch_parent=scratch_parent,cancel=cancel,progress=progress);done('extras',66)
-        support=OriginalSupport.from_main(snapshot.root/'main',cancel=cancel)
-        car_data=from_elf(support.elf,snapshot.root/'data/car',cancel=cancel)
-        def read(name,*,max_bytes,cancel=None):
-            if name not in snapshot.readset.files:raise OriginalInputError('2D dependency missing from APK read-set: '+name)
-            return source.read(name,max_bytes=max_bytes,cancel=cancel)
-        pack_hud(support,read,output.target('hud.bin'),cancel=cancel,progress=progress);_claim(output,'hud.bin',targets,cancel)
-        pack_meters(support,read,output.target('meters.bin'),car_data['pack_order'],cancel=cancel,progress=progress);_claim(output,'meters.bin',targets,cancel)
-        for name,asset in (('navi.bin','SkNavi.igb'),('navi_oosaka.bin','OsNavi.igb'),('navi_hakone.bin','HkNavi.igb'),('navi_nagoya.bin','NkNavi.igb'),('navi_fukuoka.bin','FkNavi.igb')):
-            pack_navi(support,read,output.target(name),asset,cancel=cancel,progress=progress);_claim(output,name,targets,cancel)
-        pack_full_menu(support,read,output.target('menu.bin'),car_data,scratch_parent=scratch_parent,cancel=cancel,progress=progress)
-        _claim(output,'menu.bin',targets,cancel);done('menu-hud-meters-navigation',8)
-        media.convert_media(snapshot,output,_component_plan(media,recipe['media']),library=native_dir/'liboc_media_overlay.so',cancel=cancel,progress=progress);done('media',26)
+        if not saved('extras'):
+            extras.convert_extras(snapshot,output,_component_plan(extras,recipe['extras']),scratch_parent=scratch_parent,cancel=cancel,progress=progress)
+            record('extras')
+        done('extras',66)
+        if not saved('menu-hud-meters-navigation'):
+            support=OriginalSupport.from_main(snapshot.root/'main',cancel=cancel)
+            car_data=from_elf(support.elf,snapshot.root/'data/car',cancel=cancel)
+            def read(name,*,max_bytes,cancel=None):
+                if name not in snapshot.readset.files:raise OriginalInputError('2D dependency missing from APK read-set: '+name)
+                return source.read(name,max_bytes=max_bytes,cancel=cancel)
+            pack_hud(support,read,output.target('hud.bin'),cancel=cancel,progress=progress);_claim(output,'hud.bin',targets,cancel)
+            pack_meters(support,read,output.target('meters.bin'),car_data['pack_order'],cancel=cancel,progress=progress);_claim(output,'meters.bin',targets,cancel)
+            for name,asset in (('navi.bin','SkNavi.igb'),('navi_oosaka.bin','OsNavi.igb'),('navi_hakone.bin','HkNavi.igb'),('navi_nagoya.bin','NkNavi.igb'),('navi_fukuoka.bin','FkNavi.igb')):
+                pack_navi(support,read,output.target(name),asset,cancel=cancel,progress=progress);_claim(output,name,targets,cancel)
+            pack_full_menu(support,read,output.target('menu.bin'),car_data,scratch_parent=scratch_parent,cancel=cancel,progress=progress)
+            _claim(output,'menu.bin',targets,cancel)
+            record('menu-hud-meters-navigation')
+        done('menu-hud-meters-navigation',8)
+        media_peak = 0
+        if not saved('media'):
+            media_plan = _component_plan(media,recipe['media'])
+            restored_media = [task.path for task in media_plan.tasks if task.path in output.files]
+            if len(restored_media) < len(media_plan.tasks):
+                if progress:progress('convert-media',len(restored_media),len(media_plan.tasks))
+                def media_done(name):
+                    if checkpoint is not None:
+                        checkpoint.save('media:'+name,[name])
+                report = media.convert_media(snapshot,output,media_plan,library=native_dir/'liboc_media_overlay.so',
+                                             cancel=cancel,progress=progress,worker_limit=media_workers,
+                                             restored=restored_media,on_converted=media_done)
+                media_peak = report['workers']
+        done('media',26)
+        stages[-1]['workers'] = media_peak
         # Run the expensive AO stage last: validate all 2D/media dependencies and
         # wiring before spending hour-scale CPU time. Quality and recipe unchanged.
         ao=Backend(native_dir/'liboa_native.so')
         ao_names=sorted(p for p,row in targets.items() if row['kind']=='ao')
         if len(ao_names)!=214:raise OriginalInputError('Incomplete AO recipe')
-        for index,name in enumerate(ao_names):
-            bake_owned(ao,output,name[:-3]+'.wpk',cancel=cancel)
-            if progress:progress('bake-ambient-occlusion',index+1,len(ao_names))
+        workers=0
+        pending=[name[:-3]+'.wpk' for name in ao_names if name not in output.files]
+        restored=len(ao_names)-len(pending)
+        if progress:progress('bake-ambient-occlusion',restored,len(ao_names))
+        def ao_progress(stage,done,total):
+            if progress:progress(stage,restored+done,len(ao_names))
+        def ao_done(name):
+            if checkpoint is not None:
+                checkpoint.save('ao:'+name,[name])
+        if pending:
+            workers=bake_owned_many(ao,output,pending,workers=MAX_AO_WORKERS if ao_workers else 1,
+                                    worker_limit=ao_workers,cancel=cancel,progress=ao_progress,
+                                    wall_budget_ms=ao_wall_budget(),on_baked=ao_done)
         done('ao',214)
+        stages[-1]['workers']=workers
         # Re-read every approved source after all native/Pillow/IGB work. The private
         # snapshot is read-only, but this detects accidental same-UID mutation too.
         for index,name in enumerate(sorted(snapshot.readset.files)):
@@ -263,7 +323,7 @@ def _ensure_signed_helpers():
     origin=getattr(stage,'__file__',None)
     if origin is None or Path(origin).absolute()!=expected/'__init__.py':
         raise OriginalInputError('Refusing stage helpers outside the signed application package')
-    for name in ('igb','tex','scene','pack','lualite','pack_cars','pack_vinyl','pack_lights','pack_neon','pack_mini','pack_tire_track','story_part_groups'):
+    for name in ('igb','tex','scene','pack','lualite','pack_cars','pack_vinyl','pack_lights','pack_neon','pack_mini','pack_tire_track','story_part_groups','pack_mileage_aura'):
         path=expected/(name+'.py')
         if path.is_symlink() or not path.is_file():raise OriginalInputError('Signed helper extraction is incomplete: '+name)
     if str(expected) not in sys.path:sys.path.insert(0,str(expected))
@@ -271,6 +331,13 @@ def _ensure_signed_helpers():
 
 def run_job(job_dir,feedback):
     """Called only by the APK nonexported :convert service; never publishes data."""
+    from .checkpoint import ConversionCheckpoint,write_record
+    from .mileage_aura import convert as convert_mileage_aura
+    from .finish_menu import convert as convert_finish_menu
+    from .ghost_match import convert as convert_ghost_match, convert_lemans_wheel
+    from .mileage_menu import convert as convert_mileage_menu
+    from .crown_scenes import convert as convert_crown_scenes
+    from .ten_bgm import BANK_LENGTH as TEN_BGM_LENGTH, convert as convert_ten_bgm
     from .release_assets import load_bundle
     from .runtime_check import validate_runtime
     from .validation import verify_owned_outputs,completion_bytes
@@ -281,32 +348,63 @@ def run_job(job_dir,feedback):
         check_cancel(cancel);feedback.onProgress(str(stage),int(current),int(total))
     check_cancel(cancel)
     runtime=validate_runtime(expected_versions=recipe['runtime'])
-    needed=readset.total_bytes+sum(row['max_bytes'] for row in targets.values())+128*1024*1024
-    space=os.statvfs(root)
-    if space.f_bavail*space.f_frsize<needed:raise OriginalInputError('Insufficient private storage for verified snapshot and complete output')
     native_dir=_native_directory(feedback,recipe)
-    if job['source_kind']=='zip':
-        from .archive import ArchiveSource
-        source=ArchiveSource(root/'incoming.zip',readset,cancel=cancel)
-    else:source=FileTreeSource(root/'incoming',readset)
     started=time.monotonic()
-    with source:snapshot=VerifiedSnapshot.create(source,root/'snapshots',cancel=cancel,progress=progress)
+    checkpoint=ConversionCheckpoint(root,job,targets,cancel)
+    snapshot=None
+    snapshot_name=checkpoint.record['snapshot']
+    if snapshot_name is None:
+        # Pre-checkpoint releases also left private snapshots. Only use a
+        # complete one after every file matches the current signed read-set.
+        candidates=sorted((p for p in (root/'snapshots').iterdir()
+                           if re.fullmatch(r'original-source-[0-9a-f]{32}',p.name)
+                           and p.is_dir() and not p.is_symlink()),
+                          key=lambda p:p.stat().st_mtime_ns,reverse=True)
+        if candidates:
+            snapshot_name=candidates[0].name
+    if snapshot_name is not None:
+        from .source import ConversionCancelled
+        try:
+            snapshot=VerifiedSnapshot.reopen(root/'snapshots',snapshot_name,readset,
+                                             cancel=cancel,progress=progress)
+        except ConversionCancelled:
+            raise
+        except OSError:
+            pass  # The sealed source remains available for a fresh snapshot.
+    if snapshot is None:
+        if job['source_kind']=='zip':
+            from .archive import ArchiveSource
+            source=ArchiveSource(root/'incoming.zip',readset,cancel=cancel)
+        else:source=FileTreeSource(root/'incoming',readset)
+        with source:
+            snapshot=VerifiedSnapshot.create(source,root/'snapshots',cancel=cancel,progress=progress)
+    if checkpoint.record['snapshot'] != snapshot.root.name:
+        checkpoint.set_snapshot(snapshot)
     check_cancel(cancel)
-    output=OwnedOutput(root/'outputs')
+    output=checkpoint.open_output()
+    needed=sum(row['max_bytes'] for name,row in targets.items() if name not in output.files)+128*1024*1024
+    space=os.statvfs(root)
+    if space.f_bavail*space.f_frsize<needed:
+        raise OriginalInputError('Insufficient private storage for remaining conversion outputs')
     _ensure_signed_helpers()
-    stages=_convert_snapshot(snapshot,output,recipe,targets,root/'snapshots',native_dir,cancel=cancel,progress=progress)
+    media_workers=getattr(feedback,'mediaWorkerCount',None)
+    stages=_convert_snapshot(snapshot,output,recipe,targets,root/'snapshots',native_dir,cancel=cancel,progress=progress,
+                             ao_workers=lambda:int(feedback.aoWorkerCount()),
+                             ao_wall_budget=lambda:int(feedback.aoWallBudgetMillis()),
+                             media_workers=(lambda:int(media_workers())) if media_workers else None,checkpoint=checkpoint)
+    aura_packed=convert_mileage_aura(root,job['source_kind'],cancel=cancel,progress=progress)
+    mileage_menu_packed=convert_mileage_menu(root,job['source_kind'],cancel=cancel,progress=progress)
+    ghost_match_packed=convert_ghost_match(root,job['source_kind'],cancel=cancel,progress=progress)
+    ghost_wheel_packed=convert_lemans_wheel(root,job['source_kind'],cancel=cancel,progress=progress)
+    finish_menu_packed=convert_finish_menu(root,job['source_kind'],cancel=cancel,progress=progress)
+    crown_scenes_packed=convert_crown_scenes(root,job['source_kind'],cancel=cancel,progress=progress)
+    space=os.statvfs(root)
+    ten_bgm_packed=(space.f_bavail*space.f_frsize >= TEN_BGM_LENGTH + 64*1024*1024 and
+                    convert_ten_bgm(root,job['source_kind'],cancel=cancel,progress=progress))
     rows=verify_owned_outputs(output,targets,cancel=cancel,progress=progress)
     complete=completion_bytes(job,output,rows)
-    check_cancel(cancel)
-    fd=os.open(root/'completion.tsv',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
-    try:
-        view=memoryview(complete)
-        while view:
-            check_cancel(cancel);n=os.write(fd,view)
-            if n<=0:raise OriginalInputError('Completion record short write')
-            view=view[n:]
-        os.fsync(fd)
-    finally:os.close(fd)
+    progress('write-original-completion',0,1)
+    write_record(root/'completion.tsv',complete,replace=False)
     # Main process must still re-read, verify, copy and atomically select. No Ready,
     # legacy DMF or user-output signature is created in this worker.
     return json.dumps({'schema':'wmmt-original-result-v1','job_id':job['job_id'],'profile_sha256':job['profile_sha256'],
@@ -314,4 +412,9 @@ def run_job(job_dir,feedback):
                        'output':output.root.name,'files':1801,'source_files':len(readset.files),'source_bytes':snapshot.bytes,
                        'complete_dataset':True,'activated':False,'publication_authority':False,
                        'elapsed_seconds':round(time.monotonic()-started,3),'components':stages,
-                       'runtime':runtime,'completion_sha256':hashlib.sha256(complete).hexdigest()},sort_keys=True,separators=(',',':'))
+                       'runtime':runtime,'mileage_aura_packed':aura_packed,'mileage_menu_packed':mileage_menu_packed,
+                       'ghost_match_packed':ghost_match_packed,'ghost_wheel_packed':ghost_wheel_packed,
+                       'finish_menu_packed':finish_menu_packed,
+                       'crown_scenes_packed':crown_scenes_packed,
+                       'ten_bgm_packed':ten_bgm_packed,
+                       'completion_sha256':hashlib.sha256(complete).hexdigest()},sort_keys=True,separators=(',',':'))

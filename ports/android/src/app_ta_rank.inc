@@ -1,6 +1,4 @@
-/* Production TA completion -> independent LOCAL_UNVERIFIED machine board.
- * Included after app_ghost.inc. No original RC calls, clock/RNG writes, old PB
- * migration, renderer I/O, claimed server rank, or change to title awards. */
+/* Native time-attack completion, local records, and community timing sync. */
 #include "ta_rank.h"
 #include "ta_rank_outbox.h"
 #include "ghost_arcade_models.inc"
@@ -22,11 +20,13 @@ static struct {
   int initialized, entropy;
 #ifdef __ANDROID__
   struct {
-    double poll_after, send_after, send_deadline, fetch_after, fetch_deadline;
-    uint32_t cursor;
+    double poll_after, send_after, fetch_after[TA_RANK_COURSES], result_deadline;
+    uint32_t cursor, boards_ready;
     uint8_t inflight[16];
-    int sending, fetching, course, traffic;
-    ta_rank_view board;
+    int sending, sending_result, sent_course, fetching, fetch_course;
+    int live_pending;
+    ta_rank_attempt live;
+    ta_rank_view board[TA_RANK_COURSES];
   } remote;
 #endif
   struct {
@@ -34,6 +34,7 @@ static struct {
     long long born;
     float last_elapsed;
     int final_snap;
+    unsigned local_position;
     uint32_t final_elapsed_bits;
     car_ta_ranking_observation binding;
     ta_rank_attempt attempt;
@@ -164,8 +165,8 @@ static void app_ta_rank_read_saved_pb(void) {
   }
 }
 #ifdef __ANDROID__
-extern int android_timing_cloud_submit(const uint8_t *,size_t);
-extern int android_timing_cloud_ack(void);
+extern int android_timing_cloud_submit(const uint8_t *,size_t,int);
+extern int android_timing_cloud_ack(unsigned char **,size_t *);
 extern int android_timing_cloud_refresh(const char *,const char *,int,int);
 extern int android_timing_cloud_board(unsigned char **,size_t *);
 
@@ -175,60 +176,98 @@ static void app_ta_rank_hex(char out[65],const uint8_t hash[32]) {
   out[64]=0;
 }
 
-static void app_ta_rank_cloud_tick(int course,int traffic) {
+static int app_ta_rank_show_receipt(const unsigned char *data,size_t bytes) {
+  if(bytes!=20 || memcmp(ATR.remote.inflight,ATR.run.attempt.attempt,16))return 0;
+  uint32_t total;
+  if(!ta_rank_time_ms(ATR.run.attempt.native_elapsed_bits,&total))return 0;
+  uint32_t best[3]={ah_u32(data),ah_u32(data+4),ah_u32(data+8)};
+  unsigned rank=ah_u32(data+12),flags=ah_u32(data+16);
+  if(!best[0] || best[0]>best[1] || best[0]>best[2] || best[1]>total || best[2]>total ||
+     rank>TA_RANK_TOP || flags>7)return 0;
+  menu_ta_finish_records(&G.menu,best,rank,flags);
+  return 1;
+}
+
+static void app_ta_rank_cloud_tick(int course) {
   double now=now_ms();
   if(now<ATR.remote.poll_after)return;
   ATR.remote.poll_after=now+250;
+  menu_result *result=&G.menu.result;
+  int pending=G.menu.finish && G.menu.finish_goal && !G.menu.finish_story && !G.menu.finish_ghost &&
+    G.menu.game==MENU_GAME_TA && result->cloud_status==MENU_TA_RESULT_PENDING;
   if(!android_ghost_cloud_configured()) {
-    ATR.remote.sending=ATR.remote.fetching=0;
-    ATR.remote.board.row_count=0;
-    ATR.remote.send_after=ATR.remote.fetch_after=0;
+    ATR.remote.sending=ATR.remote.fetching=ATR.remote.live_pending=0;
+    ATR.remote.boards_ready=0;
+    ATR.remote.send_after=0;
+    memset(ATR.remote.fetch_after,0,sizeof ATR.remote.fetch_after);
+    if(pending)result->cloud_status=MENU_TA_RESULT_LOCAL;
     return;
   }
   if(ATR.remote.sending) {
-    int ack=android_timing_cloud_ack();
-    if(ack || now>=ATR.remote.send_deadline) {
-      if(ack==1 && ATR.pending_open) {
+    unsigned char *data=NULL;
+    size_t bytes=0;
+    int reply=android_timing_cloud_ack(&data,&bytes);
+    if(reply) {
+      int accepted=reply>0 && (bytes==20 || (bytes==1 && data[0]==1));
+      if(accepted && ATR.pending_open) {
         ta_rank_status saved=ta_rank_outbox_ack(ATR.pending,ATR.remote.inflight);
         if(saved!=TA_RANK_NOT_FOUND)ATR.pending_status=saved;
-        ATR.remote.fetch_after=0;
+      }
+      if(accepted)ATR.remote.fetch_after[ATR.remote.sent_course]=0;
+      if(pending && ATR.remote.sending_result && !memcmp(ATR.remote.inflight,ATR.run.attempt.attempt,16)) {
+        if(!accepted || !app_ta_rank_show_receipt(data,bytes))result->cloud_status=MENU_TA_RESULT_LOCAL;
+        pending=0;
       }
       ATR.remote.sending=0;
-      ATR.remote.send_after=now+(ack==1?250:15000);
+      ATR.remote.send_after=now+(accepted?250:15000);
     }
+    free(data);
   }
-  uint32_t count=ta_rank_outbox_count(ATR.pending);
-  if(!ATR.remote.sending && ATR.pending_open && count && now>=ATR.remote.send_after) {
-    uint32_t index=ATR.remote.cursor++%count;
-    ta_rank_attempt a;
+  if(pending && now>=ATR.remote.result_deadline) {
+    result->cloud_status=MENU_TA_RESULT_LOCAL;
+    ATR.remote.live_pending=0;
+  }
+  if(!ATR.remote.sending) {
+    uint32_t count=ta_rank_outbox_count(ATR.pending);
+    ta_rank_attempt attempt;
+    int live=ATR.remote.live_pending,have=live;
+    if(live)attempt=ATR.remote.live;
+    else if(ATR.pending_open && count && now>=ATR.remote.send_after) {
+      uint32_t index=ATR.remote.cursor++%count;
+      have=ta_rank_outbox_copy(ATR.pending,index,&attempt,NULL)==TA_RANK_OK;
+    }
     uint8_t record[TA_RANK_COMMUNITY_ROW_BYTES];
-    if(ta_rank_outbox_copy(ATR.pending,index,&a,NULL)==TA_RANK_OK && ta_rank_community_encode(&a,record) &&
-       android_timing_cloud_submit(record,sizeof record)) {
-      memcpy(ATR.remote.inflight,a.attempt,16);
+    if(have && ta_rank_community_encode(&attempt,record) && android_timing_cloud_submit(record,sizeof record,live)) {
+      memcpy(ATR.remote.inflight,attempt.attempt,16);
       ATR.remote.sending=1;
-      ATR.remote.send_deadline=now+20000;
+      ATR.remote.sending_result=live;
+      ATR.remote.sent_course=(int)attempt.partition.course_id;
+      if(live)ATR.remote.live_pending=0;
     }
   }
   if(ATR.remote.fetching) {
     unsigned char *data=NULL;size_t bytes=0;
     int reply=android_timing_cloud_board(&data,&bytes);
-    if(reply || now>=ATR.remote.fetch_deadline) {
-      ta_rank_partition part={.course_id=(uint32_t)ATR.remote.course,.traffic=(uint32_t)ATR.remote.traffic};
+    if(reply) {
+      int fetched=ATR.remote.fetch_course;
+      ta_rank_partition part={.course_id=(uint32_t)fetched,.traffic=0};
       memcpy(part.rules_sha256,ATR.rules,32);memcpy(part.physics_sha256,ATR.physics,32);
-      if(reply!=1 || !ta_rank_community_board(data,bytes,&part,&ATR.remote.board))ATR.remote.board.row_count=0;
+      if(reply>0 && ta_rank_community_board(data,bytes,&part,&ATR.remote.board[fetched])) {
+        ATR.remote.boards_ready|=1u<<fetched;
+        ATR.remote.fetch_after[fetched]=now+15000;
+      } else {
+        ATR.remote.boards_ready&=~(1u<<fetched);
+        ATR.remote.fetch_after[fetched]=now+4000;
+      }
       ATR.remote.fetching=0;
     }
     free(data);
   }
-  if(!ATR.remote.fetching && course>=0 && ATR.book &&
-     (course!=ATR.remote.course || traffic!=ATR.remote.traffic || now>=ATR.remote.fetch_after)) {
+  if(!ATR.remote.fetching && course>=0 && course<TA_RANK_COURSES && ATR.book && now>=ATR.remote.fetch_after[course]) {
     char rules[65],physics[65];
     app_ta_rank_hex(rules,ATR.rules);app_ta_rank_hex(physics,ATR.physics);
-    ATR.remote.fetching=android_timing_cloud_refresh(rules,physics,course,traffic);
-    if(ATR.remote.fetching) {
-      ATR.remote.course=course;ATR.remote.traffic=traffic;
-      ATR.remote.fetch_after=now+15000;ATR.remote.fetch_deadline=now+20000;
-    }
+    ATR.remote.fetching=android_timing_cloud_refresh(rules,physics,course,0);
+    if(ATR.remote.fetching)ATR.remote.fetch_course=course;
   }
 }
 #endif
@@ -240,15 +279,14 @@ static void app_ta_rank_menu(void) {
   int course=G.menu.screen==MENU_RANKING ? menu_ta_rank_course(&G.menu) : -1;
   int traffic=!!G.menu.ta_traffic;
 #ifdef __ANDROID__
-  app_ta_rank_cloud_tick(course,traffic);
+  int prefetch=G.menu.screen==MENU_TITLE ? menu_ta_rank_course(&G.menu) : course;
+  app_ta_rank_cloud_tick(prefetch);
 #endif
   if(G.menu.screen!=MENU_RANKING){ATR.legacy_pb_loaded=0;return;}
   if(!ATR.legacy_pb_loaded){app_ta_rank_read_saved_pb();ATR.legacy_pb_loaded=1;}
 #ifdef __ANDROID__
-  const ta_rank_view *remote=&ATR.remote.board;
-  if(course>=0 && remote->row_count && remote->partition.course_id==(uint32_t)course &&
-     remote->partition.traffic==(uint32_t)traffic) {
-    menu_set_ta_rank_view(&G.menu,remote,MENU_TA_RANK_COMMUNITY);
+  if(course>=0 && course<TA_RANK_COURSES && (ATR.remote.boards_ready&(1u<<course))) {
+    menu_set_ta_rank_view(&G.menu,&ATR.remote.board[course],MENU_TA_RANK_COMMUNITY);
     if(G.menu.ta_rank_valid)return;
   }
 #endif
@@ -375,6 +413,21 @@ static void app_ta_rank_finish(const car_race *race) {
    * and does not recover an earlier failed proposal. Only real publication OK
    * clears its last error/COMMITTED_UNSYNCED disclosure. */
   if(status!=TA_RANK_NO_CHANGE && status!=TA_RANK_DUPLICATE)ATR.store_status=status;
+  ATR.run.local_position=sub.position;
+#ifdef __ANDROID__
+  if(android_ghost_cloud_configured()) {
+    ATR.remote.live=*a;
+    ATR.remote.live_pending=1;
+    ATR.remote.result_deadline=now_ms()+12000.0;
+  }
+#endif
   fprintf(stderr,"TA local board: %s; position %u; pending %s/%u; LOCAL_UNVERIFIED, no server receipt\n",
     ta_rank_error(status),sub.position,ta_rank_outbox_error(queued),ta_rank_outbox_count(ATR.pending));
+}
+
+static void app_ta_rank_result(menu_result *result) {
+  result->rank=(int)ATR.run.local_position;
+#ifdef __ANDROID__
+  if(ATR.remote.live_pending)result->cloud_status=MENU_TA_RESULT_PENDING;
+#endif
 }

@@ -12,7 +12,8 @@ static struct {
   short rival_name[5]; /* glyphs snapshotted from the bound original identity */
   unsigned request;
   uint64_t serial, token, crown_revision;
-  int crown_challenge, player_recording;
+  int crown_challenge, player_recording, cloud_crown;
+  unsigned char crown_opponent[16];
   car_spec owner;
   car_ghost_config config;
   int checked, checked_ramp, checked_route, local_available;
@@ -155,7 +156,8 @@ static void app_ghost_menu(void) {
   menu_state *m = &G.menu;
   if (!app_ghost_mode()) {
     if (AG.entered || AG.prepared || AG.active) { app_ghost_clear(); AG.entered = 0; }
-    if (AC.catalog || AC.attempted || GC.wait) app_arcade_unbind();
+    if (AC.catalog || AC.attempted) app_arcade_unbind();
+    app_cloud_menu(); /* prefetch authenticated player recordings before entering Ghost */
     return;
   }
   if (!AG.entered) {
@@ -172,7 +174,7 @@ static void app_ghost_menu(void) {
   if (AG.prepared && !menu_ghost_preparing(m) && !menu_ghost_choosing_options(m)) app_ghost_clear(); /* Back/cancel/stale request */
   app_cloud_menu();
   app_arcade_directory();
-  if(GC.search_ready && (AC.published || (AC.attempted && !AC.catalog))) {
+  if(GC.search_ready && AC.published) {
     menu_ghost_search_complete(m,GC.search_ready>0);
     GC.search_ready=0;
   }
@@ -188,15 +190,25 @@ static void app_ghost_menu(void) {
     if (app_arcade_requested(request)) app_replay_arm();
     return;
   }
+  if ((action==MENU_GHOST_CHALLENGE_LOCAL_CROWN ||
+       (action==MENU_GHOST_CHALLENGE_DEFAULT && m->ghost.search_kind==0 && m->ghost.level==9)) &&
+      m->ghost.directory.cloud_crowns!=android_ghost_cloud_configured()) {
+    (void)menu_ghost_complete(m,request,0,"CROWN CONNECTION CHANGED - SELECT AGAIN");
+    return;
+  }
   if (action == MENU_GHOST_CHALLENGE_DEFAULT) {
     if (app_default_requested(request)) {
-      if (m->ghost.search_kind==0 && m->ghost.level==9) app_crown_arm();
+      if (m->ghost.search_kind==0 && m->ghost.level==9) {
+        AG.cloud_crown=m->ghost.directory.cloud_crowns;
+        app_crown_arm();
+      }
       app_replay_arm();
     }
     return;
   }
   if (action == MENU_GHOST_CHALLENGE_LOCAL_CROWN) {
-    if (app_crown_requested(request)) app_replay_arm();
+    if (m->ghost.directory.cloud_crowns ? app_cloud_crown_requested(request) : app_crown_requested(request))
+      app_replay_arm();
     return;
   }
   if (action == MENU_GHOST_CHALLENGE_CLOUD) {
@@ -306,13 +318,26 @@ static int app_ghost_finish(void) {
       storage_note=app_arcade_history_player(result==MENU_GHOST_RESULT_WIN);
     if(valid)app_cloud_report(result==MENU_GHOST_RESULT_WIN,o.gap_m);
     int crown=AG.crown_challenge && result==MENU_GHOST_RESULT_WIN;
+    int crown_award=0;
+    unsigned crown_owned=0;
     if (valid && (crown || AG.player_recording)) {
       ghost_crown_record record={0};
       int captured=app_ghost_capture_profile(o.export_ready,&record);
       int saved=captured && app_replay_save(&record,(unsigned)AG.arcade_area);
       int queued=captured && app_cloud_publish(&record,(unsigned)AG.arcade_area);
       char error[sizeof AC.crown_note];
-      const char *note=crown?app_crown_publish(captured?&record:NULL,error,sizeof error):NULL;
+      const char *note=NULL;
+      if(crown) {
+        if(AG.cloud_crown) {
+          char key[33];
+          if(GC.crown_ready && app_ghost_card_key(key) && !strcmp(key,GC.crown_card))
+            crown_owned=GC.crown_owned;
+          note=app_cloud_crown_publish(captured?&record:NULL,&crown_award);
+        } else {
+          note=app_crown_publish(captured?&record:NULL,error,sizeof error,&crown_award);
+          if(crown_award)crown_owned=app_ghost_local_crowns();
+        }
+      }
       const char *cloud=queued?"CLOUD REPLAY QUEUED":saved?"PLAYER REPLAY SAVED":"";
       snprintf(AC.crown_note,sizeof AC.crown_note,"%s%s%s",note?note:"",note && *cloud?" / ":"",cloud);
       ghost_crown_free(&record);
@@ -320,6 +345,9 @@ static int app_ghost_finish(void) {
     }
     if (G.car.race.play_state != 3) { /* Target result2 skips the console for manual retirement. */
       menu_finish_ghost(&G.menu, result, valid, o.gap_m, player_rank, AG.arcade_binding.target_rank);
+      if(crown_award)menu_finish_set_crown_award(&G.menu,AG.arcade_area,crown_owned,AG.cloud_crown);
+      app_finish_mileage();
+      if (!G.menu.save_skip) garage_save();
       if (storage_note) app_ghost_note(storage_note);
       return 0; /* the race still owns the display until menu_finish_update leaves */
     }

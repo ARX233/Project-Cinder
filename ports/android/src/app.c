@@ -61,6 +61,7 @@ void android_story_bgm_pause(void);
 #include "backfire_wpk.h"
 #include "mathx.h"
 #include "menu.h"
+#include "mileage_style.h"
 #include "card_choice_store.h"
 #include "story_evidence_store.h"
 #include "minicourse.h"
@@ -341,6 +342,8 @@ static struct {
   int ten_freeze;   /* frames left of a beaten 10-in-a-row rival's still, negative frame */
   int ten_beaten_on; /* that frame's play state 9 has been seen (till it goes) */
   int ten_bgm_off;  /* the last rival is beaten: no race BGM */
+  const char *ten_bgm;
+  int ten_bgm_round;
   int ten_white;    /* frames since the 10-in-a-row's white went up (0: none) */
   int sign, sign_t; /* the route sign over the car, and frames to its next sound */
   int best_ms[CAR_COURSES]; /* the player's best time on each course (data_dir/records), 0 = none */
@@ -352,6 +355,7 @@ static struct {
   /* the titles (src/title.h): the card before the race (judgeTitle's PRE) and its mileage then */
   title_card title_pre;
   double title_odo0;
+  float story_mileage_pending_mm, story_mileage_unrestored_mm;
   /* the CPU rivals: the race's first (RIVALDB, -1 none; the others are the rows after it,
    * rival_rows), and each one's car model and paint (rival_look) */
   int rival, n_rival, rival_pack[CAR_RIVALS], rival_paint[CAR_RIVALS];
@@ -412,6 +416,7 @@ static void app_body_drop(int context_lost);
 static void app_body_evict_pack(int pack);
 static void app_body_evict_scene(wpk_scene *scene);
 static void app_body_reset(int context_lost);
+static void mileage_aura_open(const char *data_dir);
 static player_body_paint_identity app_body_identity(const menu_body_color_view *v);
 static int app_body_prepare(player_body_paint_cache *cache,const menu_body_color_view *v,wpk_scene *scene);
 static int app_body_menu_prepare(const menu_scene *shown);
@@ -1404,6 +1409,7 @@ static double title_odo(void) {
   return G.menu.own_sel >= 0 && G.menu.own_sel < G.menu.n_own ? G.menu.own[G.menu.own_sel].odo : 0.0;
 }
 
+
 static void title_card_now(title_card *c) {
   const menu_state *m = &G.menu;
   int mk = m->maker, car = m->car;
@@ -1804,6 +1810,12 @@ static void garage_load(void) {
       if (car_by_label(label, &mk, &c)) (void)menu_body_color_restore(&G.menu,mk,c,a);
       continue; /* additive cosmetic record; never substitutes own[].color */
     }
+    if (sscanf(line, "cdrive %d %d %199[^\n]", &a, &b, label) == 3) {
+      int mk, c;
+      unsigned value = mileage_style_encode(a, b);
+      if (value && car_by_label(label, &mk, &c)) G.menu.drive_style_car[mk][c] = (unsigned char)value;
+      continue;
+    }
     if (sscanf(line, "cstory %d %d %199[^\n]", &a, &b, label) == 3) {
       int mk, c;
       if (car_by_label(label, &mk, &c) && a >= 0) G.menu.st_div_car[mk][c] = a, G.menu.st_bits_car[mk][c] = b & 0xfffff;
@@ -1931,6 +1943,11 @@ static void garage_save(void) {
       fprintf(f, "ccolor %u %s\n", (unsigned)G.menu.custom_color[o->maker][o->car],label);
     fprintf(f, "cstory %d %d %s\n", G.menu.st_div_car[o->maker][o->car], G.menu.st_bits_car[o->maker][o->car], label);
     fprintf(f, "cclass %d %s\n", G.menu.class_car[o->maker][o->car], label);
+    if (G.menu.drive_style_car[o->maker][o->car]) {
+      int contact, wall;
+      mileage_style_decode(G.menu.drive_style_car[o->maker][o->car], &contact, &wall);
+      fprintf(f, "cdrive %d %d %s\n", contact, wall, label);
+    }
     /* the versus stars and count (the card's +0x180, +0x17c) */
     fprintf(f, "cstar %d %d %s\n", G.menu.vs_stars_car[o->maker][o->car], G.menu.vs_count_car[o->maker][o->car], label);
     fprintf(f, "ctitle %d %d %d %s\n", G.menu.title_car[o->maker][o->car], G.menu.st_streak_car[o->maker][o->car],
@@ -2462,6 +2479,7 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   if (G.console) render_aniso(16);
   snprintf(G.data_dir, sizeof G.data_dir, "%s", data_dir);
   backfire_open(data_dir);
+  mileage_aura_open(data_dir);
 #ifdef __ANDROID__
   player_tracks_open(data_dir);
   player_smoke_open(data_dir);
@@ -2692,10 +2710,84 @@ void app_movie_done(void) {
   if (G.in_menu && G.menu.screen == MENU_MOVIE) menu_movie_done(&G.menu);
 }
 
-/* the race's song stops with the last 10-in-a-row rival (clAudio::stopStream); result2 still
- * plays the result's (0x6d) */
+static const char *ten_round_bgm(const menu_state *m, int round) {
+#ifdef __ANDROID__
+  /* Arcade getTenRoundBgm10 (0x857ec40), using the cue names from its stream table. */
+  static const char *const regular[5][10] = {
+    { "ten_d1", "ten_d2", "ten_d2", "ten_d3", "ten_d3",
+      "ten_d4", "ten_d4", "ten_d5", "ten_d5", "ten_d6" },
+    { "ten_e1", "ten_e2", "ten_e2", "ten_e3", "ten_e3",
+      "ten_e4", "ten_e4", "ten_e5", "ten_e6", "ten_e7" },
+    { "ten_a1", "ten_a2", "ten_a3", "ten_a4", "ten_a5",
+      "ten_a6", "ten_a7", "ten_a8", "ten_a8", "ten_a9" },
+    { "ten_b1", "ten_b2", "ten_b3", "ten_b4", "ten_b5",
+      "ten_b6", "ten_b6", "ten_b7", "ten_b7", "ten_b8" },
+    { "ten_c1", "ten_c2", "ten_c3", "ten_c4", "ten_c5",
+      "ten_c6", "ten_c6", "ten_c7", "ten_c7", "ten_c8" }
+  };
+  if (m->ten_level < 0 || m->ten_level > 10 || round < 0) return NULL;
+  if (m->ten_level < 10) return round < 10 ? regular[m->ten_level % 5][round] : NULL;
+  /* Arcade getTenRoundBgmExtend (0x857ec5c): soundtrack from the card, an optional
+   * alternative selected once at the boundary, and no change between listed rounds. */
+  static const struct {
+    int round;
+    const char *track[3][2];
+  } extended[] = {
+    {  0, {{ "wm3DX_P_race_02" },             { "wm2_01", "wm2_02" }, { "wmr_01" }} },
+    {  2, {{ "wm3DX_P_race_03" },             { "wm2_03", "wm2_04" }, { "wmr_02" }} },
+    {  5, {{ "wm3_12" },                      { "wm2_06", "wm2_09" }, { "wmr_05" }} },
+    {  8, {{ "wm3DX_P_race_04" },             { "wm2_11" },           { "wmr_08" }} },
+    { 11, {{ "wm3_10", "wm3_11" },            { "wm2_14" },           { "wmr_09" }} },
+    { 14, {{ "wm3_04" },                      { "wm2_05", "wm2_08" }, { "wmr_01" }} },
+    { 17, {{ "wm3_08" },                      { "wm2_10", "wm2_17" }, { "wmr_06" }} },
+    { 20, {{ "wm3DX_P_race_01" },             { "wm2_07", "wm2_16" }, { "wmr_04" }} },
+    { 23, {{ "wm3_05", "wm3_06" },            { "wm2_12", "wm2_15" }, { "wmr_03" }} },
+    { 26, {{ "wm3_09" },                      { "wm2_13" },           { "wmr_07" }} },
+    { 29, {{ "wm3_13" },                      { "wm2_18", "wm2_19" }, { "wmr_10" }} },
+    { 30, {{ "wm3_14" },                      { "wm2_20", "wm2_22" }, { "wmr_11" }} },
+    { 31, {{ "wm3_15" },                      { "wm2_21", "wm2_23" }, { "wmr_12" }} }
+  };
+  for (size_t i = 0; i < sizeof extended / sizeof extended[0]; ++i) {
+    if (round != extended[i].round) continue;
+    const char *const *tracks = extended[i].track[menu_card_bgm_source(m)];
+    return tracks[tracks[1] ? rand() % 2 : 0];
+  }
+#else
+  /* The original Ten WAV bank is installed by the Android launcher. */
+  (void)m;
+  (void)round;
+#endif
+  return NULL;
+}
+
+static int ten_bgm_active(void) {
+  return !G.in_menu && G.n_ten && !G.menu.finish && !G.ten_bgm_off && G.ten_bgm;
+}
+
 const char *app_bgm(void) {
-  return !G.in_menu && G.ten_bgm_off && !G.menu.finish ? NULL : menu_bgm(&G.menu, !G.in_menu);
+  /* The last rival stops the stream immediately; result2 still plays 0x6d. */
+  if (!G.in_menu && G.ten_bgm_off && !G.menu.finish) return NULL;
+  if (ten_bgm_active()) {
+    /* If Android rejected an optional soundtrack, recover the same Extend
+     * cue slot with the default soundtrack before the next rival appears. */
+    if (G.menu.ten_level == 10 && G.ten_bgm[0] == 'w' && (G.ten_bgm[2] == '2' || G.ten_bgm[2] == 'r') &&
+        menu_card_bgm_source(&G.menu) == 0) {
+      const char *cue = ten_round_bgm(&G.menu, G.ten_bgm_round);
+      if (cue) G.ten_bgm = cue;
+    }
+    return G.ten_bgm;
+  }
+  return menu_bgm(&G.menu, !G.in_menu);
+}
+
+const char *app_bgm_fallback(void) {
+  return ten_bgm_active() ? menu_bgm(&G.menu, 1) : NULL;
+}
+
+int app_bgm_crossfade_ms(void) {
+  if (!ten_bgm_active() || G.ten_rival_on <= 0) return 0;
+  /* clRaceThread::changeTenRival (0x890f6e4): 120 or 1 audio updates at 60 Hz. */
+  return G.menu.ten_level == 10 ? 17 : 2000;
 }
 
 int app_bgm_gameplay_paused(void) {
@@ -3047,10 +3139,19 @@ static int wheel_slot(int wheel, const int *keep, int n_keep) {
   if (k < 0) return -1;
   if (G.wheel_state[k] != WHEEL_FREE && G.wheel_state[k] != WHEEL_MISSING) wpk_free(&G.wheel[k]);
   char path[1200];
-  snprintf(path, sizeof path, "%s/wheels/%s_%d.wpk", G.data_dir, name, set);
+  if (wheel == MENU_WHEEL_LEMANS) {
+#ifdef __ANDROID__
+    extern int android_optional_resource_path(const char *, char *, size_t);
+    if (!android_optional_resource_path("ghost-wheel-lman.wpk", path, sizeof path)) path[0] = 0;
+#else
+    snprintf(path, sizeof path, "%s/ghost-wheel-lman.wpk", G.data_dir);
+#endif
+  } else {
+    snprintf(path, sizeof path, "%s/wheels/%s_%d.wpk", G.data_dir, name, set);
+  }
   G.wheel_id[k] = wheel;
-  G.wheel_state[k] = wpk_open(&G.wheel[k], path) == 0 ? WHEEL_UP : WHEEL_MISSING;
-  if (G.wheel_state[k] == WHEEL_MISSING) fprintf(stderr, "no %s\n", path);
+  G.wheel_state[k] = path[0] && wpk_open(&G.wheel[k], path) == 0 ? WHEEL_UP : WHEEL_MISSING;
+  if (G.wheel_state[k] == WHEEL_MISSING && path[0]) fprintf(stderr, "no %s\n", path);
   return k;
 }
 
@@ -3122,7 +3223,7 @@ static void wheel_sync(menu_scene *shown) {
     }
   }
   for (int i = 0; shown && i < shown->n; ++i) {
-    if (shown->cars[i].ghost_row) continue;
+    if (shown->cars[i].ghost_row || G.menu.screen==MENU_GHOST_PRE) continue;
     int w = shown->cars[i].wheel, k = wheel_find(w);
     if (!w || (k >= 0 && G.wheel_state[k] == WHEEL_READY)) G.wheel_shown = w;
     else if (wheel_find(G.wheel_shown) >= 0 && G.wheel_state[wheel_find(G.wheel_shown)] == WHEEL_READY) shown->cars[i].wheel = G.wheel_shown;
@@ -3273,11 +3374,15 @@ static void story_carry_rearm(void) {
     story_carry_cancel();
 }
 static void story_carry_finish(void) {
-  if (!G.story_carry_token) return;
   uint64_t token = G.story_carry_token;
-  if (!car_story_carry_loaded(token) || !car_story_carry_finalize(token))
-    car_story_carry_cancel();
+  int carried = token && car_story_carry_loaded(token) && car_story_carry_finalize(token);
+  if (token && !carried) car_story_carry_cancel();
   G.story_carry_token = 0;
+  /* Original Init includes the carried distance in the next result by
+   * subtracting it from fStartOdo (0x8987dd8). Only account separately for
+   * a completed period when the port fell back to starting from scratch. */
+  if (!carried) G.story_mileage_unrestored_mm += G.story_mileage_pending_mm;
+  G.story_mileage_pending_mm = 0.0f;
 }
 
 static int rival_type(int rival) {
@@ -3848,6 +3953,8 @@ static void car_paint_for_draw(wpk_scene *stock, wpk_scene *aero, int paint) {
 /* the car select's 3D cars, with the arcade's menu camera */
 static void eye_in(const mat4 *m, const float *p, float *out);
 
+#include "app_mileage_aura.inc"
+
 static void app_ghost_preview_prepare(const menu_scene *shown);
 static wpk_scene *app_ghost_preview_stock(const menu_car *car);
 static int app_ghost_preview_apply(const menu_car *car,wpk_scene *scene,story_body_view *body,
@@ -3881,7 +3988,8 @@ static void menu_draw3d(void *ctx) {
     if (scene[i] && aero[i]) {
       scene[i] = menu_aero(car->pack, aero[i]);
       /* An unready optional aero must not hide the actual opponent's body. */
-      if (car->ghost_row && !scene[i]) scene[i]=stock[i], aero[i]=0;
+      if (!scene[i] && (car->ghost_row ? G.menu.screen!=MENU_GHOST_PRE : G.menu.screen==MENU_GHOST_PRE))
+        scene[i]=stock[i], aero[i]=0;
     }
   }
   /* clSpriteAnimeCPModel's own scene: the eye at (0, 0, 1000) on the origin, the frustum
@@ -3935,6 +4043,7 @@ static void menu_draw3d(void *ctx) {
       if (body_scope.cache) app_player_paint_restore(&body_scope);
       if (preview_scope.cache) app_ghost_paint_restore(&preview_scope);
       draw_wheels(s->cars[i].wheel, s->cars[i].pack, aero[i], &cvp, &model, eye, pass, &rp);
+      if (pass == WPK_BLEND) mileage_aura_draw(&s->cars[i], aero[i], &cvp, &model, e, &rp);
     }
     rp.wheels = NULL;
     rp.wheels_hub = 0;
@@ -4391,6 +4500,19 @@ static void wide_sides(void) {
 }
 
 
+/* result2 at 0x89104b1 adds the native distance in whole kilometres. */
+static void app_finish_mileage(void) {
+  int own = G.menu.save_skip ? -1 : menu_own_find(&G.menu, G.menu.maker, G.menu.car);
+  double before = own < 0 ? 0.0 : G.menu.own[own].odo;
+  const car_race *race = &G.car.race;
+  if ((G.menu.game == MENU_GAME_STORY && G.menu.story_test) || !race->mileage_valid) return;
+  float mm = race->mileage_mm + G.story_mileage_unrestored_mm;
+  int km = (int)fminf(mm * 1.0e-6f, 16777215.0f);
+  double after = fmax(before, fmin(16777215.0 * 1000.0, before + 1000.0 * km));
+  menu_finish_set_mileage(&G.menu, before, after);
+  if (own >= 0) G.menu.own[own].odo = after;
+}
+
 #include "app_ghost.inc"
 #include "app_ta_rank.inc"
 #include "app_body_color.inc"
@@ -4506,7 +4628,18 @@ static void menu_frame(float dt, double frame_start) {
                                     car_pack(ghost_pack) && paint_ready(ghost_pack, ghost_paint);
   /* Unlike legacy menus, a real Ghost opponent must never be drawn as the FD3S
    * missing-model substitute. Its exact approved model remains a start gate. */
-  if(app_ghost_mode() && AG.arcade && AG.prepared) all_in=all_in && app_arcade_appearance_ready();
+  if (app_ghost_mode() && AG.arcade && AG.prepared) {
+    all_in=all_in && app_arcade_appearance_ready();
+    if (menu_ghost_preparing(&G.menu)) {
+      int aero=G.menu.aero[G.menu.maker][G.menu.car], wheel=G.menu.wheel[G.menu.maker][G.menu.car];
+      int slot=wheel_find(wheel), set;
+      /* Old packs may lack the player's optional accessories. Keep the race's
+       * stock fallback after a definitive miss; an exact rival is mandatory. */
+      all_in=all_in && (!aero || menu_aero_find(chosen->pack,aero)>=0) &&
+        (!wheel || !menu_wheel_pack(wheel,&set) ||
+         (slot>=0 && (G.wheel_state[slot]==WHEEL_READY || G.wheel_state[slot]==WHEEL_MISSING)));
+    }
+  }
   G.pre_wait = pre && !all_in ? G.pre_wait + 1 : 0;
   if (G.menu.screen == MENU_PRE) G.pre_frames++;
   if (G.pre_wait == PRE_WAIT_MAX) fprintf(stderr, "race title: loading still not done (track %d), starting\n", G.seen.track);
@@ -4918,11 +5051,14 @@ static void menu_frame(float dt, double frame_start) {
       if (G.story_race == 0) { /* (a select's second race: the card as the first started) */
         title_card_now(&G.title_pre);
         G.title_odo0 = title_odo();
+        G.story_mileage_pending_mm = G.story_mileage_unrestored_mm = 0.0f;
       }
       G.top_kmh = 0;
       G.time_shown = (int)G.car.race.time_left;
       G.ten_rival_on = -1;
       G.ten_freeze = G.ten_beaten_on = G.ten_bgm_off = 0;
+      G.ten_bgm = G.n_ten ? ten_round_bgm(&G.menu, 0) : NULL;
+      G.ten_bgm_round = 0;
       G.story_end_freeze = G.story_end_started = 0;
       G.ten_white = G.n_ten ? 1 : 0;
       G.race_spec = spec;
@@ -4934,7 +5070,7 @@ static void menu_frame(float dt, double frame_start) {
 #if defined(__ANDROID__) && defined(WMMT_DEBUG_LOG)
       debug_race_init();
 #endif
-      G.period_fade = G.menu.pre_fade;
+      G.period_fade = ghost && G.menu.ghost.intro_t ? 1 : G.menu.pre_fade;
       G.period_in = G.period_fade ? MOVIE_FADE : 0;
       G.menu.pre_fade = 0;
       if (!ten && G.menu.game == MENU_GAME_STORY && G.rival >= 0 &&
@@ -4945,7 +5081,23 @@ static void menu_frame(float dt, double frame_start) {
       /* No movie or a missing trail: this successful Init is the real race.
        * A running movie keeps the same token until movie_close's final Init. */
       if (G.movie_len <= 0) story_carry_finish();
-      if (vs && !app_vs4_initialized()) return;
+      if (vs) {
+        /* Resolve vinyls before LOAD_READY. A first draw can read a VPK,
+         * inflate the overlay and upload a composite texture for each car. */
+        const char *page1;
+        if (!BPC.race_frozen || !BPC.race_view.custom_color)
+          vinyl_tex(G.race_pack, G.aero_set, col->paint,
+                    G.menu.vinyl[G.menu.maker][G.menu.car],
+                    G.menu.bonnet[G.menu.maker][G.menu.car], &page1);
+        for (int i = 0; i < G.n_rival; ++i) {
+          if (!G.rival_model[i]) continue;
+          const vs_dress_t *dress = &G.rival_dress[i];
+          int pack = G.rival_pack[i];
+          int body = dress->aero && menu_aero(pack, dress->aero) ? dress->aero : 0;
+          vinyl_tex(pack, body, G.rival_paint[i], dress->vinyl, dress->bonnet, &page1);
+        }
+        if (!app_vs4_initialized()) return;
+      }
       perf_open();
       return;
     }
@@ -5270,6 +5422,8 @@ void app_frame(float dt) {
     return;
   }
 
+  if (G.vs_race && app_vs4_native_gate() < 0) { menu_frame(0,frame_start); return; }
+
   /* Lost player presentation never silently becomes a different factory colour.
    * Abort at the next safe frame boundary, without committing a Ghost/TA result. */
   if (!ASB.active || !menu_story_body_owner_same(&G.menu,&ASB.own)) BPC.draw_fault=1;
@@ -5300,7 +5454,6 @@ void app_frame(float dt) {
   /* Ghost is never governed by room state. Polling continues independently of
    * user pause and soft transport pause, and cancellation wins before any tick. */
   if (app_ghost_mode()) G.vs_race = G.vs_closed = G.vs_wait = G.n_ten = 0;
-  if (G.vs_race && app_vs4_native_gate() < 0) { menu_frame(0,frame_start); return; }
   int movie = G.movie_len > 0;
   /* Handle a goal already observed before this display frame as well as one
    * reached inside the fixed-step loop below. */
@@ -5357,6 +5510,11 @@ void app_frame(float dt) {
     if (r == MENU_RESUME) G.paused = 0, G.hud.pause_pressed = 0;
   }
   /* the race's end, FINISH or TIME UP over the race running on, then white: the menus */
+  if (G.menu.finish && G.menu.crown_award.active && G.menu.crown_award.pending)
+    app_cloud_crown_tick(android_ghost_cloud_configured(),0);
+#ifdef __ANDROID__
+  if(G.menu.finish && G.menu.game==MENU_GAME_TA)app_ta_rank_cloud_tick(-1);
+#endif
   if (G.menu.finish && menu_finish_update(&G.menu, dt) == MENU_LEAVE) {
     if (app_ghost_mode()) {
       app_ghost_clear();
@@ -5448,7 +5606,6 @@ void app_frame(float dt) {
   }
 #endif
   int story_was_old_ended = G.story_old_ended;
-  int executed_physics_ticks = 0;
   int story_tail_ticks = story_was_old_ended ? steps : 0;
   int physics_steps = story_was_old_ended ? 0 : steps;
   for (int i = 0; i < physics_steps; ++i) {
@@ -5478,7 +5635,6 @@ void app_frame(float dt) {
     }
     race_tail_tick(movie);
 #endif
-    ++executed_physics_ticks;
     if (app_ghost_mode() && G.car.race.over) break; /* next ordinary 60Hz tick may finish step3 sampling */
 #ifdef __ANDROID__
     if (G.car.race.jct_select_valid) {
@@ -5571,6 +5727,14 @@ void app_frame(float dt) {
   /* clRaceThread::race and changeTenRival as each rival is set up: approach2, the last's approach3 */
   if (G.n_ten && race->ten_rival >= 0 && race->ten_rival != G.ten_rival_on) {
     G.ten_rival_on = race->ten_rival;
+    if (race->ten_rival > 0 && race->ten_rival < G.n_ten) {
+      const char *cue = ten_round_bgm(&G.menu, race->ten_rival);
+      /* setNextBgm keeps a cue already playing; a repeated round does not rewind it. */
+      if (cue) {
+        G.ten_bgm_round = race->ten_rival;
+        if (!G.ten_bgm || strcmp(cue, G.ten_bgm)) G.ten_bgm = cue;
+      }
+    }
     snd_menu(race->ten_rival == G.n_ten - 1 ? SND_APPROACH3 : SND_APPROACH2);
   }
   int ta_checkpoint = G.menu.game == MENU_GAME_TA && hud_ta_checkpoint(race);
@@ -5602,8 +5766,6 @@ void app_frame(float dt) {
   G.sign_t -= steps;
   if (race->state == CAR_RACE_RUN && race->countdown <= 0.0f) {
     G.top_kmh = fmaxf(G.top_kmh, car_kmh(&G.car));
-    /* the card's mileage */
-    if (!app_ghost_mode() && !(G.menu.game == MENU_GAME_STORY && G.menu.story_test) && G.menu.own_sel >= 0 && G.menu.own_sel < G.menu.n_own) G.menu.own[G.menu.own_sel].odo += car_kmh(&G.car) / 3.6 * executed_physics_ticks / 60.0;
   }
 #ifdef WMMT_EGL
   if (getenv("WMMT_ST_END") && (G.rival >= 0 || G.vs_race) && !movie && G.race_frames > atoi(getenv("WMMT_ST_END")))
@@ -5625,13 +5787,17 @@ void app_frame(float dt) {
   }
   if (!app_ghost_mode() && race->over && !G.menu.finish && !G.vs_closed && !movie && G.story_end_freeze <= 0 && vs_finish_ready) {
     int goal = race->state == CAR_RACE_GOAL;
-    garage_save(); /* the mileage */
     menu_result res;
     if (G.vs_race) {
       /* the versus: its place (GetPlayResult) as the story's WIN or LOSE */
       int place = race->vs_place > 0 ? race->vs_place : G.vs_race + 1;
       menu_finish_open(&G.menu, goal, NULL);
       menu_finish_vs(&G.menu, place, G.vs_race + 1);
+      if (!G.menu.save_skip && G.menu.own_sel >= 0 && G.menu.own_sel < G.menu.n_own) {
+        unsigned char *style = &G.menu.drive_style_car[G.menu.maker][G.menu.car];
+        *style = (unsigned char)car_vs_drive_style(*style);
+      }
+      app_finish_mileage();
       if (place == 1) G.menu.vs_wins_car[G.menu.maker][G.menu.car]++;
       int stars = menu_vs_stars(&G.menu, place, G.vs_race + 1);
       fprintf(stderr, "versus: stars %d -> %d (%+d)\n", G.menu.star_from, G.menu.star_from + stars, stars);
@@ -5649,6 +5815,8 @@ void app_frame(float dt) {
       menu_finish_open(&G.menu, goal, NULL);
       menu_finish_story(&G.menu, race->won, next >= 0, race->gap, fade);
       if (next >= 0) {
+        G.story_mileage_pending_mm = race->story_distance_valid && isfinite(race->story_distance)
+          ? fmaxf(race->story_distance, 0.0f) * 1000.0f : 0.0f;
         G.story_race++;
         G.story_cut_pending = 1;
         G.story_cut_select = pick;
@@ -5657,6 +5825,7 @@ void app_frame(float dt) {
       } else {
         G.story_cut_pending = 0;
         G.story_race = 0;
+        app_finish_mileage();
         /* the points first: whether the episode was cleared before counts */
         if (!G.menu.story_test) {
         int units = menu_story_points(&G.menu, race->won && RIVALDB[G.rival].select == pick);
@@ -5691,9 +5860,10 @@ void app_frame(float dt) {
         *best = (signed char)race->ten_medal;
         menu_lvup_check(&G.menu);
       }
+      menu_finish_open(&G.menu, goal, NULL);
+      app_finish_mileage();
       title_race_over(TITLE_TEN, race->won, race, G.race_course, 0);
       garage_save();
-      menu_finish_open(&G.menu, goal, NULL);
       int beaten = race->ten_beaten, medal = race->ten_medal;
       if (getenv("WMMT_TEN_RES")) sscanf(getenv("WMMT_TEN_RES"), "%d %d", &beaten, &medal); /* test: this end */
       menu_finish_ten(&G.menu, beaten, race->ten_now, medal);
@@ -5701,8 +5871,11 @@ void app_frame(float dt) {
     } else {
       if (goal) app_ta_rank_finish(race);
       if (goal) records_goal(G.menu.course, race, &res, !G.race_traffic);
+      int local_title_record=goal && !G.race_traffic && res.rank==1;
+      if (goal) app_ta_rank_result(&res);
       menu_finish_open(&G.menu, goal, goal ? &res : NULL);
-      title_race_over(TITLE_TA, goal, race, G.menu.course, goal && !G.race_traffic && res.rank == 1);
+      app_finish_mileage();
+      title_race_over(TITLE_TA, goal, race, G.menu.course, local_title_record);
       garage_save();
     }
   }
@@ -6037,14 +6210,17 @@ void app_present(float dt) {
   app_display_dt = dt > 0.1f ? 0.1f : dt;
   if (dt > 0) G.fps += (1.0f / dt - G.fps) * 0.05f;
   if (dt > 0.1f) app_history_valid = 0;
-  if (net_is_open()) app_vs4_poll_transport();
   int ticks = timing60_sim_steps(&app_clock, dt);
+  if (G.vs_race && !G.in_menu) {
+    /* app_frame polls at each simulation boundary. High-refresh frames
+     * without a tick still observe transport stalls and terminal events. */
+    if (!ticks && app_vs4_native_gate() <= 0) app_history_valid = 0;
+  } else if (net_is_open()) {
+    app_vs4_poll_transport();
+  }
   double physics_ms = 0;
   app_tick_only = 1;
   for (int i = 0; i < ticks; ++i) {
-    /* Abort is checked again before each display catch-up slice. Soft wait still
-     * runs APP logic/network polling, but the inner gate permits no native tick. */
-    if (G.vs_race && app_vs4_native_gate()<0) {app_history_valid=0;break;}
     int menu = G.in_menu, camera = G.camera, movie = G.movie_len > 0;
     int reset = G.hud.reset_pressed;
     int warm = !menu && G.race_frames < 2;
@@ -6053,7 +6229,7 @@ void app_present(float dt) {
     app_frame(1.0f / 60.0f);
     physics_ms += now_ms() - t0;
     app_history_valid = !menu && !G.in_menu && camera == G.camera && movie == (G.movie_len > 0) &&
-      !G.paused && !G.vs_closed && !G.ten_freeze && !G.story_end_freeze && !G.story_old_ended &&
+      !G.paused && !G.vs_wait && !G.vs_closed && !G.ten_freeze && !G.story_end_freeze && !G.story_old_ended &&
       !warm && !reset && app_previous.race.state == G.car.race.state;
     if (menu != G.in_menu || movie != (G.movie_len > 0)) {
       /* Slow Init/End/movie setup belongs to neither the new race nor menu time. */

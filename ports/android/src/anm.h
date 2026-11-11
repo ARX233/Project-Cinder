@@ -86,6 +86,8 @@ float anm_sprite_alpha(int anim, int frame, int sprite);
  * y + b px + d py)) and its colour, c * mul + add; 0 if the frame has no such sprite. A font hung
  * on a template is drawn with these. */
 int anm_sprite_xf(int anim, int frame, int sprite, float xf[6], float mul[4], float add[4]);
+/* Nontransparent source bounds in sprite pixels, excluding transparent padding. */
+int anm_sprite_content_rect(int sprite, float rect[4]);
 /* Width of a packed sprite in 640x480 pixels (0 if there is none). */
 float anm_sprite_width(int sprite);
 float anm_sprite_height(int sprite);

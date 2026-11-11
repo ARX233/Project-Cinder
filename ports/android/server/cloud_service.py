@@ -104,7 +104,7 @@ class CloudApplication:
 
     def capabilities(self):
         return {"schema_version": 1, "ghost_sharing": True, "world_crown_verified": False,
-                "ghost_search": True, "ghost_defense_reported": True, "ta_leaderboard": True,
+                "ghost_community_crowns": True, "ghost_search": True, "ghost_defense_reported": True, "ta_leaderboard": True,
                 "ta_community": True, "ta_verifier_available": self.timing_available}
 
     def write_guard(self):
@@ -236,6 +236,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, app.ghosts.list(physics, area, limit, query.get("cursor"), name=name,
                                            ghost_id=ghost_id,
                                            exclude_subject=principal.subject if "others" in query else None))
+        elif path == "/v1/ghosts/crowns" and method == "GET":
+            _fields(query, required=("physics_sha256",))
+            physics = _sha(query["physics_sha256"], "physics_sha256")
+            card_id = self._one_header("X-Cinder-Card-ID")
+            if card_id is not None and not GHOST_ID.fullmatch(card_id):
+                raise ContractError("invalid_card_id")
+            self._send(200, app.ghosts.crowns(physics, principal, card_id), "application/octet-stream")
+        elif path == "/v1/ghosts/crowns" and method == "POST":
+            _fields(query, required=("area", "previous"))
+            area = _small(query["area"], 0, 7, "area")
+            self._json(200, app.ghosts.claim_crown(principal, area, query["previous"],
+                       self._body(MAX_RECORD_BYTES), self._one_header("X-Cinder-Card-ID")))
         elif path == "/v1/ghosts/defense" and method == "GET":
             _fields(query, required=("card_id",))
             if not GHOST_ID.fullmatch(query["card_id"]):
@@ -256,9 +268,10 @@ class _Handler(BaseHTTPRequestHandler):
             record, digest = app.ghosts.download(ghost_id)
             self._send(200, record, "application/octet-stream",
                        {"ETag": '"' + digest + '"', "X-Content-SHA256": digest})
-        elif path == "/v1/ta/community" and method == "POST":
+        elif path in ("/v1/ta/community", "/v1/ta/community/result") and method == "POST":
             _fields(query)
-            self._json(200, app.community.submit(principal.subject, self._body(community.ROW_BYTES)))
+            self._json(200, app.community.submit(principal.subject, self._body(community.ROW_BYTES),
+                                                 include_result=path.endswith("/result")))
         elif path == "/v1/ta/community" and method == "GET":
             _fields(query, required=("rules_sha256", "physics_sha256", "course_id", "traffic"))
             course, traffic = community.partition(query["rules_sha256"], query["physics_sha256"],

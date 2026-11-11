@@ -2,6 +2,8 @@
  * sequence (the player's car, the traffic and what they hit), recompiled to C
  * (src/phys/phys_rc.c). This file sets the race up and reads back what to draw. */
 #include "car.h"
+#include "mileage_style.h"
+#include "mathx.h"
 #include "ghost_runtime.h"
 #include "cardb.h"
 #include "ghost_arcade_models.inc"
@@ -29,6 +31,7 @@ __attribute__((weak, noinline)) void f_8986878(void) { story_carry_end_stub_call
  * compile-time folding of this link-time feature check. */
 __attribute__((weak)) const volatile uint32_t rc_story_carry_bridge = 0;
 void f_8983f64(void); /* yt::CSeq::Exec(std::auto_ptr<clGameInput> const&) */
+void f_89ebd5c(void); /* yt::CLinx::CheckAck */
 void f_89a2584(void); /* yt::CElapse::Init */
 void f_89a2548(void); /* yt::CElapse::SetByMul */
 void f_89825a8(void); /* yt::CSeq::GetInfoOtherCarDisp */
@@ -210,6 +213,7 @@ static struct {
   /* car_set_versus: the link race's machines (vs_n others), ramp, km and seed */
   int vs_on, vs_pcb, vs_n, vs_ramp;
   int vs_race; /* the link's cars in the race now (0: not a versus) */
+  mileage_style_log drive_style;
   float vs_km;
   unsigned vs_seed;
   car_link_car vs[CAR_LINK_MACHINES - 1];
@@ -1114,6 +1118,7 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
   /* a fresh arcade memory image per race, like a fresh boot of CSeq::Init */
   P.ready = 0;
   P.se_backfire_on = 0;
+  mileage_style_reset(&P.drive_style);
   memset(P.vs_received, 0, sizeof P.vs_received);
   memset(P.vs_count_valid, 0, sizeof P.vs_count_valid);
   P.vs_race = 0;
@@ -1507,6 +1512,13 @@ static void read_race(car_race *r) {
    * A story race also ends on 3 (Defeat) and 10 (Suspend: Ck_X_2_Suspend, the odometer past
    * the episode's distance at 0x9802a7c; clRaceThread::race fades out and returns). */
   r->over = st == 8 || st == 6 || st == 3 || st == 10;
+  /* clWorkSpace::updateRace (0x88bd583) copies the SPlayResult and
+   * getOdoCount (0x88bd100) reads its +0xc. Freeze the first valid result
+   * so later pilot movement and rejected link ticks cannot change mileage. */
+  if (r->over && st != 10 && !r->mileage_valid && (call(f_898317c, 1, P.result) & 255u)) {
+    float mm = MF(P.result + 0xcu);
+    if (race_remain_valid(mm)) r->mileage_mm = mm, r->mileage_valid = 1;
+  }
   /* the arcade's total runs on after the time is up; the console's stops there */
   if (r->state != CAR_RACE_TIME_UP || was != CAR_RACE_TIME_UP) r->total = MF(P.info_race + 8);
   uint32_t tk = M32(TIME_KEEPER_PTR);
@@ -1813,6 +1825,7 @@ void car_reset(car_state *c) {
   c->se.rev_enabled = 0;
   c->se.rev_sequence = 0;
   c->se.rev_vol = 0;
+  c->engine_se = (car_engine_se){0};
   c->tire_smoke_tick=0;
   c->tire_smoke_valid=0;
   memset(&c->tire_smoke,0,sizeof c->tire_smoke);
@@ -1884,6 +1897,48 @@ static void read_se(car_se *out) {
   }
 }
 
+static void read_engine_se(car_engine_se *out) {
+  uint32_t se = P.m + 0xb88u;
+  /* CSE::Mc_Req reads the native gain and normalized RPM here. The shift
+   * requests can arrive in any of the physics steps before snd_update. */
+  out->gain = MF(se + 0x68u);
+  out->rpm = MF(se + 0x6cu);
+  out->accel = M8(se + 0x24u) != 0;
+  out->shift_down |= M8(se + 0x72u) != 0;
+  out->shift_up |= M8(se + 0x73u) != 0;
+}
+
+/* CSeq::Exec samples the player's SHitPushBack records (0x8984c87).
+ * The pinned recompiled object stubs the original logger bodies. */
+static void read_vs_drive_style(void) {
+  uint32_t wall = P.m + 0xd4u, contact = P.m + 0x90u;
+  if (M8(wall) && !M8(wall + 1u)) {
+    float force = MF(wall + 0x3cu);
+    if (isfinite(force)) P.drive_style.wall_force += force;
+    ++P.drive_style.wall_ticks;
+  }
+  int hit = M8(contact) != 0, kind = (int32_t)M32(contact + 4u);
+  float force = 0;
+  if (hit && kind <= 3 && kind <= P.drive_style.last_kind) {
+    float velocity[3], facing[3], push[3];
+    for (unsigned i = 0; i < 3; ++i) {
+      velocity[i] = MF(P.m + 0xab0u + 4u * i);
+      facing[i] = MF(P.m + 0xa0cu + 4u * i);
+      push[i] = MF(contact + 0x30u + 4u * i);
+    }
+    float speed = sqrtf(v3_dot(velocity, velocity)), magnitude = MF(contact + 0x3cu);
+    if (speed > 10000.0f) {
+      float direction = magnitude > 0.01f ? v3_dot(facing, push) / magnitude : 0;
+      force = fmaxf(0, -v3_dot(velocity, push) / speed) * (0.2f + 0.8f * fabsf(direction));
+    }
+  }
+  mileage_style_contact(&P.drive_style, hit, kind, isfinite(force) ? force : 0);
+}
+
+unsigned car_vs_drive_style(unsigned previous) {
+  return P.vs_race ? mileage_style_commit(previous, &P.drive_style) : previous;
+}
+
 void car_update(car_state *c, const car_input *in) {
   if (!P.ready) return;
   if (PG.arcade_on && PG.observation.status==CAR_GHOST_FINISHED &&
@@ -1925,9 +1980,14 @@ void car_update(car_state *c, const car_input *in) {
   W32(P.gin + 0x14, P.manual ? (uint32_t)P.lever : 0xffffffffu);
   /* the arcade frame: the traffic's AI and life, the car, what everything hit, the
    * checkpoints and the time, the sounds' cues */
+  /* Exec advances nCnt even if CLinx has not accepted the frame. Use its
+   * initialization and ACK gates so a stalled link cannot repeat a hit. */
+  int style_tick = P.vs_race && M8(0x9802970u) && (call(f_89ebd5c, 0) & 255);
   call(f_8983f64, 1, P.gin_ptr);
+  if (style_tick) read_vs_drive_style();
   if (PG.started) PG.observation.native_ticks++;
   read_se(&c->se);
+  read_engine_se(&c->engine_se);
   c->rev_lamp_frame = (int32_t)M32(0x9802828u); /* CSeq::nCnt, observation only */
 
   float prev[3] = { c->pos[0], c->pos[1], c->pos[2] };

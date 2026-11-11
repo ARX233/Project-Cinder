@@ -83,7 +83,15 @@ static int screen_w=1920, screen_h=1080, extent_calls;
 void cinder_vk_screen_extent(int *w, int *h) { *w=screen_w; *h=screen_h; ++extent_calls; }
 static unsigned uploads, touches, extra_loads, card_loads;
 static void load_extra(const char *path) { assert(!strcmp(path,"."));++extra_loads; }
-static void load_card_pages(const char *path) { assert(!strcmp(path,"."));++card_loads; }
+static FILE *load_sprite_animations(const char *path, const char *name, int sprites_only) {
+  assert(!strcmp(path,"."));
+  if(!strcmp(name,"card-pages.bin"))++card_loads;
+  else if (sprites_only) assert(!strcmp(name,"ghost-match.bin"));
+  else assert(!strcmp(name,"mileage-menu.bin")||!strcmp(name,"finish-menu.bin")||
+              !strcmp(name,"crown-scenes.bin"));
+  return NULL;
+}
+int anm_find(const char *name) { assert(!strcmp(name,"cons_g_last_000m")); return -1; }
 static void load_ghost_ui(const char *path) { assert(!strcmp(path,".")); }
 #ifdef WMMT_NATIVE_VK
 uint32_t cinder_vk_program_create(const char *vs,const char *fs,const char **attribs,int n) {

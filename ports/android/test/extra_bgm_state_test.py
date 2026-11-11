@@ -11,10 +11,11 @@ methods=p[a:b].replace('Executors.newSingleThreadExecutor()', 'new FakeExecutor(
 (root / 'android/util').mkdir(parents=True,exist_ok=True)
 (root / 'android/util/Log.java').write_text('package android.util; public class Log { public static int w(String a,String b){return 0;} public static int w(String a,String b,Throwable c){return 0;} }')
 t='''import java.io.*; import java.util.*; import java.util.concurrent.*;
-class Activity { protected void onPause(){} protected void onResume(){} protected void onDestroy(){} }
+class Activity { protected void onPause(){} protected void onResume(){} protected void onDestroy(){} protected void onStop(){} protected void onNewIntent(Intent i){} }
+class Intent { static final String ACTION_MAIN="main", CATEGORY_LAUNCHER="launcher"; String getAction(){return null;} boolean hasCategory(String name){return false;} }
 class Sensors { void unregisterListener(Object o){} void registerListener(Object o,Object g,int rate){} }
 class Displays { void unregisterDisplayListener(Object o){} void registerDisplayListener(Object o,Object h){} }
-class OriginalController { void detach(Object o){} }
+class OriginalController { void detach(Object o){} boolean isPickingSource(){return false;} }
 class Panel { void removeView(Object o){} void release(){} }
 class SensorManager { static final int SENSOR_DELAY_GAME=1; }
 class Movie { void pause(){} void start(){} void stopPlayback(){} }
@@ -24,8 +25,10 @@ class CardResources { static File music(File f,String n) { return f; } }
 class ArcadeBgm {
  interface Listener { void ready(ArcadeBgm p); void failed(ArcadeBgm p,Exception e); }
  static boolean enabled; static boolean supports(String name){return enabled;}
- Listener listener; boolean closed,playing,started; float volume;
- ArcadeBgm(File file,File cache,Listener l){listener=l;}
+ static boolean isTenCue(String name){return name!=null&&name.matches("ten_[a-e][1-9]");}
+ Listener listener; boolean closed,playing,started,fadeIn; float volume; int fadeMs;
+ ArcadeBgm(File file,File cache,String cue,Listener l){listener=l;}
+ void fade(boolean in,int ms){fadeIn=in;fadeMs=ms;}
  void start(){started=true;} void close(){closed=true;playing=false;}
  void playback(boolean play,float gain){if(closed)throw new AssertionError("closed PCM");playing=play;volume=gain;}
  void ready(){listener.ready(this);} void fail(){listener.failed(this,new IOException("fake PCM error"));}
@@ -38,8 +41,9 @@ class MediaPlayer {
 }
 class FakeExecutor extends AbstractExecutorService { ArrayList<Runnable> q=new ArrayList<>(); boolean closed; public void execute(Runnable r){q.add(r);} public void shutdown(){closed=true;} public java.util.List<Runnable> shutdownNow(){closed=true;return q;} public boolean isShutdown(){return closed;} public boolean isTerminated(){return closed;} public boolean awaitTermination(long n,TimeUnit u){return true;} void run(){q.remove(0).run();} }
 public class AsyncStateTest extends Activity {
- volatile boolean started=true,destroyed=false; boolean resumed=true,bgmPreparing; volatile boolean bgmGameplayPaused; long bgmPauseRevision; volatile long bgmGeneration; ExecutorService bgmExecutor; MediaPlayer bgm; ArcadeBgm arcadeBgm,pendingArcadeBgm; float bgmVolume=1; File cardResources,dataDir; int failures; ArrayList<Runnable> ui=new ArrayList<>();
+ volatile boolean started=true,destroyed=false; boolean resumed=true,bgmPreparing; volatile boolean bgmGameplayPaused; long bgmPauseRevision; volatile long bgmGeneration; ExecutorService bgmExecutor; MediaPlayer bgm; ArcadeBgm arcadeBgm,pendingArcadeBgm,fadingArcadeBgm; String requestedBgm; float bgmVolume=1; File cardResources,dataDir; static File nativeTenBgmFile; int failures; ArrayList<Runnable> ui=new ArrayList<>();
  static AsyncStateTest currentActivity; final Handler logHandler=new Handler(); final Runnable logHealthCheck=()->{}; AlertDialog consentDialog;
+ AlertDialog launcherNotice; boolean launcherNoticePending,awaitingResourcePicker; void showLauncherNotice(){}
  Displays displays; OriginalController originalController; Object originalHost; Panel root,dataPanel,launcherWallpaper;
  Sensors sensors; Object gravity; Movie movie; long movieToken; void finishMovie(Movie m,long t,boolean notify,boolean start){} void nativePause(boolean p){} void hideBars(){} void refreshSurfaceRate(){} void cancelResourceOperation(){}
  File getCacheDir(){return dataDir;} boolean isFinishing(){return false;} void nativeBgmFailure(AsyncStateTest a,int g){failures++;} void runOnUiThread(Runnable r){ui.add(r);} void drain(){while(!ui.isEmpty())ui.remove(0).run();} void worker(){((FakeExecutor)bgmExecutor).run();}
@@ -83,7 +87,20 @@ public class AsyncStateTest extends Activity {
    a.playBgm("other");a.drain();ArcadeBgm cancelled=a.pendingArcadeBgm;
    a.playBgm(null);a.drain();cancelled.ready();a.drain();
    check(cancelled.closed&&a.arcadeBgm==null&&a.bgm==null);
+   a.playRaceBgm("ten_d1","legacy",0);a.drain();ArcadeBgm fallback=a.pendingArcadeBgm;
+   fallback.ready();a.drain();
+   a.playRaceBgm("ten_d2","legacy",2000);a.drain();check(a.arcadeBgm==fallback&&a.pendingArcadeBgm==null);
+   nativeTenBgmFile=File.createTempFile("ten-bgm",".bin",a.dataDir);
+   a.playRaceBgm("ten_d1","legacy",0);a.drain();ArcadeBgm ten=a.pendingArcadeBgm;
+   ten.ready();a.drain();check(fallback.closed&&a.arcadeBgm==ten);
+   a.playRaceBgm("ten_d2","legacy",2000);a.drain();ArcadeBgm nextTen=a.pendingArcadeBgm;
+   check(ten.playing&&nextTen!=null&&!nextTen.playing);
+   nextTen.ready();a.drain();
+   check(ten.playing&&nextTen.playing&&a.fadingArcadeBgm==ten&&a.arcadeBgm==nextTen);
+   check(ten.fadeMs==2000&&!ten.fadeIn&&nextTen.fadeMs==2000&&nextTen.fadeIn);
+   a.onPause();check(!ten.playing&&!nextTen.playing);a.onResume();check(ten.playing&&nextTen.playing);
    a.onDestroy();
+   check(ten.closed&&nextTen.closed);
    System.out.println("fake executor/player state tests passed");
  }
 }

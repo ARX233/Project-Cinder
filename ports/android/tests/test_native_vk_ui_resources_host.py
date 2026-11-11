@@ -103,18 +103,62 @@ static void out(FILE*f,const void*p,size_t n){assert(fwrite(p,1,n,f)==n);}
 '''
 
 ANM_SOURCE = ANM[ANM.index("typedef struct {"):ANM.index("#ifdef WMMT_NATIVE_VK")]
-ANM_SOURCE += '#include "anm.h"\n#include "time_texture.h"\nstatic int read_all(FILE *, void *, size_t);\n#include "ghost_ui_loader.inc"\n'
+ANM_SOURCE += '#include "anm.h"\n#include "time_texture.h"\n#include "ui_vs_mode.inc"\nstatic int read_all(FILE *, void *, size_t);\n#include "ghost_ui_loader.inc"\n'
 ANM_SOURCE += functions(ANM, (
-    "static int read_all(", "static void load_extra(", "static void load_card_pages(",
-    "int anm_load(", "static GLuint texture(", "unsigned int anm_sprite_texture(", "void anm_trim(",
+    "static int read_all(", "static void load_extra(", "static FILE *load_sprite_animations(",
+    "int anm_load(", "int anm_sprite(", "static int same_name(", "int anm_find(", "static int read_sprite_pixels(", "static int vs_select_pixels(", "static GLuint texture(", "unsigned int anm_sprite_texture(", "void anm_trim(",
 ))
 ANM_TESTS = r'''
 static const unsigned char raw[16]={1,2,3,0,5,6,7,255,9,10,11,0,13,14,15,255};
 static void sprite_file(FILE*f,int id,unsigned w,unsigned h,const unsigned char*px,int zipped){uint16_t wh[2]={(uint16_t)w,(uint16_t)h};uint32_t zs=0;unsigned char z[32768];uLongf n=sizeof z;if(zipped){assert(compress(z,&n,px,(uLong)w*h*4)==Z_OK);zs=(uint32_t)n;}out(f,&id,4);out(f,wh,4);out(f,&zs,4);out(f,zipped?z:px,zipped?zs:(size_t)w*h*4);}
-static void release_anm(void){if(A.file)fclose(A.file);if(A.extra_file)fclose(A.extra_file);if(A.card_file)fclose(A.card_file);if(A.ghost_file)fclose(A.ghost_file);for(uint32_t i=0;i<A.nanims;++i){free(A.anims[i].frames);free(A.anims[i].recs);}free(A.tex);free(A.offset);free(A.zsize);free(A.used);free(A.size);free(A.ids);free(A.cols);free(A.anims);memset(&A,0,sizeof A);}
+static void release_anm(void){if(A.file)fclose(A.file);if(A.extra_file)fclose(A.extra_file);if(A.card_file)fclose(A.card_file);if(A.ghost_file)fclose(A.ghost_file);if(A.mileage_file)fclose(A.mileage_file);if(A.ghost_match_file)fclose(A.ghost_match_file);if(A.finish_menu_file)fclose(A.finish_menu_file);if(A.crown_scenes_file)fclose(A.crown_scenes_file);for(uint32_t i=0;i<A.nanims;++i){free(A.anims[i].frames);free(A.anims[i].recs);}free(A.tex);free(A.offset);free(A.zsize);free(A.used);free(A.size);free(A.ids);free(A.cols);free(A.content);free(A.anims);memset(&A,0,sizeof A);}
 static void make_menu(void){FILE*f=fopen("menu.bin","wb");assert(f);uint32_t n=3,z=0;out(f,"WMN3",4);out(f,&n,4);sprite_file(f,77,2,2,raw,0);sprite_file(f,78,2,2,raw,1);unsigned char px[8192]={0};sprite_file(f,1573,64,32,px,1);out(f,&z,4);fclose(f);f=fopen("story-cutin.bin","wb");assert(f);n=1;out(f,"WMN3",4);out(f,&n,4);sprite_file(f,79,1,2,raw,0);out(f,&z,4);fclose(f);f=fopen("card-pages.bin","wb");assert(f);uint32_t v=1;out(f,"WCP1",4);out(f,&v,4);out(f,&n,4);out(f,&n,4);sprite_file(f,80,2,1,raw,1);char name[48]="resource-card";out(f,name,48);out(f,&n,4);out(f,&n,4);out(f,&z,4);out(f,&n,4);int32_t id=80;uint16_t blend=0;float xf[6]={1,0,0,1,0,0};int16_t mul[8]={256,256,256,256,0,0,0,0};out(f,&id,4);out(f,&blend,2);out(f,xf,24);out(f,mul,16);fclose(f);}
-int main(void){reset_records();make_menu();assert(!anm_load(".")&&A.prog==1001&&A.nsprites==5&&A.base_sprites==3&&A.story_end==4&&A.nanims==1);A.edge=100;A.clock=17;
-for(int i=0;i<5;++i)assert(anm_sprite_texture(i));assert(texture_n==5);texture_bytes(0,raw,2,2);texture_bytes(1,raw,2,2);unsigned char expected[8192]={0};time_texture_fix(1573,64,32,expected);texture_bytes(2,expected,64,32);texture_bytes(3,raw,1,2);texture_bytes(4,raw,2,1);assert(A.cols[0][0]==1&&A.cols[0][1]==2&&A.used[0]==17);assert(!anm_sprite_texture(-1)&&!anm_sprite_texture(5));A.clock=60;GLuint first=A.tex[0];assert(anm_sprite_texture(0)==first&&texture_n==5&&A.used[0]==60);A.clock=119;anm_trim();assert(A.clock==120&&!deleted_tex_n);A.clock=179;anm_trim();assert(A.clock==180&&!deleted_tex_n);A.clock=239;anm_trim();assert(A.clock==240&&deleted_tex_n==4&&A.tex[0]==first);A.clock=299;anm_trim();assert(A.clock==300&&deleted_tex_n==5&&!A.tex[0]);assert(anm_sprite_texture(0)&&texture_n==6);texture_bytes(5,raw,2,2);puts("PASS ANM actual raw/zlib/optional/card/time-fixed bytes, opacity cache, reuse and 60/180 trim");
+static void make_mileage(void) {
+  FILE *f=fopen("mileage-menu.bin","wb");assert(f);
+  uint32_t one=1,zero=0;char name[48]="menu_layout_milage";
+  out(f,"WCP1",4);out(f,&one,4);out(f,&one,4);out(f,&one,4);
+  sprite_file(f,121557,1,1,raw+4,0);
+  out(f,name,48);out(f,&one,4);out(f,&zero,4);out(f,&zero,4);out(f,&zero,4);
+  fclose(f);
+}
+static void make_ghost_match(void) {
+  FILE *f=fopen("ghost-match.bin","wb");assert(f);
+  uint32_t one=1,zero=0;
+  out(f,"WCP1",4);out(f,&one,4);out(f,&one,4);out(f,&zero,4);
+  sprite_file(f,133142,1,1,raw+12,0);
+  fclose(f);
+}
+static void make_finish_menu(void) {
+  FILE *f=fopen("finish-menu.bin","wb");assert(f);
+  uint32_t one=1,zero=0;char name[48]="cons_g_last_000m";
+  out(f,"WCP1",4);out(f,&one,4);out(f,&one,4);out(f,&one,4);
+  sprite_file(f,616,1,1,raw+8,0);
+  out(f,name,48);out(f,&one,4);out(f,&zero,4);out(f,&zero,4);out(f,&zero,4);
+  fclose(f);
+}
+static void make_crown_scenes(void) {
+  FILE *f=fopen("crown-scenes.bin","wb");assert(f);
+  uint32_t one=1,zero=0;char name[48]="cscene_menu_layout_crown_get_a";
+  out(f,"WCP1",4);out(f,&one,4);out(f,&one,4);out(f,&one,4);
+  sprite_file(f,141191,1,1,raw+12,0);
+  out(f,name,48);out(f,&one,4);out(f,&zero,4);out(f,&zero,4);out(f,&zero,4);
+  fclose(f);
+}
+int main(void){reset_records();make_menu();make_mileage();make_ghost_match();make_finish_menu();make_crown_scenes();
+assert(!anm_load(".")&&A.prog==1001&&A.nsprites==9&&A.base_sprites==3&&A.story_end==4&&A.nanims==4);
+unsigned char mileage[4];
+assert(A.mileage_file&&A.mileage_begin==5&&A.ids[5]==121557&&
+       read_sprite_pixels(5,mileage,4)&&!memcmp(mileage,raw+4,4));
+int match=anm_sprite(133142);
+assert(A.ghost_match_file&&match==6&&read_sprite_pixels(match,mileage,4)&&!memcmp(mileage,raw+12,4));
+int finish=anm_sprite(616);
+assert(A.finish_menu_file&&finish==7&&anm_find("cons_g_last_000m")>=0&&
+       read_sprite_pixels(finish,mileage,4)&&!memcmp(mileage,raw+8,4));
+int crown=anm_sprite(141191);
+assert(A.crown_scenes_file&&crown==8&&anm_find("cscene_menu_layout_crown_get_a")>=0&&
+       read_sprite_pixels(crown,mileage,4)&&!memcmp(mileage,raw+12,4));
+A.edge=100;A.clock=17;
+for(int i=0;i<5;++i)assert(anm_sprite_texture(i));assert(texture_n==5);texture_bytes(0,raw,2,2);texture_bytes(1,raw,2,2);unsigned char expected[8192]={0};time_texture_fix(1573,64,32,expected);texture_bytes(2,expected,64,32);texture_bytes(3,raw,1,2);texture_bytes(4,raw,2,1);assert(A.cols[0][0]==1&&A.cols[0][1]==2&&A.used[0]==17);assert(!anm_sprite_texture(-1)&&!anm_sprite_texture(9));A.clock=60;GLuint first=A.tex[0];assert(anm_sprite_texture(0)==first&&texture_n==5&&A.used[0]==60);A.clock=119;anm_trim();assert(A.clock==120&&!deleted_tex_n);A.clock=179;anm_trim();assert(A.clock==180&&!deleted_tex_n);A.clock=239;anm_trim();assert(A.clock==240&&deleted_tex_n==4&&A.tex[0]==first);A.clock=299;anm_trim();assert(A.clock==300&&deleted_tex_n==5&&!A.tex[0]);assert(anm_sprite_texture(0)&&texture_n==6);texture_bytes(5,raw,2,2);puts("PASS ANM actual raw/zlib/optional/card/time-fixed bytes, opacity cache, reuse and 60/180 trim");
 #ifdef WMMT_NATIVE_VK
 cinder_vk_texture_destroy(A.tex[0]);A.tex[0]=0;fail_tex=texture_n+1;assert(!anm_sprite_texture(0)&&!A.tex[0]);fail_tex=0;assert(anm_sprite_texture(0)&&texture_n==8);A.tex[1]=0;long offset=A.offset[1];A.offset[1]=LONG_MAX;unsigned before=texture_n;assert(!anm_sprite_texture(1)&&texture_n==before&&!A.tex[1]);A.offset[1]=offset;uint32_t packed=A.zsize[1];A.zsize[1]=2;assert(!anm_sprite_texture(1)&&texture_n==before&&!A.tex[1]);A.zsize[1]=packed;
 assert(!ui_native_texture_rgba8(0,1,raw)&&!ui_native_texture_rgba8(1,0,raw)&&!ui_native_texture_rgba8(UINT_MAX,1,raw)&&!ui_native_texture_rgba8(1,1,NULL)&&texture_n==before);assert(!error_reads);release_anm();fail_program=program_n+1;assert(anm_load(".")==-1&&!A.prog&&!A.tex&&!A.nsprites);puts("PASS native upload/program failure never cached, retries and invalid bounded helper inputs, no GL error queries");

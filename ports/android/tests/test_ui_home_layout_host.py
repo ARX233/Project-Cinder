@@ -20,17 +20,30 @@ tree=ast.parse((ROOT/'tests/test_ghost_menu_host.py').read_text())
 prefix='#include "pre_race_tune.h"\n'+next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='PREFIX' for t in n.targets))
 prefix,part_count=re.subn(r'void anm_draw_part\(int id,const float src\[4\],const float dst\[4\],float a\)\{[^}]*\}', 'void anm_draw_part(int id,const float src[4],const float dst[4],float a){assert(src[0]>=0&&src[1]>=0&&src[2]>src[0]&&src[3]>src[1]);assert(src[2]<=anm_sprite_width(id)+.01f&&src[3]<=anm_sprite_height(id)+.01f);record(2,id,dst[0],dst[1],dst[2]-dst[0],dst[3]-dst[1],a);}',prefix)
 assert part_count==1
-prefix=prefix.replace('(void)r;(void)g;(void)b;assert(isfinite(x)&&isfinite(y)&&px>0);return x+hud_ui_text_width(s,px)+a*0;', '(void)r;(void)g;(void)b;assert(isfinite(x)&&isfinite(y)&&px>0);record(7,0,x/1.6f,y/1.6f,hud_ui_text_width(s,px)/1.6f,px,a);return x+hud_ui_text_width(s,px)+a*0;')
+prefix += r'''
+#define TITLE_GLYPH7 114000
+int title_glyph_index(unsigned codepoint){return (int)(codepoint % 1000);}
+int anm_sprite_content_rect(int sprite,float r[4]){
+ if(sprite!=2317)return 0;
+ r[0]=10;r[1]=10;r[2]=200;r[3]=30;return 1;
+}
+void anm_draw_xy(int anim,int frame,float alpha,float dx,float dy,float sx,float sy,const anm_swap *sw,int n){
+ assert(anim==ID.bottom&&frame==0&&dx==0&&sx==1&&sw==NULL&&n==0);
+ record(8,anim,dx,dy+sy*398,640,sy*54,alpha);
+}
+'''
 desc=TEXT[TEXT.index('#define GAME_SLOTS '):TEXT.index('static int game_slot(')]
 source=prefix+'\n'+desc+'\n'+'\n'.join(fun(a) for a in (
  'static int game_slot(', 'static int game_rects(', 'static int game_hit(',
- 'static void game_sprite(', 'static void game_text(', 'static void game_picture(', 'static void game_mode_label(', 'static void draw_game_modes('))
+ 'static void game_sprite(', 'static void game_picture(', 'static void game_mode_label(', 'static void game_mode_japanese(',
+ 'static void draw_game_modes(', 'static void draw_bottombar(', 'static void draw_footer_hint('))
 source+=r'''
 static void near(float x,float y){assert(fabsf(x-y)<.02f);}
 static void check_draw(menu_state *m){
- menu_mode_rect rect[5];assert(game_rects(m,rect));calls=0;draw_game_modes(m,1,1024,768);
- int icons=0,vs=0,picture=0,label=0,text=0;
+ menu_mode_rect rect[5];assert(game_rects(m,rect));calls=0;draw_game_modes(m,1);
+ int icons=0,vs=0,picture=0,label=0,glyphs=0;
  menu_mode_rect detail=menu_mode_detail(edge640);
+ near(detail.x+edge640,24);assert(detail.y>320&&detail.y+detail.h<MENU_FOOTER_TOP);
  for(int i=0;i<calls;i++){
   packet*p=&packets[i];
   if((p->kind==2&&(p->id==2825||p->id==2824||p->id==2826||p->id==2827))||p->kind==3){
@@ -38,21 +51,40 @@ static void check_draw(menu_state *m){
    near(p->x,rect[k].x);near(p->y,rect[k].y);near(p->w,rect[k].w);near(p->h,rect[k].h);near(p->w,p->h);icons++;vs+=p->kind==3;
   }
   if(p->id>=3223&&p->id<=3226){
-   assert(p->kind==2&&p->id==GAME_MODE[m->sel].picture);near(p->x,-edge640);near(p->y,84);near(p->w,640+2*edge640);near(p->h,316);picture++;
+   assert(p->kind==2&&p->id==GAME_MODE[m->sel].picture);near(p->x,-edge640);near(p->y,84);near(p->w,640+2*edge640);near(p->y+p->h,MENU_FOOTER_TOP);picture++;
   }
-  if(p->kind==2&&p->id>=2316&&p->id<=2318){
-   assert(p->id==GAME_MODE[m->sel].label);assert(p->x>=detail.x-.01f&&p->x+p->w<=detail.x+detail.w+.01f&&p->y>=detail.y-.01f&&p->y+p->h<=detail.y+detail.h+.01f);label++;
+  if(p->kind==2&&p->id>=2316&&p->id<=2319){
+   assert(p->id==(GAME_MODE[m->sel].label?GAME_MODE[m->sel].label:2318));
+   if(GAME_MODE[m->sel].label){
+    near(p->x,detail.x);near(p->w,detail.w);
+   }else{
+    near(p->x,detail.x+(label==0?0:.6f*detail.w));
+    near(p->w,(label==0?.6f:.4f)*detail.w);
+   }
+   near(p->y,detail.y);near(p->h,detail.h);label++;
   }
-  if(p->kind==7){assert(p->x>=detail.x-.01f&&p->x+p->w<=detail.x+detail.w+.01f&&p->y>=detail.y&&p->y<detail.y+detail.h);text++;}
-  assert(p->id!=2319&&p->id!=108000&&p->id!=108001);
+  if(p->kind==2&&p->id>=TITLE_GLYPH7){
+   assert(p->x>detail.x&&p->x+p->w<detail.x+detail.w&&p->y>detail.y&&p->y+p->h<detail.y+detail.h);
+   glyphs++;
+  }
+  assert(p->id!=108000&&p->id!=108001);
  }
- assert(icons==5&&vs==1&&picture==(GAME_MODE[m->sel].picture!=0));
- assert(GAME_MODE[m->sel].label?(label==1&&text==0):(label==0&&text>=2));
+ assert(icons==5&&vs==1&&picture==1&&label==(GAME_MODE[m->sel].label?1:2));
+ assert(GAME_MODE[m->sel].label?glyphs==0:glyphs==22);
 }
 int main(void){
  assert(MENU_GAME_STORY==0&&MENU_GAME_TEN==1&&MENU_GAME_TA==2&&MENU_GAME_VS==3&&MENU_GAME_GHOST==4);
  const int order[5]={MENU_GAME_STORY,MENU_GAME_GHOST,MENU_GAME_TEN,MENU_GAME_TA,MENU_GAME_VS};
  for(int i=0;i<5;i++){assert(GAME_MODE[i].game==order[i]);assert(game_slot(order[i])==i);}
+ assert(GAME_MODE[1].label==2319&&GAME_MODE[1].picture==GAME_MODE[4].picture);
+ assert(!memcmp(GAME_MODE[1].picture_crop,GAME_MODE[4].picture_crop,sizeof GAME_MODE[1].picture_crop));
+ calls=0;draw_bottombar(0,1);draw_footer_hint(2317,1);
+ assert(calls==2&&packets[0].kind==8&&packets[1].kind==2);
+ near(packets[0].y,MENU_FOOTER_TOP);near(packets[0].y+packets[0].h,480);
+ assert(packets[0].h>54);
+ near(packets[1].x+packets[1].w/2,320);near(packets[1].y+packets[1].h/2,MENU_FOOTER_CENTER);
+ near(packets[1].h,20*1.22f);
+ assert(packets[1].y>MENU_FOOTER_TOP&&packets[1].y+packets[1].h<480);
  const float edges[]={0,106.66667f,160,200,213.33333f,202.44898f,320};unsigned cases=0;
  for(unsigned e=0;e<sizeof edges/sizeof *edges;e++){edge640=edges[e];
   for(int sel=0;sel<5;sel++){
@@ -83,7 +115,7 @@ int main(void){
  float src[4];menu_mode_rect dst,r[5];assert(!menu_mode_picture(NAN,1,0,src,&dst)&&!menu_mode_picture(1,0,0,src,&dst));
  assert(!menu_mode_layout(-1,-1,0,0,r)&&!menu_mode_layout(4,0,0,0,r)&&!menu_mode_layout(5,-1,0,0,r));
  assert(menu_mode_hit(NULL,0,0)==-1&&menu_mode_hit(r,NAN,0)==-1);assert(menu_mode_edge(NAN)==0&&menu_mode_edge(-1)==0&&menu_mode_edge(1e30f)==4096);
- printf("PASS %u production home draw/hit frames, five modes with original scale and narrow viewport fit, swapped visual IDs, cover crop/right detail geometry; no GPU claim\n",cases);return 0;
+ printf("PASS %u production home draw/hit frames, five modes with original scale and narrow viewport fit, swapped visual IDs, cover crop, left caption and footer geometry; no GPU claim\n",cases);return 0;
 }
 '''
 c=OUT/'home.c';exe=OUT/'home';c.write_text(source)

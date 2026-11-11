@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>店内鬼王 — Project Cinder</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/crown.css?v=2">
+<script defer src="/crown.js?v=5"></script>
+</head>
+<body>
+<header class="site">
+  <div class="wrap site-inner">
+    <a class="brand" href="/"><span class="mark"></span>PROJECT CINDER<small>ONLINE</small></a>
+    <nav class="main">
+      <a href="/">首页</a>
+      <a href="/ta">计时榜</a>
+      <a href="/ghost" class="active">店内鬼王</a>
+      <a href="/device">设备验证</a>
+      <a href="https://afdian.com/a/ProjectCinder">赞助</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <p class="eyebrow">Ghost King</p>
+    <h1>店内鬼王</h1>
+    <p class="lead">原版八区各有一个鬼王席位。在游戏中击败服务器鬼王后，当前席位会同步显示新车手。</p>
+
+    <section class="crown-stage" id="crown-stage" aria-label="鬼王展台" hidden>
+      <img class="crown-banner" src="/crown/banner.webp" alt="分身対戦モード 最強プレイヤー">
+      <div class="crown-area-picker">
+        <img id="crown-plates" width="640" height="334" alt="">
+        <div id="crown-areas" class="crown-areas" role="group" aria-label="选择鬼王区域"></div>
+      </div>
+      <div class="crown-arrow" aria-hidden="true"></div>
+      <div id="crown-display" class="crown-display"></div>
+      <button class="chip crown-motion" type="button" id="crown-motion">暂停动画</button>
+    </section>
+
+    <div class="grid courses" id="kings">
+      <p class="muted small"><span class="spinner"></span>载入中…</p>
+    </div>
+
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">Project Cinder · 玩家自建服务</div>
+</footer>
+
+</body>
+</html>

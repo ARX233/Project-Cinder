@@ -34,7 +34,7 @@ typedef struct {
 typedef struct {
   int level, native_available, ramp, route;
   int pack, paint; uint32_t raw_model;
-  int power, handling; uint32_t title;
+  int power, handling; uint32_t title, class_id;
   int history_available, revenge_available;
   int default_crown; /* original compiled holder for this area */
   int native_type, base_paint, custom_color;
@@ -53,7 +53,16 @@ typedef struct {
   uint64_t epoch; /* nonzero source catalogue generation; never a score */
   int player_level; /* -1 unknown; authoritative native 0..9 otherwise */
   int player_history_available, player_revenge_available;
+  int cloud_crowns, cloud_crowns_ready;
+  unsigned cloud_crown_occupied;
 } menu_ghost_directory_view;
+
+enum { MENU_ATTRACT_CROWN_IDLE, MENU_ATTRACT_CROWN_LOCAL,
+       MENU_ATTRACT_CROWN_PENDING, MENU_ATTRACT_CROWN_ONLINE };
+typedef struct {
+  short glyphs[5]; /* namedb glyphs for the server or local holder */
+  menu_ghost_directory_area car;
+} menu_attract_crown;
 
 #define MENU_CARD_GHOST_RECENT 8u
 typedef struct {
@@ -111,13 +120,15 @@ typedef struct {
 
 /* clTaResult's figures (its clArg, 0x97fda04), filled by the app as the race ends at the goal */
 #define MENU_SECTIONS 7
+enum { MENU_TA_RESULT_LOCAL, MENU_TA_RESULT_PENDING, MENU_TA_RESULT_ONLINE };
 typedef struct {
   float course_record, car_record, personal; /* s: the course's record, the car's, the player's (after this run) */
   int new_course, new_car, new_personal;     /* this run set them */
   float section[MENU_SECTIONS];              /* s each section took (0 for those the course lacks) */
   float total;                               /* s */
   int top_speed;                             /* km/h */
-  int rank;                                  /* the run's place in the machine's ranking (shown up to 100) */
+  int rank;                                  /* displayed place, through 100 */
+  int cloud_status;
 } menu_result;
 
 #define MENU_GARAGE_MAKERS 7 /* CARDB_ALL: the makers and the hidden cars */
@@ -203,6 +214,10 @@ typedef struct {
   int story_n;     /* and its place in the loop, 20 * division + 5 * level + episode */
   int course, official; /* the choice, once a race is ready */
   int demo;        /* rounds of the attract loop so far: picks the movie and automatic ranking course */
+  menu_attract_crown attract_crowns[MENU_GHOST_DIRECTORY_AREAS];
+  int attract_crown_status, attract_crown_slot;
+  unsigned attract_crown_occupied;
+  uint64_t attract_crown_generation;
   int ta_rank_offset, ta_rank_touch_inside; /* manual browsing shares the 12-course rotation */
   void *ta_rank_touch;
   /* APP game-thread snapshot only. No borrowed lifetime, network authority or draw-time I/O. */
@@ -251,6 +266,8 @@ typedef struct {
    * (pre_fade; the app takes it at the start) */
   int finish_fade, pre_fade;
   menu_result result;
+  struct { int active, remaining_km, total_km, hold, fade_out; } mileage;
+  struct { int active, area, pending; unsigned owned; } crown_award;
   /* The car setting screen's choices: per car of the car select (src/cardb.h's makers and
    * cars), stock or full tune, and the full tune's balance as its power (the handling has
    * the rest of CAR_TUNE_TOTAL); and the gearbox, AT (0) or MT (1). menu.c sets
@@ -279,7 +296,7 @@ typedef struct {
   int res_row, hires;
   /* the gear key pressed; the maker under the cursor meanwhile; the screen it was pressed on
    * (the maker select or the SAVE DATA screen) */
-  int option, opt_sel, opt_from;
+  int option, opt_sel, opt_from, opt_page;
   int key_k[3], key_dx[3], key_dy[3];
   int key_base_k[3], key_base_dx[3], key_base_dy[3];
   unsigned key_layout_dirty; /* one bit per legacy group */
@@ -396,6 +413,7 @@ typedef struct {
    * each car; the stars screen after a versus (MENU_VS_STAR, clSeqJoStarGetThread): the stars
    * before the race and the race's change (menu_vs_stars; the screen only for one), its frame */
   int vs_stars_car[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS], vs_count_car[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS];
+  unsigned char drive_style_car[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS];
   int star_from, star_delta, star_t, star_skip;
   float star_spin;
   int plays;
@@ -540,6 +558,7 @@ typedef struct {
     int status, pending_action, inflight_action;
     unsigned request_serial, active_request, completed_request, prepared_request;
     int completed_action, pre_go; /* once-only loading handoff, not race authority */
+    int intro_t; /* Ghost matchup ticks after the exact race resources are ready */
     int choose_race_options, previous_zone, previous_zones;
     int result, claim_eligible, claim_pending; /* display only; never a granted crown */
     void *touch;
@@ -563,7 +582,7 @@ enum { MENU_VS_LAN, MENU_VS_NET, MENU_VS_KINDS };
 enum { MENU_VS_LEAVE = -2, MENU_VS_DISCONNECT = -1 };
 #define MENU_VS_RAMPS 22
 
-/* The attract loop (mseqDemo) runs MOVIE, TITLE, RANKING, LOGO, PROLOGUE and round again; a tap
+/* The attract loop (mseqDemo) runs MOVIE, TITLE, RANKING, ATTRACT_CROWNS, LOGO, PROLOGUE; a tap
  * anywhere in it is START (the gas pedal), which flashes white into SAVE (the port's save
  * slots), then HAVE (a car of the save, through GARAGE, or a new one, through the car
  * select), each ending on CARD. The back button steps back through MAKER ... BGM, MAKER to
@@ -582,7 +601,10 @@ enum { MENU_MOVIE, MENU_TITLE, MENU_RANKING, MENU_LOGO, MENU_PROLOGUE, MENU_STAR
        MENU_TG_VINYL, MENU_VS, MENU_VS_SEL, MENU_VS_AREA, MENU_VS_MATCH, MENU_SHOGO, MENU_VS_STAR, MENU_INFO, MENU_LAYOUT,
        MENU_GHOST, /* appended: independent hub, never routed through MENU_VS */
        MENU_GHOST_PRE, /* independently prepared loading screen; no TA/VS fallback */
-       MENU_BODY_COLOR /* appended: original repaint UI; stable prior IDs unchanged */
+       MENU_BODY_COLOR, /* original repaint UI; stable prior IDs unchanged */
+       MENU_MILEAGE,
+       MENU_ATTRACT_CROWNS,
+       MENU_CROWN_AWARD
 };
 /* Exact factory identity and committed/transient repaint view for APP materials.
  * get returns committed style before page preparation outside the edit screen;
@@ -683,7 +705,7 @@ typedef struct {
   menu_body_color_view body_color;
   int story_body_valid;
   menu_story_body_stamp story_body;
-  int ghost_row; /* original Ghost directory index + 1, zero for other cars */
+  int ghost_row; /* Ghost directory index + 1, -(area + 1) on the attract board, zero otherwise */
 } menu_car;
 typedef struct {
   int n;
@@ -770,6 +792,9 @@ void menu_pause_draw(const menu_state *m);
  * MENU_LEAVE once the screen is black, the menus coming back out of it on the time zone and
  * BGM select. Taps go to menu_touch meanwhile. */
 void menu_finish_open(menu_state *m, int goal, const menu_result *res);
+void menu_ta_finish_records(menu_state *m, const uint32_t best_ms[3], unsigned rank, unsigned flags);
+void menu_finish_set_mileage(menu_state *m, double before_m, double after_m);
+void menu_finish_set_crown_award(menu_state *m, int area, unsigned owned, int pending);
 int menu_finish_update(menu_state *m, float dt);
 void menu_finish_draw(const menu_state *m);
 /* Each race frame from the moment the race stops running (goal or time up, before
@@ -870,6 +895,8 @@ void menu_story_clear(menu_state *m, int n);
 void menu_dress_win(menu_state *m, int wins);
 /* A dress-up wheel's pack (menu_state.wheel: emTireModelID + 1): its wheel_list.lua name and
  * texture set, data/wheels/<name>_<set>.wpk; NULL for none. */
+/* Original emTireModelID 98 is used by a Ghost opponent, outside the dress ladder. */
+enum { MENU_WHEEL_LEMANS = 99 };
 const char *menu_wheel_pack(int wheel, int *set);
 /* its GET screen model's pack name (wheels/<name>.wpk), NULL if none */
 const char *menu_wheel_get(int wheel);
@@ -898,6 +925,7 @@ int menu_update(menu_state *m, float dt);
 /* The 3D layer of the current screen; returns 0 when it has none. */
 int menu_scene3d(const menu_state *m, menu_scene *s);
 const menu_ghost_directory_area *menu_ghost_preview_profile(const menu_state *m,int ghost_row);
+int menu_in_attract(const menu_state *m);
 int menu_story_body_for_profile(int maker,int car,int color,int power,int handling,int direct_full,story_body_view *out);
 int menu_story_body_get(const menu_state *m,menu_story_body_stamp *out);
 int menu_story_body_owner_same(const menu_state *m,const menu_story_body_stamp *old);

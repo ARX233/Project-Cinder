@@ -20,6 +20,9 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -30,7 +33,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/** Optional authenticated replay sharing. A downloaded recording never confers a crown. */
+/** Authenticated replay sharing and community crowns. */
 final class GhostCloud {
     static final int RECORDS = 16;
     private static final int DEFENSE_RECORDS = 8;
@@ -39,6 +42,8 @@ final class GhostCloud {
     private static final Pattern SHA = Pattern.compile("[a-f0-9]{64}");
     private static final Pattern ID = Pattern.compile("[a-f0-9]{32}");
     private static final Pattern FILE = Pattern.compile("([0-7])-([a-f0-9]{64})(?:-([a-f0-9]{32}))?\\.ghost");
+    private static final Pattern CROWN = Pattern.compile("([0-7])-([a-f0-9]{32})-([a-f0-9]{32})-([a-f0-9]{64})\\.crown");
+    private static final int MAX_CROWN_BOARD = 2 + 8 * (21 + MAX_PROFILE);
     private static final Pattern BATTLE = Pattern.compile("([a-f0-9]{32})-([a-f0-9]{32})\\.battle");
     private static final int BATTLE_BYTES = 34;
     private static final int TIMING_BYTES = 236;
@@ -47,14 +52,24 @@ final class GhostCloud {
     private final CloudDevice device;
     private volatile int registration; // 0 unknown, 1 approved, -1 awaiting approval
     private final Path root;
+    // Owned by the worker. Reuse immutable, hash-checked blobs across catalogue refreshes.
+    private final LinkedHashMap<String, byte[]> downloads = new LinkedHashMap<>(RECORDS, 0.75f, true);
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "cinder-ghost-cloud");
         t.setDaemon(true);
         return t;
     });
-    private byte[] reply, defenseReply, timingReply;
+    private final ExecutorService timingWorker = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "cinder-timing-cloud");
+        t.setDaemon(true);
+        return t;
+    });
+    private byte[] reply, defenseReply, timingReply, timingAck;
     private boolean fetching, defenseFetching, draining, timingFetching, timingSending;
-    private int timingAck;
+    private byte[] crownReply;
+    private boolean crownFetching;
+    private int crownAck;
+    private String crownAwaitingLeaf;
 
     GhostCloud(String address, CloudDevice device, Path queueRoot) {
         this.base = CloudDevice.httpsOrigin(address);
@@ -85,35 +100,51 @@ final class GhostCloud {
         } catch (IOException | JSONException ignored) { /* 403 is handled by exchange. */ }
     }
 
-    synchronized void close() { worker.shutdownNow(); }
+    synchronized void close() {
+        worker.shutdownNow();
+        timingWorker.shutdownNow();
+    }
 
-    synchronized boolean timingSubmit(byte[] record) {
-        if (worker.isShutdown() || timingSending || record == null || record.length != TIMING_BYTES) return false;
+    synchronized boolean timingSubmit(byte[] record, boolean wantResult) {
+        if (timingWorker.isShutdown() || timingSending || record == null || record.length != TIMING_BYTES) return false;
         timingSending = true;
-        timingAck = 0;
-        worker.execute(() -> {
-            int result = -1;
+        timingAck = null;
+        timingWorker.execute(() -> {
+            byte[] result = new byte[0];
             try {
-                JSONObject ack = json(exchange("/v1/ta/community", record, 1024, null));
-                if (digest(record).equals(ack.getString("sha256")) && !ack.getBoolean("verified")) result = 1;
+                JSONObject ack;
+                try {
+                    ack = json(exchange(wantResult ? "/v1/ta/community/result" : "/v1/ta/community",
+                                        record, 1024, null));
+                } catch (Rejected olderServer) {
+                    if (!wantResult || olderServer.status != 404) throw olderServer;
+                    ack = json(exchange("/v1/ta/community", record, 1024, null));
+                }
+                if (digest(record).equals(ack.getString("sha256")) && !ack.getBoolean("verified")) {
+                    JSONObject records = wantResult ? ack.optJSONObject("result") : null;
+                    result = records == null ? new byte[]{1} : ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+                        .putInt(records.getInt("course_best_ms")).putInt(records.getInt("car_best_ms"))
+                        .putInt(records.getInt("personal_best_ms")).putInt(records.getInt("rank"))
+                        .putInt(records.getInt("new_records")).array();
+                }
             } catch (IOException | JSONException ignored) { /* the native outbox retains the record */ }
             finally { synchronized (this) { timingAck = result; timingSending = false; } }
         });
         return true;
     }
 
-    synchronized int timingPollAck() {
-        int result = timingAck;
-        timingAck = 0;
+    synchronized byte[] timingPollAck() {
+        byte[] result = timingAck;
+        timingAck = null;
         return result;
     }
 
     synchronized boolean timingRefresh(String rules, String physics, int course, int traffic) {
-        if (worker.isShutdown() || timingFetching || !SHA.matcher(rules).matches() || !SHA.matcher(physics).matches() ||
+        if (timingWorker.isShutdown() || timingFetching || !SHA.matcher(rules).matches() || !SHA.matcher(physics).matches() ||
                 course < 0 || course > 14 || traffic < 0 || traffic > 1) return false;
         timingFetching = true;
         timingReply = null;
-        worker.execute(() -> {
+        timingWorker.execute(() -> {
             byte[] result = new byte[0];
             try {
                 result = exchange("/v1/ta/community?rules_sha256=" + rules + "&physics_sha256=" + physics +
@@ -172,6 +203,78 @@ final class GhostCloud {
             return false;
         String leaf = area + "-" + digest(recording) + (cardId == null ? "" : "-" + cardId) + ".ghost";
         return queue(leaf, "*.ghost", recording);
+    }
+
+    synchronized boolean crownRefresh(String physics, String cardId) {
+        if (worker.isShutdown() || crownFetching || !SHA.matcher(physics).matches()) return false;
+        crownReply = null;
+        crownFetching = true;
+        scheduleUpload();
+        worker.execute(() -> {
+            byte[] result = new byte[0];
+            try {
+                result = exchange("/v1/ghosts/crowns?physics_sha256=" + physics,
+                        null, MAX_CROWN_BOARD, cardId);
+            } catch (IOException ignored) { /* empty reply signals an unavailable board */ }
+            finally { synchronized (this) { crownReply = result; crownFetching = false; } }
+        });
+        return true;
+    }
+
+    synchronized byte[] crownPoll() {
+        byte[] result = crownReply;
+        crownReply = null;
+        return result;
+    }
+
+    synchronized int crownPollAck() {
+        int result = crownAck;
+        crownAck = 0;
+        if (result != 0) crownAwaitingLeaf = null;
+        return result;
+    }
+
+    synchronized boolean crownEnqueue(int area, byte[] previous, byte[] recording, String cardId) {
+        if (area < 0 || area > 7 || previous == null || previous.length != 16 ||
+                recording == null || recording.length < 276 || recording.length > MAX_PROFILE ||
+                cardId == null || !ID.matcher(cardId).matches()) return false;
+        String leaf = area + "-" + hex(previous) + "-" + cardId + "-" + digest(recording) + ".crown";
+        if (!queue(leaf, "*.crown", recording)) return false;
+        crownAwaitingLeaf = leaf;
+        crownAck = 0;
+        return true;
+    }
+
+    private void drainCrowns(long deadline) throws IOException, JSONException {
+        if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) return;
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(root, "*.crown")) {
+            for (Path item : entries) {
+                if (System.nanoTime() >= deadline) return;
+                Matcher file = CROWN.matcher(item.getFileName().toString());
+                if (!file.matches() || !Files.isRegularFile(item, LinkOption.NOFOLLOW_LINKS)) continue;
+                byte[] record;
+                try (InputStream source = Files.newInputStream(item)) { record = bounded(source, MAX_PROFILE); }
+                if (!digest(record).equals(file.group(4))) continue;
+                int result = 1;
+                try {
+                    JSONObject ack = json(exchange("/v1/ghosts/crowns?area=" + file.group(1)
+                            + "&previous=" + file.group(2), record, 4096, file.group(3)));
+                    if (!file.group(4).equals(ack.getString("sha256")) ||
+                            !ID.matcher(ack.getString("id")).matches() ||
+                            ack.getInt("area") != Integer.parseInt(file.group(1)) ||
+                            ack.getBoolean("verified")) throw new IOException("Invalid crown acknowledgement");
+                } catch (Rejected failure) {
+                    if (failure.status == 409) result = -1;
+                    else if (failure.status == 400 || failure.status == 413 || failure.status == 422) result = -2;
+                    else throw failure; // Keep the claim across transient failures and app restarts.
+                }
+                Files.deleteIfExists(item);
+                synchronized (this) {
+                    if (crownAwaitingLeaf == null || crownAwaitingLeaf.equals(item.getFileName().toString()))
+                        crownAck = result;
+                }
+            }
+        }
     }
 
     synchronized boolean report(byte[] id, boolean won, int rawModel, int hp, int gap, String name) {
@@ -247,6 +350,8 @@ final class GhostCloud {
         worker.execute(() -> {
             try {
                 long deadline = System.nanoTime() + 8_000_000_000L;
+                try { drainCrowns(Math.min(deadline, System.nanoTime() + 4_000_000_000L)); }
+                catch (IOException | JSONException ignored) { /* retry independently of ordinary replays */ }
                 try { drainBattles(Math.min(deadline, System.nanoTime() + 4_000_000_000L)); }
                 catch (IOException | JSONException ignored) { /* retry independently of replay uploads */ }
                 try { drainReplays(deadline); }
@@ -338,29 +443,43 @@ final class GhostCloud {
         String basePath = "/v1/ghosts?physics_sha256=" + physics + "&limit=" + RECORDS;
         String filter = name != null ? "&name_hex=" + hex(name.getBytes(StandardCharsets.UTF_8)) :
                 ghostId != null ? "&id=" + ghostId : "&others=1";
-        JSONObject list;
-        try { list = json(exchange(basePath + filter, null, 32768, null)); }
-        catch (Rejected failure) {
-            if (failure.status != 400 || name != null || ghostId != null) throw failure;
-            list = json(exchange(basePath, null, 32768, null)); // servers without discovery filters
-        }
+        JSONObject list = json(exchange(basePath + filter, null, 32768, null));
         JSONArray ghosts = list.getJSONArray("ghosts");
         if (ghosts.length() > RECORDS) throw new IOException("Cloud replay count exceeds budget");
         ByteArrayOutputStream rows = new ByteArrayOutputStream();
+        HashSet<String> seen = new HashSet<>();
+        boolean retry = false;
         int count = 0;
         long deadline = System.nanoTime() + 12_000_000_000L;
-        for (int i = 0; i < ghosts.length() && System.nanoTime() < deadline; i++) {
+        for (int i = 0; i < ghosts.length(); i++) {
             JSONObject item = ghosts.getJSONObject(i);
             String id = item.getString("id"), sha = item.getString("sha256");
             int area = item.getInt("area"), bytes = item.getInt("bytes");
             if (!ID.matcher(id).matches() || (ghostId != null && !ghostId.equals(id)) ||
                     (name != null && !item.getString("display_name").contains(name)) || !SHA.matcher(sha).matches() ||
                     !physics.equals(item.getString("physics_sha256")) || area < 0 || area > 7 ||
-                    bytes < 276 || bytes > MAX_PROFILE) continue;
-            byte[] data;
-            try { data = exchange("/v1/ghosts/" + id, null, bytes, null); }
-            catch (IOException failure) { continue; }
-            if (data.length != bytes || !digest(data).equals(sha)) continue;
+                    bytes < 276 || bytes > MAX_PROFILE || !seen.add(id)) continue;
+            byte[] data = downloads.get(sha);
+            if (data == null) {
+                if (System.nanoTime() >= deadline) {
+                    retry = true;
+                    continue;
+                }
+                try { data = exchange("/v1/ghosts/" + id, null, bytes, null); }
+                catch (Rejected failure) {
+                    if (failure.status == 401 || failure.status == 403) throw failure;
+                    retry |= failure.status != 404;
+                    continue;
+                } catch (IOException failure) {
+                    retry = true;
+                    continue;
+                }
+                if (data.length != bytes || !digest(data).equals(sha)) continue;
+                downloads.put(sha, data);
+                if (downloads.size() > 2 * RECORDS)
+                    downloads.remove(downloads.keySet().iterator().next());
+            }
+            if (data.length != bytes) continue;
             rows.write(area);
             for (int n = 0; n < id.length(); n += 2)
                 rows.write(Integer.parseInt(id.substring(n, n + 2), 16));
@@ -368,6 +487,7 @@ final class GhostCloud {
             rows.write(data, 0, bytes);
             count++;
         }
+        if (retry && count == 0) throw new IOException("No listed replay could be downloaded");
         ByteArrayOutputStream result = new ByteArrayOutputStream(1 + rows.size());
         result.write(count);
         rows.writeTo(result);

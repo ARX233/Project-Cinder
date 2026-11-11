@@ -10,10 +10,14 @@ import os
 from pathlib import Path
 import stat
 import struct
+from threading import Event
 from types import MappingProxyType
 from .source import (VerifiedSnapshot, OwnedOutput, ReviewedReadSet, SourceEntry,
     FileTreeSource, OriginalInputError, ConversionCancelled, HASH, _unique_object)
 from .media_validate import validate_media_fd
+from .work_queue import run_parallel
+
+MAX_MEDIA_WORKERS = 4
 
 _SCHEMA='wmmt-original-media-v1'
 _TOKEN=object()
@@ -164,7 +168,8 @@ def _video(fd,expect):
     b=_read(fd,0,44);v=struct.unpack('<10I',b[4:44])
     if b[:3]!=b'BIK' or v[0]+8!=os.fstat(fd).st_size or (v[1],v[4],v[5],v[7],v[6])!=(expect['frames'],expect['width'],expect['height'],*expect['time_base']):_bad('Bink source differs from pinned metadata')
 
-def convert_media(snapshot,output,plan,*,library,cancel=None,progress=None):
+def convert_media(snapshot,output,plan,*,library,cancel=None,progress=None,worker_limit=None,
+                  restored=(),on_converted=None):
     """No result activation/publication. Each SourceEntry is added only after closure.
     library is supplied by the trusted app engine, never by the player/plan.
     """
@@ -184,8 +189,13 @@ def convert_media(snapshot,output,plan,*,library,cancel=None,progress=None):
         if t.audio:caps[t.audio]=128*1024*1024
         if t.overlay:caps[t.overlay['source']]=1024*1024
     if any(not 1<=snapshot.readset.files[n].size<=caps[n] for n in plan.sources):_bad('source dependency byte budget')
-    targets={t.path:output.target(t.path) for t in plan.tasks}
-    handles={};source=FileTreeSource(snapshot.root,snapshot.readset);completed=[]
+    restored = frozenset(restored)
+    if (not restored <= {task.path for task in plan.tasks}
+            or any(not isinstance(output.files.get(name), SourceEntry) for name in restored)):
+        _bad('media resume requires verified output entries')
+    tasks = [task for task in plan.tasks if task.path not in restored]
+    targets = {task.path: output.target(task.path) for task in tasks}
+    handles={};source=FileTreeSource(snapshot.root,snapshot.readset);completed={}
     try:
         # Every needed FD is reviewed/hash-bound BEFORE Pillow or native loading.
         for name in plan.sources:
@@ -201,7 +211,19 @@ def convert_media(snapshot,output,plan,*,library,cancel=None,progress=None):
         import ctypes as C
         if (C.sizeof(Limits),C.sizeof(Result))!=(64,320):_bad('native ABI size mismatch')
         backend=OverlayBackend(lib)
-        for index,task in enumerate(plan.tasks):
+        # Pillow's warning filter is process-wide on this Python runtime.
+        # Decode the two bounded overlays before starting native workers.
+        overlays = {}
+        for task in tasks:
+            if task.overlay:
+                _cancel(cancel)
+                label = load_png_overlay_fd(handles[task.overlay['source']], x=29, y=18,
+                                            other_fds=(handles[task.source], handles[task.audio]))
+                if (label.width, label.height) != (task.overlay['width'], task.overlay['height']):
+                    _bad('original PNG dimensions differ from plan')
+                overlays[task.path] = label
+
+        def convert(task, cancel):
             _cancel(cancel);sfd=handles[task.source];afd=handles[task.audio] if task.audio else -1
             needed=[task.source]+([task.audio] if task.audio else [])+([task.overlay['source']] if task.overlay else [])
             for name in needed:
@@ -215,9 +237,7 @@ def convert_media(snapshot,output,plan,*,library,cancel=None,progress=None):
                     try:return bool(cancel and cancel())
                     except BaseException as exc:callback_errors.append(exc);return True
                 if task.overlay:
-                    label=load_png_overlay_fd(handles[task.overlay['source']],x=29,y=18,other_fds=(sfd,afd,fd))
-                    if (label.width,label.height)!=(task.overlay['width'],task.overlay['height']):_bad('original PNG dimensions differ from plan')
-                    r=backend.convert_overlay(2,sfd,afd,fd,limit,label,cancel=poll)
+                    r=backend.convert_overlay(2,sfd,afd,fd,limit,overlays[task.path],cancel=poll)
                 else:r=backend.convert(1 if task.kind=='wav' else 2,sfd,afd,fd,limit,cancel=poll)
                 if callback_errors:raise OriginalInputError('Media native cancellation callback failed') from callback_errors[0]
                 _cancel(cancel)
@@ -234,12 +254,37 @@ def convert_media(snapshot,output,plan,*,library,cancel=None,progress=None):
                     if _hash_fd(handles[name],cancel)!=snapshot.readset.files[name]:_bad('source changed during conversion')
                 _cancel(cancel)
             finally:os.close(fd)
-            output.files[task.path]=observed
-            completed.append({'path':task.path,'bytes':observed.size,'sha256':observed.sha256,'native':r.as_dict(),'container':container})
+            return observed, r.as_dict(), container
+
+        def commit(task, result):
+            observed, native, container = result
+            output.files[task.path] = observed
+            if on_converted:
+                on_converted(task.path)
+            completed[task.path] = {'path':task.path,'bytes':observed.size,'sha256':observed.sha256,
+                                    'native':native,'container':container}
             if progress:
-                try:progress('convert-media',index+1,26)
-                except BaseException as exc:raise OriginalInputError('Media progress callback failed') from exc
-        return {'component':'media','plan_sha256':plan.sha256,'source_readset_sha256':snapshot.readset.sha256,'files':completed,'complete_dataset':False,'activated':False,'expected_output_verified':False,'structural_profile_verified':True,'lossy_byte_equivalence_claimed':False,'validation':'native completion plus required container closure; not runtime full decode or lossy-byte pin'}
+                try:
+                    progress('convert-media',len(restored)+len(completed),len(plan.tasks))
+                except ConversionCancelled:
+                    raise
+                except BaseException as exc:
+                    raise OriginalInputError('Media progress callback failed') from exc
+
+        if worker_limit is None:
+            for task in tasks:
+                commit(task, convert(task, cancel))
+            peak = min(len(tasks), 1)
+        else:
+            # Start long encodes first. Each native codec keeps its existing
+            # settings and independently owns the output descriptor.
+            stopped = Event()
+            peak = run_parallel(sorted(tasks, key=lambda task: task.kind != 'movie'),
+                                lambda task: convert(task, stopped.is_set), commit,
+                                capacity=MAX_MEDIA_WORKERS, worker_limit=worker_limit,
+                                cancel=cancel, stop=stopped.set)
+        files = [completed[task.path] for task in tasks]
+        return {'component':'media','plan_sha256':plan.sha256,'source_readset_sha256':snapshot.readset.sha256,'files':files,'workers':peak,'complete_dataset':False,'activated':False,'expected_output_verified':False,'structural_profile_verified':True,'lossy_byte_equivalence_claimed':False,'validation':'native completion plus required container closure; not runtime full decode or lossy-byte pin'}
     except (OSError,ValueError,TypeError,OverflowError,struct.error,AssertionError) as exc:
         if isinstance(exc,OriginalInputError):raise
         raise OriginalInputError('Media component failed; new job partials retained') from exc

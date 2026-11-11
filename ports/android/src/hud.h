@@ -198,9 +198,10 @@ int hud_layout_hit(int gyro, float x, float y);
 void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy);
 void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel);
 
-/* The menus' left/right keys and back button, in the same style: which one is at (x, y)
+/* The menus' left/right keys and back button: which one is at (x, y)
  * (-1, +1, HUD_MENU_BACK, or 0), and drawing them (held = the one being pressed, or 0;
- * keys and back say which are on the screen). */
+ * keys is a direction mask on Android and back enables the return button). */
+enum { HUD_MENU_LEFT_KEY = 1, HUD_MENU_RIGHT_KEY = 2, HUD_MENU_BOTH_KEYS = 3 };
 #define HUD_MENU_BACK 2
 #define HUD_MENU_OPTION 3 /* the OPTION button (the brand select's, left of back) */
 #define HUD_MENU_HIDDEN 4 /* the maker select's hidden cars key, in the bottom bar's middle */
@@ -221,6 +222,8 @@ void hud_draw_menu_erase(float screen_w, float screen_h, int held, int armed);
  * x past EDGE). */
 void hud_ui_begin(float screen_w, float screen_h);
 void hud_ui_rect(float x, float y, float w, float h, float r, float g, float b, float a);
+/* Four HUD-space XY points in triangle-strip order, using the same UI batch. */
+void hud_ui_quad(const float xy[8], float r, float g, float b, float a);
 void hud_ui_button(float x, float y, float w, float h, int held);
 /* text with its top left at (x, y), each font pixel px points; returns the x after it */
 float hud_ui_text(const char *s, float x, float y, float px, float r, float g, float b, float a);

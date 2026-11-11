@@ -87,6 +87,8 @@ typedef struct {
   /* CSeq::Exec CutInInfo+4: (machine odometer - race origin) in metres. */
   float story_distance;
   int story_distance_valid;
+  float mileage_mm;     /* frozen SPlayResult +0xc, including TenWarp mileage mapping */
+  int mileage_valid;
   int won;
   /* the rivals' boxes (clStoryConsole): S2DInfoStory's m each rival i is behind (negative: ahead)
    * and whether it is on (getInfoStoryAdvantage / getInfoStoryCharacterEnable) */
@@ -143,6 +145,11 @@ typedef struct {
   unsigned rev_sequence;
   float rev_vol;
 } car_se;
+
+typedef struct {
+  float rpm, gain;
+  unsigned char accel, shift_up, shift_down;
+} car_engine_se;
 
 typedef struct {
   car_se se;
@@ -208,6 +215,7 @@ typedef struct {
   TireSmokeInput tire_smoke;
   uint64_t tire_smoke_tick;
   int tire_smoke_valid;
+  car_engine_se engine_se; /* sampled with se.rev_sequence */
 } car_state;
 
 /* the corners: +x is the car's left */
@@ -544,6 +552,7 @@ void car_view(int view);
 /* One arcade frame (1/60 s). */
 void car_update(car_state *c, const car_input *in);
 float car_kmh(const car_state *c);
+unsigned car_vs_drive_style(unsigned previous);
 
 /* The story's realtime movies (data/rtmovie, the arcade's YOURTMOVIE_CPP::clMovieSystem): the
  * movie (clEffStoryType's RtMovie id, MovieTableData.txt's row), the player's car (NULL: the

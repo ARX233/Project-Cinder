@@ -30,7 +30,7 @@ class NativePaths(unittest.TestCase):
 #include <pthread.h>
 #include <string.h>
 #include <stddef.h>
-static struct {pthread_mutex_t mx;char optional_files[8][512];} A={.mx=PTHREAD_MUTEX_INITIALIZER};
+static struct {pthread_mutex_t mx;char optional_files[14][512];} A={.mx=PTHREAD_MUTEX_INITIALIZER};
 '''+function(text,'android_optional_resource_path')+r'''
 int main(void){char out[512];
 assert(!android_optional_resource_path("story-cutin.bin",out,sizeof out)&&!out[0]);
@@ -40,6 +40,17 @@ assert(!android_optional_resource_path("card-pages.bin",out,sizeof out)&&!out[0]
 strcpy(A.optional_files[6],"/verified/front_halo.wpk");strcpy(A.optional_files[7],"/verified/front_halo.bin");
 assert(android_optional_resource_path("front_halo.wpk",out,sizeof out)&&!strcmp(out,A.optional_files[6]));
 assert(android_optional_resource_path("front_halo.bin",out,sizeof out)&&!strcmp(out,A.optional_files[7]));
+strcpy(A.optional_files[8],"/verified/mileage-aura.wpk");strcpy(A.optional_files[9],"/verified/mileage-menu.bin");
+assert(android_optional_resource_path("mileage-aura.wpk",out,sizeof out)&&!strcmp(out,A.optional_files[8]));
+assert(android_optional_resource_path("mileage-menu.bin",out,sizeof out)&&!strcmp(out,A.optional_files[9]));
+strcpy(A.optional_files[10],"/verified/ghost-match.bin");
+assert(android_optional_resource_path("ghost-match.bin",out,sizeof out)&&!strcmp(out,A.optional_files[10]));
+strcpy(A.optional_files[11],"/verified/ghost-wheel-lman.wpk");
+assert(android_optional_resource_path("ghost-wheel-lman.wpk",out,sizeof out)&&!strcmp(out,A.optional_files[11]));
+strcpy(A.optional_files[12],"/verified/finish-menu.bin");
+assert(android_optional_resource_path("finish-menu.bin",out,sizeof out)&&!strcmp(out,A.optional_files[12]));
+strcpy(A.optional_files[13],"/verified/crown-scenes.bin");
+assert(android_optional_resource_path("crown-scenes.bin",out,sizeof out)&&!strcmp(out,A.optional_files[13]));
 assert(!android_optional_resource_path("../story-cutin.bin",out,sizeof out));
 assert(!android_optional_resource_path("story-cutin.bin",out,2)&&!out[0]);
 assert(!android_optional_resource_path(NULL,out,sizeof out));
@@ -93,11 +104,12 @@ return 0;}
 #include <stdatomic.h>
 static struct {
   pthread_mutex_t mx;JavaVM *vm;jobject activity;
-  jmethodID show_movie,play_bgm,set_bgm_volume,set_bgm_gameplay_paused,fail,frame_rate_limit_changed;
+  jmethodID show_movie,play_bgm,play_race_bgm,set_bgm_volume,set_bgm_gameplay_paused,fail,frame_rate_limit_changed;
   jmethodID ghost_cloud_configured,ghost_cloud_refresh,ghost_cloud_poll,ghost_cloud_enqueue;
   jmethodID ghost_cloud_search,ghost_cloud_search_id,ghost_cloud_report,ghost_cloud_defense_refresh,ghost_cloud_defense_poll;
-  jmethodID timing_cloud_submit,timing_cloud_ack,timing_cloud_refresh,timing_cloud_board;
-  char data_dir[512],save_dir[512],sidecar_dir[512],ta_store_dir[512],ghost_crown_dir[512],optional_files[8][512];
+  jmethodID crown_refresh,crown_poll,crown_ack,crown_enqueue;
+  jmethodID timing_cloud_submit,timing_cloud_ack,timing_cloud_refresh,timing_cloud_board,online_vs_address;
+  char data_dir[512],save_dir[512],sidecar_dir[512],ta_store_dir[512],ghost_crown_dir[512],optional_files[14][512];
   _Atomic unsigned activity_generation;
 } A={.mx=PTHREAD_MUTEX_INITIALIZER};
 static _Atomic unsigned bgm_extra_mask;
@@ -120,10 +132,10 @@ static int detach_thread(pthread_t t){detached++;return 0;}
 #define pthread_create create_thread
 #define pthread_detach detach_thread
 #define JFN(name) native_##name
-#define ROOT_CALL(actor,root) native_nativeStart(&e,NULL,(jobject)(actor),(jstring)"/data",(jstring)"/save",(jstring)"/card",NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,(jstring)(root),NULL)
+#define ROOT_CALL(actor,root) native_nativeStart(&e,NULL,(jobject)(actor),(jstring)"/data",(jstring)"/save",(jstring)"/card",NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,(jstring)(root),NULL)
 '''+text[start:end]+r'''
 int main(void){struct JNINativeInterface_ table={.GetJavaVM=fake_vm,.ExceptionCheck=fake_exception,.GetStringUTFChars=fake_utf,.ReleaseStringUTFChars=fake_release,.GetMethodID=fake_method,.NewGlobalRef=fake_new,.DeleteGlobalRef=fake_delete};JNIEnv e=&table;
-#define CALL(actor,data) native_nativeStart(&e,NULL,(jobject)(actor),(jstring)(data),(jstring)"/save",(jstring)"/card",(jstring)"/cutin",NULL,(jstring)"/wpk",(jstring)"/bfx",NULL,NULL,(jstring)"/halo-wpk",(jstring)"/halo-bin",(jstring)"/ta-private",(jstring)"/ghost-private")
+#define CALL(actor,data) native_nativeStart(&e,NULL,(jobject)(actor),(jstring)(data),(jstring)"/save",(jstring)"/card",(jstring)"/cutin",NULL,(jstring)"/wpk",(jstring)"/bfx",NULL,NULL,(jstring)"/halo-wpk",(jstring)"/halo-bin",(jstring)"/aura",(jstring)"/mileage",(jstring)"/match",(jstring)"/ghost-wheel",(jstring)"/finish-menu",(jstring)"/crown-scenes",(jstring)"/ta-private",(jstring)"/ghost-private")
 assert(!CALL(1,NULL)&&!A.activity&&!refs);
 fail_utf=1;assert(!CALL(1,"/data")&&!A.activity&&!refs);fail_utf=exception=0;
 fail_method=1;assert(!CALL(1,"/data")&&!A.activity&&!refs);fail_method=exception=0;
@@ -134,6 +146,8 @@ fail_stack=1;assert(!CALL(1,"/data")&&!A.activity&&!refs);fail_stack=0;
 fail_thread=1;assert(!CALL(1,"/data")&&!A.activity&&!refs&&!A.ta_store_dir[0]&&!atomic_load(&bgm_extra_mask));fail_thread=0;
 assert(CALL(1,"/data")&&refs==1&&created==1&&detached==1);assert(!strcmp(A.data_dir,"/data")&&!strcmp(A.optional_files[0],"/cutin")&&!A.optional_files[1][0]);
 assert(!strcmp(A.optional_files[6],"/halo-wpk")&&!strcmp(A.optional_files[7],"/halo-bin")&&!strcmp(A.ghost_crown_dir,"/ghost-private"));
+assert(!strcmp(A.optional_files[8],"/aura")&&!strcmp(A.optional_files[9],"/mileage")&&!strcmp(A.optional_files[10],"/match")&&!strcmp(A.optional_files[11],"/ghost-wheel")&&!strcmp(A.optional_files[12],"/finish-menu"));
+assert(!strcmp(A.optional_files[13],"/crown-scenes"));
 atomic_store(&bgm_extra_mask,0);assert(CALL(2,"/bait")&&refs==1&&created==1&&A.activity==(jobject)2);assert(!strcmp(A.data_dir,"/data")&&!atomic_load(&bgm_extra_mask));assert(atomic_load(&A.activity_generation)==2);assert(!strcmp(A.ta_store_dir,"/ta-private"));
 /* Reattach must preserve the first private root despite a new Activity bait. */
 assert(ROOT_CALL(3,"/bait-rank")&&!strcmp(A.ta_store_dir,"/ta-private")&&!strcmp(A.save_dir,"/save"));

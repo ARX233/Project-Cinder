@@ -2,7 +2,6 @@ package com.wmmt.port;
 
 import android.app.Activity;
 import android.app.ActivityManager;
-import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -143,6 +142,7 @@ public final class OriginalConversionController {
         io.execute(() -> restore(gate));
     }
     public boolean isBusy() { return phase!=Phase.IDLE; }
+    boolean isPickingSource() { return phase==Phase.PICKER; }
     public void saveState(Bundle out) {
         requireMain();out.putString(STATE_PREFIX+"phase",phase.name());out.putInt(STATE_PREFIX+"pickerKind",pickerKind);
         out.putBoolean(STATE_PREFIX+"pickerLaunched",pickerLaunched);
@@ -168,18 +168,56 @@ public final class OriginalConversionController {
                 "私有分区预留至少 "+gib(requiredSpace(p.sourceBytes,p.maxOutputBytes))+" GiB（来源×2 + 输出上限×2 +128 MiB，包含worker输出和发布副本；仅分区即时估算，实际ZIP可能更大）。\n"+
                 "原版ZIP压缩文件最多8 GiB（来源只读复制，不解压执行）。\n手机整包可能耗时1–3小时，默认服务期限4小时。选定来源后可以返回桌面，允许通知即可查看转换进度。\n\n"+
                 "仅生成新私有job；主进程验证并提交成功后才改变选择。旧资源/存档不作清理。请选择原版ZIP或目录。";
-            new AlertDialog.Builder(h.activity()).setTitle("原版街机资源一键转换")
-                .setMessage(text).setPositiveButton("我有使用权：选ZIP",(d,w)->choose(REQUEST_ZIP))
-                .setNeutralButton("我有使用权：选目录",(d,w)->choose(REQUEST_TREE)).setNegativeButton("取消",null).show();
+            new LauncherDialog(h.activity(),"原版街机资源一键转换").message(text)
+                .action("取消",null).action("我有使用权：选目录",()->choose(REQUEST_TREE))
+                .primary("我有使用权：选ZIP",()->choose(REQUEST_ZIP)).show();
         } catch(Exception e) { h.status("暂不能开始原版转换："+message(e)+"；旧可用资源保留"); }
     }
+    public void resumeLast() {
+        requireMain();
+        Host h=liveHost();
+        if(h==null || isBusy() || !h.canBegin()) return;
+        try { profile=h.profile(); }
+        catch(IOException e) { h.status("无法读取转换配置："+message(e));return; }
+        resetAttempt();
+        phase=Phase.RESTORING;
+        h.setBusy(true);h.status("查找上次已复制的原版资源…");
+        io.execute(() -> {
+            try {
+                h.withInstallLock(() -> {
+                    checkCancelled();
+                    OriginalJobStore target=newStore(profile);
+                    OriginalJobStore.Job previous=target.latestResumableJob(cancelled::get);
+                    if(previous==null) throw new IOException("没有可继续的转换。来源复制完成后，才可以断点继续。");
+                    store=target;job=previous;
+                    pickerKind=target.resumeUsesZip(previous)?REQUEST_ZIP:REQUEST_TREE;
+                    writeMarker(Phase.SEALED);
+                });
+                main.post(() -> {
+                    if(cancelled.get()) {
+                        scheduleFinish(false,"已取消继续转换，进度保留",false);return;
+                    }
+                    phase=Phase.SEALED;
+                    status("正在校验并恢复上次转换进度…");
+                    connect(false);
+                });
+            } catch(Exception e) { completeLocal(h,false,message(e)); }
+        });
+    }
+
+    private void resetAttempt() {
+        cancelled.set(false);committed=false;detachedDuringCopy=false;terminalHandled=false;
+        publishScheduled=false;finishScheduled=false;ackOnly=false;ackExpected=false;
+        pickerLaunched=false;job=null;store=null;workerPid=0;
+    }
+
     private void choose(int kind) {
         Host h=liveHost();if(h==null)return;
         if(isBusy()||!h.canBegin()) { h.status("当前资源操作状态已改变，请重新检查");return; }
         try { profile=h.profile();admission(profile); }
         catch(Exception e) { h.status("预检失败："+message(e)+"；旧资源/存档保留");return; }
-        cancelled.set(false);committed=false;detachedDuringCopy=false;terminalHandled=false;publishScheduled=false;finishScheduled=false;ackOnly=false;ackExpected=false;
-        pickerKind=kind;pickerLaunched=false;job=null;store=null;workerPid=0;phase=Phase.PICKER;
+        resetAttempt();
+        pickerKind=kind;phase=Phase.PICKER;
         h.setBusy(true);h.status("准备只读来源选择…");final Host gate=h;
         io.execute(() -> {
             try { gate.withInstallLock(() -> writeMarker(Phase.PICKER)); }
@@ -316,7 +354,7 @@ public final class OriginalConversionController {
             if(ackOnly) { scheduleFinish(false,"上次发布过程被中断，提交结果未知；可能已提交，请重新检查（不会重发或回滚）",true);return; }
             if(message.what==OriginalConversionService.MSG_FAILED) {
                 String code=data.getString(OriginalConversionService.KEY_ERROR_CODE,"ENGINE_FAILED");
-                scheduleFinish(false,"转换未提交："+bounded(code,120)+" / "+bounded(data.getString(OriginalConversionService.KEY_ERROR_MESSAGE,"worker stopped"),1200)+"；partial保留",true);
+                scheduleFinish(false,"转换未提交："+bounded(code,120)+" / "+bounded(data.getString(OriginalConversionService.KEY_ERROR_MESSAGE,"worker stopped"),1200)+"；可在选择资源中继续上次转换",true);
             } else {
                 // reportPath/reportJson deliberately not read: only Store's fixed private completion is authority.
                 if(cancelled.get())scheduleFinish(false,"已取消，转换candidate不发布；partial保留",true);

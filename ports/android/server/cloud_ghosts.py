@@ -178,6 +178,15 @@ class SharedGhosts:
                     UNIQUE(subject, area, sha256)
                 );
             """)
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS community_ghost_crowns_v1 (
+                    area INTEGER PRIMARY KEY CHECK (area BETWEEN 0 AND 7),
+                    id TEXT UNIQUE NOT NULL, subject TEXT NOT NULL, card_id TEXT NOT NULL,
+                    sha256 TEXT NOT NULL, physics_sha256 TEXT NOT NULL,
+                    display_name TEXT NOT NULL, raw_model INTEGER NOT NULL, raw_ramp INTEGER NOT NULL,
+                    route INTEGER NOT NULL, created_ms INTEGER NOT NULL, record BLOB NOT NULL
+                )
+            """)
             if "card_id" not in {row[1] for row in self._db.execute("PRAGMA table_info(shared_ghosts_v1)")}:
                 self._db.execute("ALTER TABLE shared_ghosts_v1 ADD COLUMN card_id TEXT")
             self._db.executescript("""
@@ -210,6 +219,58 @@ class SharedGhosts:
         except BaseException:
             self._db.close()
             raise
+
+    def crowns(self, physics, principal, card_id):
+        """One consistent snapshot. A zero-length row means occupied but incompatible."""
+        with self._lock:
+            rows = self._db.execute("""
+                SELECT area,id,subject,card_id,physics_sha256,record FROM community_ghost_crowns_v1 ORDER BY area
+            """).fetchall()
+        owned = sum(1 << row["area"] for row in rows
+                    if row["subject"] == principal.subject and row["card_id"] == card_id
+                    and row["physics_sha256"] == physics)
+        packet = bytearray([owned, len(rows)])
+        for row in rows:
+            record = row["record"] if row["physics_sha256"] == physics else b""
+            packet.extend(struct.pack("<B16sI", row["area"], bytes.fromhex(row["id"]), len(record)))
+            packet.extend(record)
+        return bytes(packet)
+
+    def claim_crown(self, principal, area, previous, record, card_id):
+        if type(principal) is not TrustedPrincipal:
+            raise ContractError("trusted_auth_context_required", 401)
+        if not GHOST_ID.fullmatch(previous or "") or not GHOST_ID.fullmatch(card_id or ""):
+            raise ContractError("invalid_crown_claim")
+        profile = parse_record(record, area)
+        if profile.raw_ramp >= len(_ERAMPS):
+            raise ContractError("crown_requires_ghost_race", 422)
+        digest = hashlib.sha256(record).hexdigest()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._db.execute("""
+                    SELECT * FROM community_ghost_crowns_v1 WHERE area=?
+                """, (area,)).fetchone()
+                if (current and current["sha256"] == digest and current["subject"] == principal.subject
+                        and current["card_id"] == card_id):
+                    crown_id = current["id"]  # retry after a committed response was lost
+                else:
+                    if previous != (current["id"] if current else "0" * 32):
+                        raise ContractError("crown_changed", 409)
+                    if current and (profile.physics_sha256 != current["physics_sha256"]
+                                    or record[32:64] != current["record"][32:64]):
+                        raise ContractError("crown_route_or_physics_mismatch", 422)
+                    crown_id = secrets.token_hex(16)
+                    self._db.execute("""
+                        INSERT OR REPLACE INTO community_ghost_crowns_v1 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (area, crown_id, principal.subject, card_id, digest, profile.physics_sha256,
+                          profile.display_name, profile.raw_model, profile.raw_ramp, profile.route,
+                          time.time_ns() // 1_000_000, record))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return {"id": crown_id, "area": area, "sha256": digest, "verified": False}
 
     @staticmethod
     def _view(row):

@@ -38,14 +38,19 @@ final class LauncherWallpaperView extends FrameLayout {
   static final long MAX_DECODED_PIXELS = 4L * 1024 * 1024;
   static final int MAX_DECODED_EDGE = 4096;
 
-  final Button selectButton, launchButton, cancelButton, clearButton;
+  private static final int CORNER_MARGIN_DP = 24;
+  private static final int ACTION_WIDTH_DP = 136;
+  private static final int NOTICE_WIDTH_DP = 76;
+  private static final int ACTION_GAP_DP = 10;
+
+  final Button selectButton, registrationButton, launchButton, noticeButton, cancelButton, clearButton;
   // Retained non-null action controls for MainActivity's existing enable/disable contract.
   // They are never part of a front-of-car five-button bar or accessibility traversal.
   final Button originalActionButton, recheckActionButton;
   final TextView statusText;
   private final ImageView wallpaper;
   private final FrameLayout controls, statusDock;
-  private final LinearLayout statusContent, wordmark;
+  private final LinearLayout statusContent, wordmark, resourceActions;
   private final TextView wallpaperWarning;
   private final Handler main = new Handler(Looper.getMainLooper());
   private ExecutorService loader;
@@ -71,11 +76,30 @@ final class LauncherWallpaperView extends FrameLayout {
 
     selectButton = button(context, "选择资源", false);
     selectButton.setContentDescription("选择资源，打开原版转换、运行资源导入或重新检查菜单");
+    registrationButton = button(context, "联网设备登记", false);
     launchButton = button(context, "启动游戏", true);
     launchButton.setContentDescription("启动游戏，资源完整校验通过后可用");
     launchButton.setEnabled(false);
-    controls.addView(selectButton, corner(Gravity.TOP | Gravity.LEFT));
-    controls.addView(launchButton, corner(Gravity.TOP | Gravity.RIGHT));
+    noticeButton = button(context, "说明", false);
+    resourceActions = new LinearLayout(context);
+    resourceActions.setOrientation(LinearLayout.VERTICAL);
+    resourceActions.addView(selectButton, new LinearLayout.LayoutParams(-1, dp(52)));
+    LinearLayout.LayoutParams registration = new LinearLayout.LayoutParams(-1, dp(48));
+    registration.topMargin = dp(8);
+    resourceActions.addView(registrationButton, registration);
+    FrameLayout.LayoutParams left = corner(Gravity.TOP | Gravity.LEFT);
+    left.height = FrameLayout.LayoutParams.WRAP_CONTENT;
+    controls.addView(resourceActions, left);
+    LinearLayout launchActions = new LinearLayout(context);
+    launchActions.setOrientation(LinearLayout.HORIZONTAL);
+    launchActions.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+    LinearLayout.LayoutParams notice = new LinearLayout.LayoutParams(dp(NOTICE_WIDTH_DP), -1);
+    notice.rightMargin = dp(ACTION_GAP_DP);
+    launchActions.addView(noticeButton, notice);
+    launchActions.addView(launchButton, new LinearLayout.LayoutParams(dp(ACTION_WIDTH_DP), -1));
+    FrameLayout.LayoutParams right = corner(Gravity.TOP | Gravity.RIGHT);
+    right.width = FrameLayout.LayoutParams.WRAP_CONTENT;
+    controls.addView(launchActions, right);
 
     wordmark = new LinearLayout(context);
     wordmark.setOrientation(LinearLayout.VERTICAL);
@@ -267,8 +291,18 @@ final class LauncherWallpaperView extends FrameLayout {
   private void layoutOverlays(int width, int height) {
     if (width <= 0 || height <= 0) return;
     int availableWidth = width - safeLeft - safeRight;
+    int fixedWidth = dp(2 * CORNER_MARGIN_DP + NOTICE_WIDTH_DP + 2 * ACTION_GAP_DP);
+    int actionWidth = Math.min(dp(ACTION_WIDTH_DP), Math.max(dp(72), (availableWidth - fixedWidth) / 2));
+    resourceActions.getLayoutParams().width = actionWidth;
+    launchButton.getLayoutParams().width = actionWidth;
+    int occupiedRight = actionWidth + dp(CORNER_MARGIN_DP + NOTICE_WIDTH_DP + 2 * ACTION_GAP_DP);
+    int unspecified = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+    wordmark.measure(unspecified, unspecified);
     FrameLayout.LayoutParams brand = (FrameLayout.LayoutParams) wordmark.getLayoutParams();
-    brand.topMargin = availableWidth < dp(620) ? dp(88) : dp(25);
+    int brandWidth = wordmark.getMeasuredWidth();
+    int occupiedLeft = actionWidth + dp(CORNER_MARGIN_DP + ACTION_GAP_DP);
+    brand.topMargin = availableWidth >= 2 * occupiedRight + brandWidth ? dp(25)
+        : availableWidth >= 2 * occupiedLeft + brandWidth ? dp(88) : dp(140);
     wordmark.setLayoutParams(brand);
     FrameLayout.LayoutParams dock = (FrameLayout.LayoutParams) statusDock.getLayoutParams();
     int desired = dp(wallpaperWarning.getVisibility() == View.VISIBLE ? 102 : 76);
@@ -303,8 +337,8 @@ final class LauncherWallpaperView extends FrameLayout {
   }
 
   private FrameLayout.LayoutParams corner(int gravity) {
-    FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(dp(136), dp(52), gravity);
-    p.setMargins(dp(24), dp(22), dp(24), 0); return p;
+    FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(dp(ACTION_WIDTH_DP), dp(52), gravity);
+    p.setMargins(dp(CORNER_MARGIN_DP), dp(22), dp(CORNER_MARGIN_DP), 0); return p;
   }
 
   private Button button(Context context, String label, boolean accent) {

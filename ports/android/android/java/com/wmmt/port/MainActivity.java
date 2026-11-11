@@ -1,14 +1,12 @@
 package com.wmmt.port;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.widget.Button;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.hardware.display.DisplayManager;
 import android.view.Display;
 import android.hardware.Sensor;
@@ -18,6 +16,9 @@ import android.hardware.SensorManager;
 import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.URLSpan;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -50,7 +51,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   static native boolean nativeStart(MainActivity a, String dataDir, String saveDir, String sidecarDir,
       String cutin, String cardPages, String backfireWpk, String backfireBfx, String ghostUi, String builtinGhosts,
-      String frontHaloWpk, String frontHaloAnchors, String taStoreDir, String ghostCrownDir);
+      String frontHaloWpk, String frontHaloAnchors, String mileageAura, String mileageMenu, String ghostMatch, String ghostWheel, String finishMenu,
+      String crownScenes, String taStoreDir, String ghostCrownDir);
   static native void nativeSurface(Surface s, int w, int h);
   static native void nativeTouch(int id, int phase, float x, float y);
   static native void nativePause(boolean p);
@@ -77,7 +79,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   private long movieToken; /* UI thread: identity of the attached view (or pending failure). */
   private volatile long movieRequest; /* newest native request, published before posting. */
   private MediaPlayer bgm; /* fallback for an unavailable PCM path */
-  private ArcadeBgm arcadeBgm, pendingArcadeBgm;
+  private ArcadeBgm arcadeBgm, pendingArcadeBgm, fadingArcadeBgm;
+  private String requestedBgm;
   private float bgmVolume = 1.0f; /* legacy Android player default */
   private String dataDir;
   private File cardResources;
@@ -98,12 +101,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   private static DataCoordinator.ProcessLock processInstallLock;
   private static String nativeDataDir;
   private static File nativeCardResources;
+  private static File nativeTenBgmFile;
   private static String[] nativeOptionalFiles;
   private static boolean resourceClearing; // Main thread, shared across Activity recreation.
   private static final int REQUEST_RESOURCE_IMPORT = 134;
   private static final int REQUEST_CONVERSION_NOTIFICATIONS = 135;
   private FrameLayout dataPanel;
   private LauncherWallpaperView launcherWallpaper;
+  private boolean launcherNoticePending = true;
+  private LauncherDialog launcherNotice;
   private Button beginButton, importButton, checkButton, cancelButton, clearButton;
   private volatile boolean resourceBusy, resourceCancelled;
   private volatile android.os.CancellationSignal resourceOpenSignal;
@@ -161,13 +167,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
       if (!java.nio.file.Files.isRegularFile(dataDirectory.resolve("sound/rx7_rev1.wav"), java.nio.file.LinkOption.NOFOLLOW_LINKS))
         messages.add("所选资源缺少 RX-7／RX-8 原版高转蜂鸣音效。可通过“原版 ZIP / 目录一键转换”补齐。");
       warnings=java.util.Collections.unmodifiableList(messages);
-    }
-    ResolvedResources(OriginalJobStore.Ready ready) {
-      dataDirectory=ready.dataDirectory; cardDirectory=null;
-      java.util.List<String> messages=new java.util.ArrayList<String>(ready.warnings);
-      messages.add("已使用原版本地转换资源；额外卡片/附加演出不从未校验文件回退。");
-      warnings=java.util.Collections.unmodifiableList(messages);
-      optionalFiles=java.util.Collections.emptyMap();
     }
     ResolvedResources(ResolvedResources base, ResourceStore.VerifiedOptional uiCapability,
         ResourceStore.VerifiedOptional datasetCapability) {
@@ -242,6 +241,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     cancelButton = launcherWallpaper.cancelButton;
     clearButton = launcherWallpaper.clearButton;
     beginButton.setOnClickListener(v -> startGame());
+    launcherWallpaper.noticeButton.setOnClickListener(v -> showLauncherNotice());
+    launcherWallpaper.registrationButton.setOnClickListener(v -> showGhostCloudSettings());
     importButton.setOnClickListener(v -> showResourceSelection());
     originalButton.setOnClickListener(v -> requestOriginalConversion());
     checkButton.setOnClickListener(v -> requestResourceRecheck());
@@ -322,15 +323,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
       File selectedCard = first ? cardResources : nativeCardResources;
       String[] optional = first ? new String[]{resourcePath("story-cutin.bin"), resourcePath("card-pages.bin"),
           resourcePath("backfire.wpk"), resourcePath("backfire.bfx"), resourcePath("ghost-ui.bin"), resourcePath("builtin-ghosts.bin"),
-          resourcePath("front_halo.wpk"), resourcePath("front_halo.bin")} : nativeOptionalFiles;
-      if (optional == null) optional = new String[8];
+          resourcePath("front_halo.wpk"), resourcePath("front_halo.bin"),
+          resourcePath(ResourceMetadata.MILEAGE_AURA_PATH), resourcePath(ResourceMetadata.MILEAGE_MENU_PATH),
+          resourcePath(ResourceMetadata.GHOST_MATCH_PATH), resourcePath(ResourceMetadata.GHOST_WHEEL_PATH),
+          resourcePath(ResourceMetadata.FINISH_MENU_PATH), resourcePath(ResourceMetadata.CROWN_SCENES_PATH)} : nativeOptionalFiles;
+      if (optional == null) optional = new String[14];
       if (!nativeStart(this, selectedData, saveDir, selectedCard == null ? null : selectedCard.getAbsolutePath(),
-          optional[0], optional[1], optional[2], optional[3], optional[4], optional[5], optional[6], optional[7],
+          optional[0], optional[1], optional[2], optional[3], optional[4], optional[5], optional[6], optional[7], optional[8], optional[9], optional[10], optional[11], optional[12], optional[13],
           privateRecordDirectory("ta-ranking-v1"), privateRecordDirectory("ghost-crown-v1"))) {
         installError("运行线程暂未能启动。资源已保留，可重新点击开始游戏。");
         return;
       }
       if (first) { nativeDataDir = selectedData; nativeCardResources = selectedCard; nativeOptionalFiles = optional; }
+      if (first) {
+        String bank = resourcePath(ResourceMetadata.TEN_BGM_PATH);
+        nativeTenBgmFile = bank == null ? null : new File(bank);
+      }
       dataDir = nativeDataDir; cardResources = nativeCardResources;
       started = true;
     }
@@ -389,17 +397,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         (originalController==null || !originalController.isBusy());
   }
 
+  private void showLauncherNotice() {
+    if (!launcherVisible()) return;
+    launcherNoticePending = false;
+    if (launcherNotice != null) return;
+
+    String domain = "niceapi.net";
+    String sponsorship = "点此跳转赞助网页";
+    SpannableString message = new SpannableString(
+        "想要云端同步计时赛和化身数据？请访问" + domain + "\n\n"
+        + "如果你是在闲鱼或者类似的平台通过付款的方式获得了本项目的资源，请立刻向对应的店铺进行退款并差评，该项目为免费项目。\n\n"
+        + "如果你想支持项目开发，可以考虑给开发者捐赠。捐赠的金额将用于维护服务器，以及充值Token，用于修复Bug。\n"
+        + sponsorship);
+    int linkStart = message.toString().indexOf(domain);
+    message.setSpan(new URLSpan("https://" + domain), linkStart, linkStart + domain.length(),
+        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    message.setSpan(new URLSpan("https://afdian.com/a/ProjectCinder"),
+        message.length() - sponsorship.length(), message.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+    launcherNotice = new LauncherDialog(this, "倒狗必死")
+        .boldTitle().message(message).primary("我已阅读", null);
+    launcherNotice.setCanceledOnTouchOutside(false);
+    launcherNotice.setCancelable(false);
+    launcherNotice.setOnDismissListener(dialog -> launcherNotice = null);
+    launcherNotice.show();
+  }
+
+  private boolean launcherVisible() {
+    return !started && !destroyed && !isFinishing() && currentActivity == this
+        && dataPanel != null && dataPanel.getParent() == root;
+  }
+
   private void showResourceSelection() {
     if (!resourceSelectionAllowed()) return;
-    new AlertDialog.Builder(this).setTitle("选择资源")
-        .setItems(new String[]{"原版 ZIP / 目录一键转换", "导入已转换的资源 ZIP", "重新检查资源", "联网设备登记"}, (dialog, which) -> {
+    new LauncherDialog(this, "选择资源")
+        .choices(new String[]{"原版 ZIP / 目录一键转换", "导入已转换的资源 ZIP", "重新检查资源", "继续上次转换"}, which -> {
           // A dialog may stay open while restored work changes state. Recheck at action time.
           if (!resourceSelectionAllowed()) return;
           if (which==0) requestOriginalConversion();
           else if (which==1) chooseResourceArchive();
           else if (which==2) requestResourceRecheck();
-          else if (which==3) showGhostCloudSettings();
-        }).setNegativeButton("取消", null).show();
+          else if (which==3 && originalController!=null) originalController.resumeLast();
+        }).action("取消", null).show();
   }
 
   private void loadGhostCloud() {
@@ -414,30 +453,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   }
 
   private void showGhostCloudSettings() {
+    if (!launcherVisible()) return;
     CloudDevice identity = cloudDevice;
+    LauncherDialog dialog = new LauncherDialog(this, "联网设备登记");
     if (identity == null) {
-      new AlertDialog.Builder(this).setTitle("联网设备登记")
-          .setMessage("暂时无法读取此安装的设备 ID。").setPositiveButton("关闭", null).show();
+      dialog.message("暂时无法读取此安装的设备 ID。").primary("关闭", null).show();
       return;
     }
     GhostCloud cloud = ghostCloud;
+    dialog.message(deviceRegistrationMessage(identity, cloud));
+    dialog.action("关闭", null);
+    if (cloud != null) {
+      Button check = dialog.addAction("检查登记", false);
+      check.setOnClickListener(v -> {
+        check.setEnabled(false);
+        dialog.message("设备 ID\n" + identity.id + "\n\n正在检查登记状态…");
+        cloud.refreshRegistration(() -> runOnUiThread(() -> {
+          if (!dialog.isShowing() || !launcherVisible()) return;
+          dialog.message(deviceRegistrationMessage(identity, cloud));
+          check.setEnabled(true);
+        }));
+      });
+    }
+    dialog.primary("复制设备 ID", () -> {
+      android.content.ClipboardManager clipboard =
+          (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+      if (clipboard != null) clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Cinder 设备 ID", identity.id));
+    }).show();
+  }
+
+  private static String deviceRegistrationMessage(CloudDevice identity, GhostCloud cloud) {
     int status = cloud == null ? 0 : cloud.registrationStatus();
     String note = cloud == null ? "登记服务尚未配置。" :
         status == 1 ? "此设备已放行。" : status == -1 ? "此设备尚未获准联网。" : "尚未验证登记状态。";
-    AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("联网设备登记")
-        .setMessage("设备 ID\n" + identity.id + "\n\n" + note +
-            "\n将 ID 提交到登记网站，获准后即可同步联网化身和计时榜。")
-        .setNegativeButton("关闭", null)
-        .setPositiveButton("复制设备 ID", (d, which) -> {
-          android.content.ClipboardManager clipboard =
-              (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-          if (clipboard != null) clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Cinder 设备 ID", identity.id));
-        });
-    if (cloud != null) dialog.setNeutralButton("检查登记", (d, which) ->
-        cloud.refreshRegistration(() -> runOnUiThread(() -> {
-          if (resourceSelectionAllowed()) showGhostCloudSettings();
-        })));
-    dialog.show();
+    return "设备 ID\n" + identity.id + "\n\n" + note
+        + "\n将 ID 提交到登记网站，获准后即可同步联网化身和计时榜。";
   }
 
   String onlineVsAddress() {
@@ -475,6 +525,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     return cloud != null && cloud.approved() ? cloud : null;
   }
 
+  boolean ghostCrownRefresh(String physics, String cardId) {
+    GhostCloud cloud = approvedGhostCloud();
+    return cloud != null && cloud.crownRefresh(physics, cardId);
+  }
+  byte[] ghostCrownPoll() {
+    GhostCloud cloud = approvedGhostCloud();
+    return cloud == null ? null : cloud.crownPoll();
+  }
+  int ghostCrownPollAck() {
+    GhostCloud cloud = approvedGhostCloud();
+    return cloud == null ? 0 : cloud.crownPollAck();
+  }
+  boolean ghostCrownEnqueue(int area, byte[] previous, byte[] record, String cardId) {
+    GhostCloud cloud = ghostCloud;
+    return cloud != null && cloud.crownEnqueue(area, previous, record, cardId);
+  }
   boolean ghostCloudConfigured() { return approvedGhostCloud() != null; }
   boolean ghostCloudRefresh(String physics) {
     GhostCloud cloud = approvedGhostCloud();
@@ -508,13 +574,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     GhostCloud cloud = approvedGhostCloud();
     return cloud != null ? cloud.defensePoll() : null;
   }
-  boolean timingCloudSubmit(byte[] record) {
+  boolean timingCloudSubmit(byte[] record, boolean wantResult) {
     GhostCloud cloud = approvedGhostCloud();
-    return cloud != null && cloud.timingSubmit(record);
+    return cloud != null && cloud.timingSubmit(record, wantResult);
   }
-  int timingCloudPollAck() {
+  byte[] timingCloudPollAck() {
     GhostCloud cloud = approvedGhostCloud();
-    return cloud != null ? cloud.timingPollAck() : -1;
+    return cloud != null ? cloud.timingPollAck() : null;
   }
   boolean timingCloudRefresh(String rules, String physics, int course, int traffic) {
     GhostCloud cloud = approvedGhostCloud();
@@ -556,10 +622,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   private void confirmResourceClear() {
     if (!resourceSelectionAllowed()) return;
-    new AlertDialog.Builder(this).setTitle("清除资源包")
-        .setMessage("清除应用内游戏资源目录及导入、转换暂存。车库存档、计时成绩和化身记录会保留。之后需要重新导入资源才能开始游戏。")
-        .setNegativeButton("取消", null)
-        .setPositiveButton("清除资源包", (dialog, which) -> clearResources())
+    new LauncherDialog(this, "清除资源包")
+        .message("清除应用内游戏资源目录及导入、转换暂存。车库存档、计时成绩和化身记录会保留。之后需要重新导入资源才能开始游戏。")
+        .action("取消", null)
+        .primary("清除资源包", this::clearResources)
         .show();
   }
 
@@ -599,10 +665,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   private void chooseResourceArchive() {
     if (!resourceSelectionAllowed()) return;
-    new AlertDialog.Builder(this).setTitle("本地导入 / 安全修复")
-        .setMessage("请选择已转换的游戏资源 ZIP。原版街机 ZIP 或目录请使用“原版 ZIP / 目录一键转换”。存档会保留。")
-        .setNegativeButton("取消", null)
-        .setPositiveButton("选择文件", (dialog, which) -> {
+    new LauncherDialog(this, "本地导入 / 安全修复")
+        .message("请选择已转换的完整资源 ZIP 或附加资源 ZIP。附加包可用于两种模式，导入时保留现有主资源和存档。")
+        .action("取消", null)
+        .primary("选择文件", () -> {
           if (!resourceSelectionAllowed()) return;
           awaitingResourcePicker = true;
           resourceControls();
@@ -732,35 +798,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
           OriginalJobStore originalStore = new OriginalJobStore(ext.toPath(), privateRoot.getCanonicalFile().toPath(), originalProfile(getApplicationContext()));
           if (source == null) {
             OriginalJobStore.Ready original = originalStore.resolve(() -> cancel.cancelled(), (stage,current,total) -> report.update(stage,current,total));
-            baseReady = original == null ? new ResolvedResources(store.resolve(cancel, report)) : new ResolvedResources(original);
+            baseReady = new ResolvedResources(original == null ? store.resolve(cancel, report) :
+                store.resolveOriginal(original, cancel, report));
           } else {
             android.os.CancellationSignal signal = new android.os.CancellationSignal();
             resourceOpenSignal = signal;
             InputStream opened = null;
             ResourceStore.Ready imported = null;
+            boolean committed = false;
             try {
               if (cancel.cancelled()) signal.cancel();
               android.os.ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(source, "r", signal);
               if (descriptor == null) throw new IOException("无法打开所选文件");
               opened = new android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor);
               resourceSource = opened;
-              imported = store.importArchive(opened, cancel, report);
+              imported = store.importArchive(opened, cancel, report, true);
+              committed = true;
             } finally {
               // A provider close error after the atomic selection switch is a warning,
               // never a false claim that the committed import failed or was rolled back.
-              closeResourceInput(opened, imported != null);
+              closeResourceInput(opened, committed);
               if (resourceSource == opened) resourceSource = null;
               if (resourceOpenSignal == signal) resourceOpenSignal = null;
             }
-            if (imported == null) throw new IOException("导入没有返回已校验资源");
-            // Old Store committed its own selector already. If this extra marker
-            // fails, the authenticated legacy-epoch barrier still delegates to it;
-            // never misreport a committed old import as rolled back.
-            if (java.nio.file.Files.exists(privateRoot.toPath().resolve("resource-choice-v2/selection"), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-              try { originalStore.markPreparedSelection(); }
-              catch (IOException markerError) { resourceNotice = "已校验并登记所选资源；附加选择标记未同步，重新检查将按旧资源选择记录核验。"; }
+            if (imported == null) {
+              resourceNotice = "已登记附加资源，现有主资源选择与存档已保留。";
+              OriginalJobStore.Ready original = originalStore.resolve(() -> cancel.cancelled(),
+                  (stage,current,total) -> report.update(stage,current,total));
+              baseReady = new ResolvedResources(original == null ? store.resolve(cancel, report) :
+                  store.resolveOriginal(original, cancel, report));
+            } else {
+              // Old Store committed its own selector. The legacy-epoch barrier
+              // also delegates to it if the secondary marker cannot be written.
+              if (java.nio.file.Files.exists(privateRoot.toPath().resolve("resource-choice-v2/selection"), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                try { originalStore.markPreparedSelection(); }
+                catch (IOException markerError) { resourceNotice = "已校验并登记所选资源；附加选择标记未同步，重新检查将按旧资源选择记录核验。"; }
+              }
+              baseReady = new ResolvedResources(imported);
             }
-            baseReady = new ResolvedResources(imported);
           }
           ResourceStore.VerifiedOptional uiCapability = store.preparePackagedGhost(() -> getAssets().open("ghost-ui.bin"), cancel, report);
           ResourceStore.VerifiedOptional datasetCapability = store.preparePackagedBuiltinGhosts(() -> getAssets().open("builtin-ghosts.bin"), cancel, report);
@@ -1161,10 +1236,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     finishMovie(movie, movieToken, true, false);
   }
 
+  @Override protected void onStop() {
+    super.onStop();
+    if (!started && launcherNotice == null && !awaitingResourcePicker
+        && (originalController == null || !originalController.isPickingSource())) {
+      launcherNoticePending = true;
+    }
+  }
+
+  @Override protected void onNewIntent(Intent intent) {
+    super.onNewIntent(intent);
+    if (Intent.ACTION_MAIN.equals(intent.getAction()) && intent.hasCategory(Intent.CATEGORY_LAUNCHER)) {
+      launcherNoticePending = true;
+      if (resumed) showLauncherNotice();
+    }
+  }
+
   @Override protected void onResume() {
     super.onResume();
     hideBars();
     resumed = true;
+    if (launcherNoticePending) showLauncherNotice();
     if (displays != null) displays.registerDisplayListener(this, null);
     refreshSurfaceRate();
     if (started && currentActivity == this) nativePause(false);
@@ -1177,6 +1269,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     cancelResourceOperation();
     finishMovie(movie, movieToken, true, false);
     destroyed = true;
+    if (launcherNotice != null) launcherNotice.dismiss();
     if (currentActivity == this) currentActivity = null;
     ++bgmGeneration;
     if (bgmExecutor != null) { bgmExecutor.shutdownNow(); bgmExecutor = null; }
@@ -1306,6 +1399,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     if (destroyed || currentActivity != this) return;
     boolean play = resumed && !bgmGameplayPaused;
     if (arcadeBgm != null) arcadeBgm.playback(play, bgmVolume);
+    if (fadingArcadeBgm != null) fadingArcadeBgm.playback(play, bgmVolume);
     if (bgm == null || bgmPreparing) return;
     if (play) {
       if (!bgm.isPlaying()) bgm.start();
@@ -1318,8 +1412,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     runOnUiThread(() -> {
       if (destroyed || isFinishing()) return;
       bgmVolume = volume;
-      if (arcadeBgm != null) arcadeBgm.playback(resumed && !bgmGameplayPaused, volume);
       if (bgm != null && !bgmPreparing) bgm.setVolume(volume, volume);
+      updateBgmPlayback();
     });
   }
 
@@ -1329,20 +1423,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   private void closeCurrentBgm() {
     if (arcadeBgm != null) { arcadeBgm.close(); arcadeBgm = null; }
+    closeFadingBgm();
     if (bgm != null) { bgm.release(); bgm = null; }
     bgmPreparing = false;
   }
 
+  private void closeFadingBgm() {
+    if (fadingArcadeBgm != null) { fadingArcadeBgm.close(); fadingArcadeBgm = null; }
+  }
+
   void playBgm(final String name) {
+    playRaceBgm(name, null, 0);
+  }
+
+  void playRaceBgm(final String cue, final String fallback, final int fadeMs) {
     runOnUiThread(() -> {
       if (destroyed || currentActivity != this || isFinishing()) return;
+      final boolean ten = ArcadeBgm.isTenCue(cue);
+      final File bank = nativeTenBgmFile;
+      final boolean available = ten && bank != null && bank.isFile();
+      final String name = ten && !available ? fallback : cue;
+      if (ten && !available && name != null && name.equals(requestedBgm) &&
+          (arcadeBgm != null || pendingArcadeBgm != null || bgm != null)) return;
+      requestedBgm = name;
       final long generation = ++bgmGeneration;
       closePendingBgm();
       if (name == null || arcadeBgm == null) closeCurrentBgm();
       if (name == null) return;
+      if (available) {
+        prepareBgm(bank, name, 0, generation, fadeMs, fallback);
+        return;
+      }
       final int group = name.matches("wm2_[0-9][0-9]") ? 1 : name.matches("wmr_[0-9][0-9]") ? 2 : 0;
       if (group != 0) {
-        if (started) queueExtraBgm(name, group, generation);
+        if (started) queueExtraBgm(name, group, generation, fadeMs);
         return;
       }
       File file = new File(dataDir, "sound/bgm/" + name + ".m4a");
@@ -1351,22 +1465,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         android.util.Log.w("WMMT", "BGM unavailable: " + name);
         return;
       }
-      prepareBgm(file, name, 0, generation);
+      prepareBgm(file, name, 0, generation, fadeMs, null);
     });
   }
 
-  private void prepareBgm(File file, String name, int group, long generation) {
-    if (!ArcadeBgm.supports(name)) {
+  private void prepareBgm(File file, String name, int group, long generation, int fadeMs, String fallback) {
+    boolean ten = ArcadeBgm.isTenCue(name);
+    if (!ten && !ArcadeBgm.supports(name)) {
       closeCurrentBgm();
       prepareLegacyBgm(file, name, group, generation);
       return;
     }
-    pendingArcadeBgm = new ArcadeBgm(file, getCacheDir(), new ArcadeBgm.Listener() {
+    pendingArcadeBgm = new ArcadeBgm(file, getCacheDir(), ten ? name : null, new ArcadeBgm.Listener() {
       @Override public void ready(ArcadeBgm player) {
         runOnUiThread(() -> {
           if (pendingArcadeBgm != player || !currentBgmRequest(generation)) return;
           pendingArcadeBgm = null;
-          closeCurrentBgm();
+          if (fadeMs > 0 && arcadeBgm != null) {
+            closeFadingBgm();
+            fadingArcadeBgm = arcadeBgm;
+            fadingArcadeBgm.fade(false, fadeMs);
+            player.fade(true, fadeMs);
+          } else closeCurrentBgm();
           arcadeBgm = player;
           updateBgmPlayback();
         });
@@ -1380,7 +1500,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
           if (!currentBgmRequest(generation)) return;
           android.util.Log.w("WMMT", "PCM BGM playback failed: " + name, error);
           closeCurrentBgm();
-          prepareLegacyBgm(file, name, group, generation);
+          if (ten) playBgm(fallback);
+          else prepareLegacyBgm(file, name, group, generation);
         });
       }
     });
@@ -1393,7 +1514,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     return started && !destroyed && currentActivity == this && !isFinishing() && generation == bgmGeneration;
   }
 
-  private void queueExtraBgm(final String name, final int group, final long generation) {
+  private void queueExtraBgm(final String name, final int group, final long generation, final int fadeMs) {
     final File resources = cardResources;
     try {
       if (bgmExecutor == null) bgmExecutor = Executors.newSingleThreadExecutor();
@@ -1412,7 +1533,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
             nativeBgmFailure(this, group);
             return;
           }
-          prepareBgm(file, name, group, generation);
+          prepareBgm(file, name, group, generation, fadeMs, null);
         });
       });
     } catch (RuntimeException ex) {
@@ -1471,7 +1592,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   }
 
   void fail(final String msg) {
-    runOnUiThread(() -> new android.app.AlertDialog.Builder(this).setTitle("WMMT3DX").setMessage(msg)
-        .setPositiveButton("OK", null).show());
+    runOnUiThread(() -> {
+      if (destroyed || isFinishing() || currentActivity != this) return;
+      new LauncherDialog(this, "WMMT3DX").message(msg).primary("关闭", null).show();
+    });
   }
 }

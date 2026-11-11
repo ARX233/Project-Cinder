@@ -8,8 +8,8 @@ HERE = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("story_defaults_extract", HERE / "tools/story_defaults_extract.py")
 x = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(x)
-ELF = Path(os.environ['WMMT_TEST_ELF']) if os.environ.get('WMMT_TEST_ELF') else None
-CSV = Path(os.environ['WMMT_TEST_CSV']) if os.environ.get('WMMT_TEST_CSV') else None
+ELF = Path("/Volumes/MacSave/WMMT3 Phone/Fulldata/Wangan Midnight 3DX+[banwu]/Wangan Midnight 3DX+/main")
+CSV = Path("/Volumes/CodexWork/wmmt3dx-story-defaults-2e659115.csv")
 
 class IndexTests(unittest.TestCase):
  def test_first_and_later_loop(self):
@@ -31,7 +31,7 @@ class IndexTests(unittest.TestCase):
   self.assertEqual([len(g) for g in groups],[22,25,14])
   with self.assertRaises(x.Invalid): x.parse_menu(text.replace('"wm2_02"','"wm2_01"',1))
 
-@unittest.skipUnless(ELF is not None and ELF.is_file(), "set WMMT_TEST_ELF to an available original ELF")
+@unittest.skipUnless(ELF.is_file(), "original ELF not available")
 class OriginalTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
@@ -45,7 +45,7 @@ class OriginalTests(unittest.TestCase):
   for day,lines,ids,fallback in self.rows:
    self.assertIn(day,(0,1));self.assertEqual(len(lines),3)
    for g,line in enumerate(lines): self.assertTrue(0<line<len(self.groups[g])-1)
-  if CSV is not None: x.check_csv(self.rows,CSV)
+  if CSV.is_file(): x.check_csv(self.rows,CSV)
  def test_fallback_episodes_one_and_eight(self):
   for index in (0,7):
    for g in range(3):

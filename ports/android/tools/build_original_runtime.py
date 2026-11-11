@@ -28,7 +28,10 @@ import zlib
 SCHEMA='wmmt-original-runtime-package-v1'
 PINS={
  'aar':'0ef6423721b8a5fb32709316b33554b1fe0b66b4ae817af9c28e89699f2f91c0',
- 'ao':'b730592c4e68407c281bc02c1863d3a4b12406dfa3af144b0c5c92d8e058b7a9',
+ # The new image changes scheduling only. Existing installation profiles
+ # still bind the original numerical recipe and retain their identity.
+ 'ao':'b4cb0a9cc57ebb0dd3a8864af3f4f3a2b6adc3b066dd298609ff3b814c207e2c',
+ 'ao_recipe':'b730592c4e68407c281bc02c1863d3a4b12406dfa3af144b0c5c92d8e058b7a9',
  'media':'2e88baa7d461622f43a66b181a141d5c8f7f8bdb131e60940575e642f27888aa',
  'profile':'dd5ba7761175b83652ff304f40fdc20fbb93d26d2aa5cb883e914ae9ff825f20'}
 MAIN_SHA='2e6591153d7e599437465f736a42e27b01a3b56c881bee58365fb21d0678b1f6'
@@ -46,13 +49,13 @@ MAX_APP_BYTES=32*1024*1024
 HASH=re.compile(r'[0-9a-f]{64}\Z')
 SHA1=re.compile(r'[0-9a-f]{40}\Z')
 CONVERTER_MODULES=(
- '__init__','engine','source','archive','validation','physics_image','car_tables',
+ '__init__','engine','source','archive','checkpoint','work_queue','validation','physics_image','car_tables',
  'chara_colors','cars','wheels','maps','extras','ao','media','media_validate',
  'runtime_check','menu_support','menu_car_data','menu_components',
- 'menu_scene_sprites','menu_recipe','full_menu','release_assets','player_paints','player_paint_lua','smoke')
+ 'menu_scene_sprites','menu_recipe','full_menu','release_assets','player_paints','player_paint_lua','smoke','mileage_aura','mileage_menu','ghost_match','finish_menu','ten_bgm','crown_scenes')
 NATIVE_MODULES=('media_ctypes','media_overlay_ctypes')
 STAGE_MODULES=('igb','tex','scene','pack','lualite','pack_cars','pack_vinyl',
-               'pack_lights','pack_neon','pack_mini','pack_tire_track','story_part_groups')
+               'pack_lights','pack_neon','pack_mini','pack_tire_track','story_part_groups','pack_mileage_aura')
 SOURCE_PATHS=tuple(sorted(
  ['tools/original_convert/'+n+'.py' for n in CONVERTER_MODULES]+
  ['tools/original_convert/native_backend/'+n+'.py' for n in NATIVE_MODULES]+
@@ -174,6 +177,17 @@ def parse_profile(data):
  _need(src.get('main',{}).get('sha256')==MAIN_SHA,'profile main pin')
  return header,src,out
 
+def _ao_code_pins(source):
+ tree=ast.parse(source,filename='original_convert/ao.py')
+ keys={'SERIAL_AO_SHA256','PARALLEL_AO_SHA256'};values={}
+ for node in tree.body:
+  if isinstance(node,ast.Assign) and len(node.targets)==1 and isinstance(node.targets[0],ast.Name) and node.targets[0].id in keys:
+   name=node.targets[0].id;_need(name not in values,'duplicate AO implementation pin')
+   try:values[name]=ast.literal_eval(node.value)
+   except (ValueError,TypeError,RecursionError) as e:raise PackagingError('nonliteral AO implementation pin') from e
+ _need(values=={'SERIAL_AO_SHA256':PINS['ao_recipe'],'PARALLEL_AO_SHA256':PINS['ao']},'AO code/implementation pin mismatch')
+
+
 def _metadata_release(source,profile):
  tree=ast.parse(source,filename='original_convert/release_assets.py');values={}
  for node in tree.body:
@@ -196,7 +210,7 @@ def _metadata_release(source,profile):
  _need(isinstance(readset['files'],list) and len(readset['files'])==EXPECTED_SOURCE_COUNT,'release source inventory incomplete')
  _need(readset['files']==[{'path':n,**v} for n,v in src.items()],'release source rows vs profile mismatch')
  _need(isinstance(recipe,dict) and set(recipe)=={'schema','profile_id','runtime','native','raw','wheels','cars','extras','media','outputs','route_arrow_order','player_paints','player_paints_plan_sha256','smoke','smoke_plan_sha256'} and recipe['schema']=='wmmt-original-race-recipe-v1' and recipe['profile_id']==header['profileId'],'release recipe incomplete')
- _need(recipe['native']=={'liboa_native.so':PINS['ao'],'liboc_media_overlay.so':PINS['media']},'release native pins mismatch')
+ _need(recipe['native']=={'liboa_native.so':PINS['ao_recipe'],'liboc_media_overlay.so':PINS['media']},'release native pins mismatch')
  _need(recipe['runtime']==EXPECTED_RUNTIME,'release runtime version mismatch')
  _need(isinstance(recipe['outputs'],list) and len(recipe['outputs'])==EXPECTED_OUTPUT_COUNT,'release outputs incomplete')
  observed={}
@@ -361,6 +375,7 @@ def build_runtime(*,aar,ao_lib,media_lib,profile,repo,out):
  inputs={'aar':_pinned(aar,'aar'),'ao':_pinned(ao_lib,'ao'),'media':_pinned(media_lib,'media'),'profile':_pinned(profile,'profile')}
  profile_info=parse_profile(inputs['profile']);sources,source_inventory,closure=source_plan(Path(repo))
  release=_metadata_release(sources['original_convert/release_assets.py'],profile_info)
+ _ao_code_pins(sources['original_convert/ao.py'])
  public_licenses,public_license_inventory=license_plan(repo)
  outer=safe_zip(inputs['aar'],'frozen AAR');assets={};jars=[];native=[];license_inventory=[]
  allowed_meta={'R.txt','AndroidManifest.xml','proguard.txt','META-INF/com/android/build/gradle/aar-metadata.properties'}

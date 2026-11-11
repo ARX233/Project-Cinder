@@ -41,7 +41,7 @@ void menu_set_ta_rank_view(menu_state *m,const ta_rank_view *view,int status) {
   unsigned source=status==MENU_TA_RANK_COMMUNITY ? TA_RANK_SOURCE_COMMUNITY_UNVERIFIED : TA_RANK_SOURCE_LOCAL_UNVERIFIED;
   int ok=view && (status==MENU_TA_RANK_LOCAL || status==MENU_TA_RANK_STORE_ERROR || status==MENU_TA_RANK_COMMUNITY) &&
     view->source_kind==source &&
-    view->partition.course_id==(uint32_t)menu_ta_rank_course(m) && view->partition.traffic==(uint32_t)!!m->ta_traffic &&
+    view->partition.course_id==(uint32_t)menu_ta_rank_course(m) && view->partition.traffic==(status==MENU_TA_RANK_COMMUNITY?0u:(uint32_t)!!m->ta_traffic) &&
     view->row_count<=TA_RANK_DISPLAY && view->real_count<=TA_RANK_TOP;
   if(ok && m->ta_rank_valid && m->ta_rank_snapshot.source_kind==source &&
      ta_ui_partition_equal(&m->ta_rank_snapshot.partition,&view->partition) &&
@@ -72,7 +72,7 @@ void menu_set_ta_rank_view(menu_state *m,const ta_rank_view *view,int status) {
 static const ta_rank_row *ta_ui_row(const menu_state *m,int slot) {
   if(!m || !m->ta_rank_valid || slot<0 || slot>=(int)m->ta_rank_snapshot.row_count ||
      m->ta_rank_snapshot.partition.course_id!=(uint32_t)menu_ta_rank_course(m) ||
-     m->ta_rank_snapshot.partition.traffic!=(uint32_t)!!m->ta_traffic)return NULL;
+     m->ta_rank_snapshot.partition.traffic!=(m->ta_rank_status==MENU_TA_RANK_COMMUNITY?0u:(uint32_t)!!m->ta_traffic))return NULL;
   return &m->ta_rank_snapshot.rows[slot];
 }
 /* Insert the best old card time into this local display only. Keep a new

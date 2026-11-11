@@ -214,6 +214,15 @@ class OwnedOutput:
         os.mkdir(self.root, 0o700)
         self.files = {}
 
+    @classmethod
+    def resume(cls, parent, name):
+        if not isinstance(name, str) or not re.fullmatch(r'original-convert-[0-9a-f]{32}', name):
+            raise OriginalInputError('Invalid private checkpoint output directory')
+        output = cls.__new__(cls)
+        output.root = _directory(_directory(parent) / name)
+        output.files = {}
+        return output
+
     def target(self, name):
         # Runtime names are separately constrained here, not original-source names.
         if not isinstance(name, str) or name == 'main' or name.startswith('data/'):
@@ -259,6 +268,19 @@ class VerifiedSnapshot:
         if token is not _SNAPSHOT_TOKEN:
             raise OriginalInputError('A snapshot must be created from verified source reads')
         self.root, self.readset, self.bytes = root, readset, total
+
+    @classmethod
+    def reopen(cls, parent, name, readset, *, cancel=None, progress=None):
+        if not isinstance(name, str) or not re.fullmatch(r'original-source-[0-9a-f]{32}', name):
+            raise OriginalInputError('Invalid private source snapshot name')
+        root = _directory(_directory(parent) / name)
+        with FileTreeSource(root, readset) as source:
+            for index, path in enumerate(readset.files, 1):
+                for _ in source.chunks(path, cancel=cancel):
+                    pass
+                if progress:
+                    progress('reverify-original-input', index, len(readset.files))
+        return cls(root, readset, readset.total_bytes, _SNAPSHOT_TOKEN)
 
     @classmethod
     def create(cls, source, parent, *, cancel=None, progress=None):

@@ -21,7 +21,7 @@ int main(int argc,char **argv) {
   A.tex=calloc(2,sizeof *A.tex); A.offset=calloc(2,sizeof *A.offset); A.zsize=calloc(2,sizeof *A.zsize); A.used=calloc(2,sizeof *A.used); A.size=calloc(2,sizeof *A.size); A.ids=calloc(2,sizeof *A.ids); A.cols=calloc(2,sizeof *A.cols);
   A.ids[0]=17; A.ids[1]=23; A.size[0][0]=13; A.size[1][0]=14;
   A.file=tmpfile(); A.extra_file=tmpfile(); FILE *base=A.file,*story=A.extra_file; fwrite("BASE",1,4,base); fwrite("STOR",1,4,story); fflush(base); fflush(story);
-  load_card_pages(argv[1]);
+  A.card_file=load_sprite_animations(argv[1], "card-pages.bin");
   assert(A.ids[0]==17 && A.ids[1]==23 && A.size[0][0]==13 && A.size[1][0]==14 && A.file==base && A.extra_file==story);
   if (!strcmp(argv[2],"valid")) {
     assert(A.nsprites==3 && A.nanims==1 && A.card_file && A.ids[2]==42);

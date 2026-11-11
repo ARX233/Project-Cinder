@@ -7,6 +7,14 @@ uint8_t *rc_va_slow(uint32_t a) { (void)a; abort(); }
 int main(void) {
   rc_mem = calloc(1, 4096); assert(rc_mem); P.m = RC_MEM_BASE;
   uint32_t se = P.m + 0xb88u; car_se s = {0};
+  car_engine_se engine = {0};
+  WF(se + 0x68, .75f); WF(se + 0x6c, 4567.5f);
+  W8(se + 0x24, 1); W8(se + 0x73, 1);
+  read_engine_se(&engine);
+  assert(engine.gain == .75f && engine.rpm == 4567.5f && engine.accel && engine.shift_up);
+  W8(se + 0x24, 0); W8(se + 0x73, 0); W8(se + 0x72, 1);
+  read_engine_se(&engine);
+  assert(!engine.accel && engine.shift_up && engine.shift_down);
   W8(se + 0xa8, 1); WF(se + 0xac, .5f);
   W8(se + 0xb0, 1); WF(se + 0xb4, .75f); W32(se + 0xb8, 22050);
   W8(se + 0xbc, 1); WF(se + 0xc0, .25f); W32(se + 0xc4, 13000);

@@ -6,6 +6,7 @@ import struct
 import threading
 
 from .ghost_service import ContractError
+from .ta_rec_car import REC_CAR_IDS
 
 
 MAGIC = b"CTA1"
@@ -14,6 +15,7 @@ RULES = "f4e932bed02ddefd261e5fc798870f474d8fc5e39f4d32b3aa9fc0144e34050f"
 PHYSICS = "cd78647227a0a4bb9c56939f2f00b85917530f3bf10ad9c92c6b1d6e780bf0a8"
 _STAGES = (363, 364, 365, 366, 367, 0, 369, 0, 376, 371, 372, 0, 374, 375, 377)
 _COHORT = bytes.fromhex(RULES + PHYSICS)
+BOARD_ORDER = "score ASC, date DESC, attempt ASC, subject ASC, owner ASC"
 
 
 def partition(rules, physics, course, traffic):
@@ -70,13 +72,62 @@ class CommunityTiming:
                     PRIMARY KEY(subject, owner, course, traffic), UNIQUE(subject, attempt));
                 CREATE INDEX IF NOT EXISTS community_rank_v1
                     ON community_pb_v1(course, traffic, score, date DESC, attempt);
+                CREATE TABLE IF NOT EXISTS community_model_best_v1 (
+                    course INTEGER NOT NULL, traffic INTEGER NOT NULL,
+                    model_class INTEGER NOT NULL, score INTEGER NOT NULL,
+                    PRIMARY KEY(course, traffic, model_class));
+                CREATE TABLE IF NOT EXISTS community_crown_v1 (
+                    course INTEGER PRIMARY KEY, subject TEXT NOT NULL, owner BLOB NOT NULL,
+                    acquired_at INTEGER NOT NULL);
+                INSERT OR IGNORE INTO community_crown_v1
+                    SELECT course, subject, owner, date FROM (
+                        SELECT course, subject, owner, date, ROW_NUMBER() OVER (
+                            PARTITION BY course ORDER BY score, date DESC, attempt, subject, owner
+                        ) AS place FROM community_pb_v1 WHERE traffic=0
+                    ) WHERE place=1;
             """)
+            self._db.execute("BEGIN IMMEDIATE")
+            for course, traffic, score, model in self._db.execute("""
+                SELECT course,traffic,score,substr(record,221,4) FROM community_pb_v1
+            """).fetchall():
+                model_id, = struct.unpack("<I", model)
+                if model_id < len(REC_CAR_IDS):
+                    self._save_model_best(course, traffic, REC_CAR_IDS[model_id], score)
+            self._db.execute("COMMIT")
         except BaseException:
             self._db.close()
             raise
 
-    def submit(self, subject, body):
+    def _save_model_best(self, course, traffic, model_class, score):
+        return self._db.execute("""
+            INSERT INTO community_model_best_v1 VALUES (?,?,?,?)
+            ON CONFLICT(course,traffic,model_class) DO UPDATE SET score=excluded.score
+            WHERE excluded.score < community_model_best_v1.score
+        """, (course, traffic, model_class, score)).rowcount != 0
+
+    def _result(self, course, traffic, subject, owner, attempt, current, old_course, new_model, model_class):
+        board = self._db.execute(f"""
+            SELECT subject,owner,attempt,score FROM community_pb_v1
+            WHERE course=? AND traffic=? ORDER BY {BOARD_ORDER} LIMIT 100
+        """, (course, traffic)).fetchall()
+        personal, = self._db.execute("""
+            SELECT score FROM community_pb_v1 WHERE subject=? AND owner=? AND course=? AND traffic=?
+        """, (subject, owner, course, traffic)).fetchone()
+        car_best, = self._db.execute("""
+            SELECT score FROM community_model_best_v1 WHERE course=? AND traffic=? AND model_class=?
+        """, (course, traffic, model_class)).fetchone()
+        position = next((i for i, row in enumerate(board, 1) if row[:3] == (subject, owner, attempt)), 0)
+        course_best = board[0][3]
+        flags = ((old_course is None or course_best < old_course)
+                 | (new_model << 1) | ((current is None or personal < current[0]) << 2))
+        return {"course_best_ms": course_best, "car_best_ms": car_best,
+                "personal_best_ms": personal, "rank": position, "new_records": flags}
+
+    def submit(self, subject, body, *, include_result=False):
         course, traffic, owner, attempt, date, score = decode(body)
+        model_id, = struct.unpack_from("<I", body, 220)
+        model_class = REC_CAR_IDS[model_id]
+        ack = {"sha256": hashlib.sha256(body).hexdigest(), "verified": False}
         # Keep the client's local card key private. Returned rows contain only
         # a scoped stable pseudonym and the data shown in the game.
         public_owner = hashlib.sha256(subject.encode("ascii") + b"\0" + owner).digest()[:16]
@@ -95,22 +146,42 @@ class CommunityTiming:
                         raise ContractError("community_account_quota", 429)
                     if self._db.execute("SELECT COUNT(*) FROM community_pb_v1").fetchone()[0] >= 20000:
                         raise ContractError("community_archive_full", 503)
-                self._db.execute("""
+                if include_result:
+                    old_course, = self._db.execute("""
+                        SELECT MIN(score) FROM community_pb_v1 WHERE course=? AND traffic=?
+                    """, (course, traffic)).fetchone()
+                saved = self._db.execute("""
                     INSERT INTO community_pb_v1 VALUES (?,?,?,?,?,?,?,?)
                     ON CONFLICT(subject,owner,course,traffic) DO UPDATE SET
                     attempt=excluded.attempt,date=excluded.date,score=excluded.score,record=excluded.record
                     WHERE excluded.score < community_pb_v1.score
                 """, (subject, owner, course, traffic, attempt, date, score, record))
+                if traffic == 0 and saved.rowcount:
+                    self._db.execute("""
+                        INSERT INTO community_crown_v1 VALUES (?,?,?,?)
+                        ON CONFLICT(course) DO UPDATE SET
+                            subject=excluded.subject, owner=excluded.owner, acquired_at=excluded.acquired_at
+                        WHERE (excluded.subject<>community_crown_v1.subject OR excluded.owner<>community_crown_v1.owner)
+                          AND ? < (
+                            SELECT score FROM community_pb_v1
+                            WHERE course=community_crown_v1.course AND traffic=0
+                              AND subject=community_crown_v1.subject AND owner=community_crown_v1.owner
+                          )
+                    """, (course, subject, owner, date, score))
+                new_model = self._save_model_best(course, traffic, model_class, score)
+                if include_result:
+                    ack["result"] = self._result(course, traffic, subject, owner, attempt, current,
+                                                 old_course, new_model, model_class)
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
-        return {"sha256": hashlib.sha256(body).hexdigest(), "verified": False}
+        return ack
 
     def board(self, course, traffic):
         with self._lock:
-            rows = self._db.execute("""SELECT record FROM community_pb_v1 WHERE course=? AND traffic=?
-                                      ORDER BY score, date DESC, attempt LIMIT 10""", (course, traffic)).fetchall()
+            rows = self._db.execute(f"""SELECT record FROM community_pb_v1 WHERE course=? AND traffic=?
+                                      ORDER BY {BOARD_ORDER} LIMIT 10""", (course, traffic)).fetchall()
         return b"CTB1" + struct.pack("<I", len(rows)) + b"".join(row[0] for row in rows)
 
     def close(self):

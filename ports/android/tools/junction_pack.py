@@ -29,66 +29,35 @@ def read_barrier_sprite(sid, source_name, path, table_size):
             raise ValueError(f'barrier sprite format or dimensions mismatch {sid:x}')
         return image.convert('RGBA')
 
-def private_input(root, path):
-    """Resolve a regular input beneath the caller's original-material root."""
-    root = Path(root).resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError('input root must be a directory')
-    resolved = (root / path).resolve(strict=True)
-    if not resolved.is_relative_to(root) or resolved == root:
-        raise ValueError('input escapes root')
-    if not resolved.is_file():
-        raise ValueError('input must be a regular file')
-    return resolved
-
-
-def validate_table_header(path, private_root):
-    path = Path(path)
-    parent = path.parent.resolve(strict=True)
-    allowed = Path(private_root).resolve(strict=True)
-    if not allowed.is_dir():
-        raise ValueError('private root must be a directory')
-    if parent != allowed and allowed not in parent.parents:
-        raise ValueError('header must be below private root')
-    if path.name in ('', '.', '..'):
-        raise ValueError('invalid header filename')
-    target = parent / path.name
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(str(target))
-    return target
-
-
-def write_table_header(path, table, private_root):
+def write_table_header(path, table):
     """Write a private byte-exact C initializer without overwriting any file."""
     if len(table) != 384:
         raise ValueError('table must contain exactly 384 bytes')
-    target = validate_table_header(path, private_root)
+    path = Path(path)
+    parent = path.parent.resolve(strict=True)
+    allowed = Path('/Volumes/CodexWork').resolve(strict=True)
+    if parent != allowed and allowed not in parent.parents:
+        raise ValueError('header must be below /Volumes/CodexWork')
+    if path.name in ('', '.', '..'):
+        raise ValueError('invalid header filename')
     rows = [', '.join('0x%02x' % byte for byte in table[i:i+12]) for i in range(0, len(table), 12)]
     text = ('/* Private original-game data; do not commit. Generated from verified ELF. */\n'
             '#ifndef JUNCTION_TABLE_PRIVATE_H\n#define JUNCTION_TABLE_PRIVATE_H\n'
             'static const unsigned char junction_table_private[384] = {\n  ' +
             ',\n  '.join(rows) + '\n};\n#endif\n').encode('ascii')
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
-    fd = os.open(target, flags, 0o600)
+    fd = os.open(parent / path.name, flags, 0o600)
     with os.fdopen(fd, 'wb') as f:
         f.write(text)
     return hashlib.sha256(text).hexdigest()
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument("root",type=Path); p.add_argument("output",type=Path)
-    p.add_argument('--private-root', required=True, type=Path, help='existing directory permitted for private outputs')
-    p.add_argument('--table-header', type=Path, help='optional new private C header under private root')
-    a=p.parse_args(); root=a.root.resolve(strict=True)
-    allowed=a.private_root.resolve(strict=True)
-    if not allowed.is_dir(): raise ValueError('private root must be a directory')
-    parent=a.output.parent.resolve(strict=True)
-    if not parent.is_relative_to(allowed) or a.output.name in ('', '.', '..'): raise ValueError('output must be a fresh directory below private root')
-    output=parent/a.output.name
-    if output.exists() or output.is_symlink(): raise ValueError('output must be a fresh directory below private root')
-    if a.table_header is not None:
-        if validate_table_header(a.table_header, allowed) == output:
-            raise ValueError('header and output directory must differ')
-    exe=private_input(root, 'main'); data=exe.read_bytes()
+    p.add_argument('--table-header', type=Path, help='optional new private C header under /Volumes/CodexWork')
+    a=p.parse_args(); root=a.root.resolve(strict=True); output=a.output.resolve()
+    allowed=Path('/Volumes/CodexWork').resolve()
+    if output==allowed or allowed not in output.parents or output.exists(): raise ValueError('output must be a fresh directory below /Volumes/CodexWork')
+    exe=root/'main'; data=exe.read_bytes()
     if hashlib.sha256(data).hexdigest()!=SHA: raise ValueError('wrong ELF')
     po=struct.unpack_from('<I',data,28)[0]; size,num=struct.unpack_from('<HH',data,42)
     seg=[struct.unpack_from('<8I',data,po+i*size) for i in range(num)]
@@ -100,7 +69,8 @@ def main():
     def name(sid):
         if sid<0 or sid>=0x1f9b: raise ValueError('invalid sprite id')
         o=off(u32(0x9551560+44*sid)); end=data.index(b'\0',o); n=data[o:end].decode('ascii')
-        q=private_input(root, n)
+        q=(root/n).resolve(strict=True)
+        if root not in q.parents: raise ValueError('sprite escapes root')
         return q,n
     expected={0x144e:'menu_p_bunki_area_C1_in.png',0x179d:'menu_p_bunki_area_C1_out.png',0xdc4:'menu_p_bunki_L_waku_1.png',0xdc6:'menu_p_bunki_R_waku_1.png',0x1450:'menu_p_bunki_mes_select.png'}
     for sid,n in expected.items():
@@ -118,7 +88,7 @@ def main():
     raw=bytes(emu.rd(0x9803c80,276*36))
     anims=[]; ids=set()
     for an in ANIMS:
-        b=private_input(root, Path('data/anime')/f'{an}.anm').read_bytes(); nf=struct.unpack_from('<I',b)[0]
+        b=(root/'data/anime'/f'{an}.anm').read_bytes(); nf=struct.unpack_from('<I',b)[0]
         if not 0<nf<=10000: raise ValueError('invalid frames')
         frames=[struct.unpack_from('<II',b,8+8*i) for i in range(nf)]
         count=max(s+n for s,n in frames); base=8+8*nf
@@ -152,11 +122,11 @@ def main():
         for f in frames: out+=struct.pack('<II',*f)
         for r in records:
             out+=struct.pack('<iH6f4h4h',r[0],{8:1,9:2}.get(r[15],0),*r[1:7],*(max(-32768,min(32767,x)) for x in r[7:15]))
-    output.mkdir(mode=0o700,exist_ok=False)
+    output.mkdir(parents=True,exist_ok=False)
     for n,b in [('junction-table.bin',table),('junction-pages.wcp',out)]:
         with (output/n).open('xb') as f: f.write(b)
         print(n,len(b),hashlib.sha256(b).hexdigest())
     if a.table_header is not None:
-        digest = write_table_header(a.table_header, table, allowed)
+        digest = write_table_header(a.table_header, table)
         print('private header', a.table_header, 'sha256', digest)
 if __name__=='__main__': main()

@@ -11,6 +11,7 @@ from pathlib import Path
 import stat
 
 EXPECTED = "8b5885738fb46c23ce71fb89fa70f25d1a201fd2e5d76ed79d9627a9c17c0170"
+ROOT = Path("/Volumes/CodexWork")
 INCLUDE = b'#include "rc_runtime.h"'
 DECLS = (INCLUDE + b"\nextern void rc_story_carry_save(void);\n"
          b"extern void rc_story_carry_load(void);\n"
@@ -37,15 +38,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--private-root", required=True, type=Path)
     args = parser.parse_args()
-    root = args.private_root.resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError("private root must be a directory")
+    if ROOT.resolve(strict=True) != ROOT:
+        raise ValueError("unexpected private root")
     source = args.input.resolve(strict=True)
     parent = args.output.parent.resolve(strict=True)
-    if not source.is_relative_to(root) or source == root or not parent.is_relative_to(root):
-        raise ValueError("input and output must be under private root")
+    if not source.is_relative_to(ROOT) or not parent.is_relative_to(ROOT):
+        raise ValueError("input and output must be under /Volumes/CodexWork")
     if stat.S_IMODE(parent.stat().st_mode) & 0o077:
         raise ValueError("output directory must be private (0700)")
     if not source.is_file():

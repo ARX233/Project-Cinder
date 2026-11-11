@@ -131,7 +131,8 @@ int main(void){
   assert(menu_ghost_set_directory(&m,&view)&&m.ghost.active_request==id); /* same-view refresh cannot reroll */
   assert(menu_ghost_complete(&m,id,1,NULL)&&m.ghost.completed_action==7&&!menu_ghost_complete(&m,id,1,NULL));
   assert(menu_ghost_begin_pre(&m)&&menu_ghost_choosing_options(&m));bind_reject_unchanged(&m,id,b->ramp,b->route);
-  if(!n){run_tuned_flow(&m);tick(&m,600);assert(!m.ghost.pre_go);m.ready=1;assert(menu_update(&m,1.0f/60.0f)==1&&m.ghost.pre_go);
+  if(!n){run_tuned_flow(&m);tick(&m,600);assert(!m.ghost.pre_go&&!m.ghost.intro_t);m.ready=1;
+   tick(&m,220);assert(menu_update(&m,1.0f/60.0f)==1&&m.ghost.pre_go);
    menu_ghost_race_finished(&m,MENU_GHOST_RESULT_LOSE,0);
    assert(m.ghost.ui.page==GHOST_UI_SEARCH&&m.ghost.result==MENU_GHOST_RESULT_LOSE&&!m.ghost.claim_eligible);
   }else menu_ghost_open(&m);
@@ -149,7 +150,7 @@ int main(void){
  default_profile(&m,b->index,(int)b->area);assert(ghost_arcade_request(&m));assert(menu_ghost_take_action(&m,&id)==7);assert(menu_ghost_bind_default_request(&m,id,b->ramp,b->route)&&menu_ghost_complete(&m,id,1,NULL)&&menu_ghost_begin_pre(&m));
  assert(menu_ghost_set_directory(&m,NULL)&&!menu_ghost_preparing(&m));menu_ghost_race_finished(&m,MENU_GHOST_RESULT_INVALID,1);assert(m.ghost.result==MENU_GHOST_RESULT_INVALID&&!m.ghost.claim_eligible&&m.ghost.ui.page!=GHOST_UI_RESULT);
  /* The UI WIN path is an API callback-contract test, NOT evidence of a native win. */
- assert(menu_ghost_set_directory(&m,&view));default_profile(&m,b->index,(int)b->area);assert(ghost_arcade_request(&m));assert(menu_ghost_take_action(&m,&id)==7);assert(menu_ghost_bind_default_request(&m,id,b->ramp,b->route)&&menu_ghost_complete(&m,id,1,NULL)&&menu_ghost_begin_pre(&m));pick_time(&m);assert(menu_ghost_preparing(&m));m.ready=1;assert(menu_update(&m,1.0f/60.0f)==1);menu_ghost_race_finished(&m,MENU_GHOST_RESULT_WIN,0);assert(m.ghost.ui.page==GHOST_UI_SEARCH&&m.ghost.result==MENU_GHOST_RESULT_WIN&&!m.ghost.claim_eligible);
+ assert(menu_ghost_set_directory(&m,&view));default_profile(&m,b->index,(int)b->area);assert(ghost_arcade_request(&m));assert(menu_ghost_take_action(&m,&id)==7);assert(menu_ghost_bind_default_request(&m,id,b->ramp,b->route)&&menu_ghost_complete(&m,id,1,NULL)&&menu_ghost_begin_pre(&m));pick_time(&m);assert(menu_ghost_preparing(&m));m.ready=1;tick(&m,220);assert(menu_update(&m,1.0f/60.0f)==1);menu_ghost_race_finished(&m,MENU_GHOST_RESULT_WIN,0);assert(m.ghost.ui.page==GHOST_UI_SEARCH&&m.ghost.result==MENU_GHOST_RESULT_WIN&&!m.ghost.claim_eligible);
  /* Combined builtin rows total316, 305 selectable; a raw index is not global. */
  static menu_ghost_directory_row combined[318];memcpy(combined,REAL_ROWS,sizeof REAL_ROWS);memcpy(combined+196,UI_DEFAULT_FIX_ROWS,sizeof UI_DEFAULT_FIX_ROWS);
  menu_ghost_directory_view both=view;both.rows=combined;both.count=316;++both.epoch;assert(menu_ghost_set_directory(&m,&both));m.ghost.search_kind=0;assert(ghost_directory_count(&m,-1,-1)==305);
@@ -177,7 +178,13 @@ int main(void){
  assert(m.ghost.request_id1==0x12&&m.ghost.request_id2==1&&m.ghost.request_ramp==19);
  assert(menu_ghost_complete(&m,id,1,NULL)&&menu_ghost_begin_pre(&m)&&menu_ghost_choosing_options(&m));
  pick_time(&m);assert(menu_ghost_preparing(&m));
- menu_ghost_open(&m);
+ assert(ghost_intro_crown(&m));m.ready=1;
+ ghost_vs_drawn=0;crown_sprite_drawn=0;
+ tick(&m,132);ghost_intro_overlay(&m,1024,768);assert(!ghost_vs_drawn&&!crown_sprite_drawn);
+ tick(&m,38);ghost_intro_overlay(&m,1024,768);assert(!ghost_vs_drawn&&crown_sprite_drawn==1776);
+ tick(&m,100);assert(m.ghost.intro_t==270&&!m.ghost.pre_go);
+ assert(menu_update(&m,1.0f/60.0f)==1);
+ menu_ghost_open(&m);assert(!m.ghost.intro_t);
  combined[317]=combined[316];combined[317].source_kind=MENU_GHOST_SOURCE_CLOUD;
  combined[317].record_index=0;
  ++both.epoch;both.count=318;

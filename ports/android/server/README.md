@@ -45,6 +45,8 @@ python3 -m server.device_registration revoke /path/to/cinder-state/approved-devi
 | `GET /v1/device` | 设备登记模式的认证检查。通过时返回设备 ID 和 `approved:true`。 |
 | `GET /v1/capabilities` | 免认证。分别返回化身分享、世界王冠、计时榜单及计时核验器的能力。 |
 | `POST /v1/ghosts?area=0` | 请求体为 `application/octet-stream` 格式的完整 `W3GCROWN` v1 容器，上限 395,540 字节。首传返回 201，同一账号和区域重复提交同一内容返回 200 及同一记录。可选 `X-Cinder-Card-ID` 头为 32 位小写十六进制的私有存档键。 |
+| `GET /v1/ghosts/crowns?physics_sha256=…` | 八区鬼王的单份快照。首字节为调用者指定卡片的持有掩码，其次为行数。每行包含区域、16 字节鬼王 ID、四字节小端长度及原始录像。长度为 0 表示该席位已有鬼王，但录像与查询的物理版本不兼容。 |
+| `POST /v1/ghosts/crowns?area=0&previous=…` | 登记获胜录像。必须提供 `X-Cinder-Card-ID`。`previous` 是开赛时的鬼王 ID，空席使用 32 个零。席位变化返回 409。相同卡片与录像在仍持有该席位时可以重试。 |
 | `GET /v1/ghosts?physics_sha256=<hex>&limit=20` | 返回 `ghosts` 数组和 `next_cursor`。可选 `area=0..7`、`limit=1..50`、`cursor` 和 `others=1`（排除当前账号）。`name_hex` 接受原版最多五个字符的 UTF-8 十六进制串，按字形子串匹配。`id` 可定位旧的共享记录。常规列表按账号、存档、物理版本及赛道分组，仅显示各组最新记录。 |
 | `GET /v1/ghosts/<id>` | 下载原始容器字节，`X-Content-SHA256` 与 `ETag` 提供内容摘要。 |
 | `POST /v1/ghosts/<id>/battles` | 客户端上报比赛结果。34 字节小端请求体依次是 16 字节随机比赛标识、挑战者胜负（1/0）、车型（u8）、马力（u16）、防守化身的领先距离（i32 米，`INT32_MIN` 表示未知）和补零至五字符的 UTF-16LE 名字。同账号相同内容重传不重复记入。 |
@@ -53,6 +55,8 @@ python3 -m server.device_registration revoke /path/to/cinder-state/approved-devi
 | `GET /v1/ta/community` | 使用与正式榜相同的四个分区参数，返回 `CTB1`、小端记录数和至多十条 `CTA1` 社区记录。 |
 | `GET /v1/ta/leaderboard` | 使用 `rules_sha256`、`physics_sha256`、`course_id` 和 `traffic` 查询已核验成绩。 |
 | `POST /v1/ta/attempts` | 由服务运营方注入可信核验器后启用。请求体依次为四字节大端 JSON 长度、计时赛契约 JSON 及二进制输入证据。核验器缺失时返回 503。 |
+
+社区鬼王由客户端原生比赛结果触发。服务器验证设备、录像结构、区域和现任鬼王的路线及物理版本，并在 SQLite 事务中更新席位。该流程不进行服务器物理重演，`world_crown_verified` 仍为 false。当前八份鬼王录像独立于共享化身的过期与容量淘汰。旧本地鬼王和历史计时赛成绩不会自动获得社区席位。
 
 化身返回字段为 `id`、`sha256`、`bytes`、`area`、`physics_sha256`、`display_name`、`raw_model`、`raw_ramp`、`route`、`created_ms` 和 `verified`。ID 是服务端生成的 32 位小写十六进制字符串。服务端验证容器、检查赛道区域和录制采样的语法，并原样保存数据。客户端仍须使用原生引擎检查赛道和回放兼容性。共享化身与客户端上报战绩的 `verified` 恒为 false。服务端通过已共享录制确定防守账号和存档，认证挑战者身份，防守记录仅向其所属账号返回。普通化身可包含已验证原生赛道字段的计时赛录制，世界王冠仍由下方的独立可信核验契约管理。
 

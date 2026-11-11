@@ -160,7 +160,7 @@ public final class OriginalSourceBroker {
                 cancel, progress, SYSTEM_SPACE);
     }
 
-    /** Copies only the immutable APK-audited profile sources, with main first. */
+    /** Copies the immutable APK-audited profile sources, then optional aura artwork. */
     public static Receipt copyTree(Context context, Uri tree, Path jobRoot,
                                    OriginalProfile profile, Cancel cancel, Progress progress)
             throws IOException {
@@ -191,6 +191,175 @@ public final class OriginalSourceBroker {
             this.path = path; this.length = length; this.sha256 = sha256;
         }
     }
+    // Optional artwork is pinned separately so old sealed jobs and their primary profile stay valid.
+    private static final List<Expected> AURA_SOURCES = Arrays.asList(
+            new Expected("data/effect/car_aura_blue.igb",305263,"90b4357981687e4fe588dbcf5cfec6385637bae1b89fd7086e91d6cab83ddee1"),
+            new Expected("data/effect/car_aura_glow_blue.igb",24707,"8d7c9903a4cd5bc90a482a3b34da8c4176a5c4c6d61207a5d6a9973e39825b8a"),
+            new Expected("data/effect/car_aura_glow_green.igb",24708,"4764d76f6266f8a964c9025309d2afe2c59f4ee814d1d7db051c3599a64dc4fe"),
+            new Expected("data/effect/car_aura_glow_purple.igb",24716,"4c5a024263485b4c657b79889d6d0731c864ce5c0268211aca7791426fdfd274"),
+            new Expected("data/effect/car_aura_glow_red.igb",24706,"da64fddf97f044ec78b15c1dce320511f8a2bb1f92c403b284fc54c487f97dd2"),
+            new Expected("data/effect/car_aura_green.igb",305266,"7f197cba7d06833efcdc7a1e40ada449710ed2a8b9b519e39c625cf88be42d86"),
+            new Expected("data/effect/car_aura_purple.igb",305283,"90c13e5978a4d818ac5147ac9d231708f63a2048b883fb75df4c6b5344256b32"),
+            new Expected("data/effect/car_aura_red.igb",305260,"a5fa7cec21222fd3bcf5357358211880aee3e09e03d9ace9be2d50d2050cfcae"));
+
+    private static final List<Expected> FINISH_MENU_SOURCES = Arrays.asList(
+            new Expected("data/anime/cons_g_last_000m.anm",37032,"d4c4dd94aae0c965c3d98e3d06dd8c6543aadced1a71706cdf322024299d3937"),
+            new Expected("data/anime/cons_g_last_saigo.anm",8232,"10bf2126e10a037068d4650831e1a02c23da9c62e7204aaa72f0393cff93ebb3"),
+            new Expected("data/anime/cons_g_last_tonikaku.anm",12072,"032ce768c040d09fc7e00922dc8758e98e9f5887cc313af07d63dc59cbb30e8d"),
+            new Expected("data/sprite/cons_p_finish_rival.png",2761,"8ac9082082c54d6d74dc213f8d17f7a525a6fe35d9315590245c3d5edaed7d00"),
+            new Expected("data/sprite/cons_p_finish_saigo.png",7533,"10d4b7d5e9ccf77ae2422cf6bb2dbc6f3c9ba59ab98205116bf006683e827af3"),
+            new Expected("data/sprite/cons_p_finish_tonikaku.png",6525,"0b05141db5187ecc93ad71df2ca072583f976d6b0087ad576ff86113b4012b63"),
+            new Expected("data/sprite/cons_p_last_0_template.png",2872,"27fd4a5d79a83b708584503978d15d52ab753e3c15b17676972d16128e52ca6c"),
+            new Expected("data/sprite/cons_p_last_1_template.png",2872,"27fd4a5d79a83b708584503978d15d52ab753e3c15b17676972d16128e52ca6c"),
+            new Expected("data/sprite/cons_p_last_2_template.png",2872,"27fd4a5d79a83b708584503978d15d52ab753e3c15b17676972d16128e52ca6c"),
+            new Expected("data/sprite/cons_p_last_m.png",3613,"c2193f52f59a5a473f80216b14825f9d60ca57b1ad2147f4dbc5408a34d4274c"),
+            new Expected("data/sprite/cons_p_last_m_template.png",242,"b9d795a35e3971223a7315b664c3bb9887b3c945da9eb446e48bf4c5b9ac7483"));
+
+    private static final List<Expected> CROWN_SCENE_SOURCES = Arrays.asList(
+            new Expected("data/anime/menu_g_cardcheck_5_point.anm",12072,"834ecd8402ace85984bf3e13af13108d8c46f6552193c436f60d0a65ba5cadce"),
+            new Expected("data/anime/menu_g_cardcheck_5_waku.anm",208,"25bc0ebc367800e1ace9b37bb64f697eff33135fd75cfa6247439eb2a2e49d85"),
+            new Expected("data/anime/menu_g_crown_atract.anm",64872,"eea2cad0206610a3dc6ac83a220919707a311041914ba8db000111b5390da75d"),
+            new Expected("data/anime/menu_g_crown_atract_title.anm",13672,"c275b90c0e4c62f381248371630402b9543a00c5b4e5158ea1c610bc14bcbfa6"),
+            new Expected("data/anime/menu_g_crown_bg.anm",144,"a90f42e5383860c868d69fa84dfd8354eb04a2a99dbccd02fc045c7884b09dc9"),
+            new Expected("data/anime/menu_g_crown_get_title.anm",8136,"bc7af4c6c615ca98dd9366984314782c39e99b6d00fa09949d39eb0ecee29b27"),
+            new Expected("data/anime/menu_g_crown_waku.anm",592,"4311c7d6c0469d58a0714839d049085ae1b91f9a7b0bb051522671dee5951053"),
+            new Expected("data/anime/menu_layout_cardcheck_5.anm",720,"a81fc10b4490c8ed49d9b27cc240a2a7b06e893d52b5ae49acd8a0e8ea62d3f2"),
+            new Expected("data/anime/menu_layout_crown_get_a.anm",12616,"2995f2ed2eb9ee93a5a168b62f9a0e4644bf6b241d9bf376264d69b6cbcd1b5d"),
+            new Expected("data/anime/menu_layout_crown_get_b.anm",45384,"440b607051210415b095ee7ff0be3265efff020db3ab406016cd156d475b1eaf"),
+            new Expected("data/anime/menu_layout_crown_saikyo.anm",11112,"cdbb19cf16e2e41b643622166e7c8b32885585da0b925c296a748943f6b2c8e3"),
+            new Expected("data/anime/menu_layout_crown_saikyo_all.anm",15744,"a2d0b532e4e0f4a3543d898f9c623595737f83139236f7cc649c7b4452b178c0"),
+            new Expected("data/sprite/font_28_black_1.png",630259,"68153bbc2dfe28e69627a6d085994ad93b1c730dbe3dd17168c2d529c92894ed"),
+            new Expected("data/sprite/menu_p_card_14_battle_sen.png",3684,"2113f7237a240256cd4b261742cac1cf3ed5ae04629377005e076b04672fc364"),
+            new Expected("data/sprite/menu_p_card_5_graph.png",88650,"d7d53a8c7141ea3517ab86f67b4260c044ab28099878bf9e6ff7267876fed273"),
+            new Expected("data/sprite/menu_p_card_5_menu.png",4589,"caca7930e071411c4db46f99e788dc9336de1e000e81c7f952acd03303196575"),
+            new Expected("data/sprite/menu_p_card_5_point_1.png",3024,"3335cd2e10c36ea957a69ef0861f68b134933a5cede6def397d40330f191aa27"),
+            new Expected("data/sprite/menu_p_card_5_point_2.png",2949,"d015924c7e757cb14ec952e78364a585edd739a72d16f3c1a90373c64695c7c1"),
+            new Expected("data/sprite/menu_p_card_5_point_3.png",3291,"c3831a18aac03af01d80ea93de417d2bba4d86600b7a5986b6bc6d8927040f81"),
+            new Expected("data/sprite/menu_p_card_5_title.png",7687,"9a8041b5b3d91df837f5244c3bd03529fc832ff571c0fb465cd85aaab20e9626"),
+            new Expected("data/sprite/menu_p_card_waku_1.png",34641,"2af996167cb492884a65f9e0a219b7bf626eca39c5f4e6e071ea5281857b56b7"),
+            new Expected("data/sprite/menu_p_crown_L_C1.png",84861,"8fed58e3ce85a04803b751b24b860a693734b6cb6e369ed3db8253c6d3e2f58a"),
+            new Expected("data/sprite/menu_p_crown_L_fk.png",60749,"2cbc6e70166c0180b647010e1e905f67b6a830b6c7e39eaf7d142b814ad4aaff"),
+            new Expected("data/sprite/menu_p_crown_L_hk.png",85101,"c3a033c86411449e3445fc3d51db6a91528e9fa1d2740695f7c4db1a3783156e"),
+            new Expected("data/sprite/menu_p_crown_L_ng.png",88877,"a4bcd3a1d6ebf8a7a70c5091d52c9745fa7c96d17bc890f24e632210dc6a06fd"),
+            new Expected("data/sprite/menu_p_crown_L_os.png",81838,"7cb42837f25c049742f2d0d5ed77e1a8cfd9dbb0da1210d77167d0192c539ca2"),
+            new Expected("data/sprite/menu_p_crown_L_sk.png",86648,"58946640f43626ac1684b8c786f75b7e58c92796e75cf830873867b04d40ad3c"),
+            new Expected("data/sprite/menu_p_crown_L_wg.png",89671,"75b251fdf1c12d783dd1abe3b6661854113ff0995125bb51f2a0b1bf8a50f3fa"),
+            new Expected("data/sprite/menu_p_crown_L_yk.png",88340,"1c4e8a8f887f7262173be7f80370eada9ec80a52c7def35ffb161e4e8f65c04b"),
+            new Expected("data/sprite/menu_p_crown_S_C1.png",16208,"0bf6b01b52b0a37f5aa2d5aedddc17927e6d4e3e17445cda4d79e1dda1b92029"),
+            new Expected("data/sprite/menu_p_crown_S_fk.png",13016,"c31883970849062b2fad5fdec57e2770a5d2c58255128aebc674f5325a667644"),
+            new Expected("data/sprite/menu_p_crown_S_hk.png",17058,"d75125790265acc1482bcbd6a43b678fba79c980fbb9a5e2a1d2b89de6c19d74"),
+            new Expected("data/sprite/menu_p_crown_S_ng.png",17604,"f7619f54bc42479067fae0fb6322a1db8adc2144c1426abb1216f2314f4642f7"),
+            new Expected("data/sprite/menu_p_crown_S_os.png",15747,"713f7669233f93bdfe6914f111ded3618267e043d3b29aaa9561a383e79cb242"),
+            new Expected("data/sprite/menu_p_crown_S_sk.png",11900,"0d0596549ebbf9e34b689b249d6d4c8e09e621197f003e53ef8fdd6db6fe4156"),
+            new Expected("data/sprite/menu_p_crown_S_waku_C1.png",14804,"f6e7945460d74aec56636d9f502301adec4bd2f1aacac9e59ba5e2c7eef4e857"),
+            new Expected("data/sprite/menu_p_crown_S_waku_fk.png",12104,"877cff2a884b11fc09c4c16734d1d7c8a4818f6cd2fc48fa12b272f5402d66ea"),
+            new Expected("data/sprite/menu_p_crown_S_waku_hk.png",15803,"6f412a7736a10b7ca8c56e443e6061d2a25f51a2b95b85efe66d6367bd957ffb"),
+            new Expected("data/sprite/menu_p_crown_S_waku_ng.png",16599,"39dd4baa96ce2ed05637887916fe9f6153bf25b0c6ef5f11b05820c71071c2db"),
+            new Expected("data/sprite/menu_p_crown_S_waku_os.png",14399,"cb0a46aacd6cb2a920615b739cbeb1e0bd331cc6a59e400e95db9a5ef55a8185"),
+            new Expected("data/sprite/menu_p_crown_S_waku_sk.png",11337,"be77cc2d0d119926e469356594f3492b6179d138973ff7d849bc378d38ffec08"),
+            new Expected("data/sprite/menu_p_crown_S_waku_wg.png",12965,"e43fc164f31d88a54982a20f21ee46b2488b6bbfcadcd5cadbcc5805e9439db3"),
+            new Expected("data/sprite/menu_p_crown_S_waku_yk.png",14961,"4988f795b7baea47fc6b3ca0cf51169c51d08674ed1d361be82f3a95af48858b"),
+            new Expected("data/sprite/menu_p_crown_S_wg.png",14204,"69eaa6236da23e2a5d9dc3c4b2b2bfcd717a5c36d8b24bf5310c15104f93e37d"),
+            new Expected("data/sprite/menu_p_crown_S_yk.png",17277,"857fbfba604d5e48aba52deecde68bc4b0db6dbfea3c4439543a09fd87ff89a9"),
+            new Expected("data/sprite/menu_p_crown_atract_c1.png",62498,"ed001430bcb3167c318373950f86ed111682bbb6e8e8d4de53361f50f16d4779"),
+            new Expected("data/sprite/menu_p_crown_atract_fk.png",44136,"92c35817e1c98c44bfda541da88ee3be3528b8a8dfd6c7b310e8d0bfb5aa4ee2"),
+            new Expected("data/sprite/menu_p_crown_atract_gray.png",172977,"c4c9c02a907467410874e66d8029cc31ed75545be067d2d8e092b98b115aaaf1"),
+            new Expected("data/sprite/menu_p_crown_atract_hk.png",61432,"003444cdd4cafb3fcebfb715ed6fb234391aba232e85bbc89ec7fb2f85d05183"),
+            new Expected("data/sprite/menu_p_crown_atract_ng.png",40538,"126b6e08c82dbf252a461a05afabf572ca56e7d3f744c8dad56f8fd77aec8c9a"),
+            new Expected("data/sprite/menu_p_crown_atract_os.png",43675,"00dbd14761d73fd98c87706c4c63d03ba72f82915ea18827029d2c923fa74f02"),
+            new Expected("data/sprite/menu_p_crown_atract_sk.png",50868,"fb4bc884f9b039b5366bf6083093b3a2219344ded9a77cf3b5cb0ba1865f52ac"),
+            new Expected("data/sprite/menu_p_crown_atract_title_ghost.png",7059,"041de08371a0c2d3ef6cab6a9c593ebb966dacef899035767d2eb03e993cb697"),
+            new Expected("data/sprite/menu_p_crown_atract_title_saikyo.png",15373,"0a4abfbffa8bc1eddf95a19a51161a20c55ad5c1545f9edd8f69ced11f0e0dbd"),
+            new Expected("data/sprite/menu_p_crown_atract_wg.png",45812,"ccc0934981eb167e4c98b61d788aba4fec114b167c35002eaf868cbd134f2365"),
+            new Expected("data/sprite/menu_p_crown_atract_yk.png",43597,"9bb9d8e0cd50028fd14ce29015a44ff00d401754823dffdb825a31a366ec5ff8"),
+            new Expected("data/sprite/menu_p_crown_bg.png",3747,"73243779311ca3a8247835943051d25f30e73df8cb9c7f690d82832a64b9e0c7"),
+            new Expected("data/sprite/menu_p_crown_mes.png",40227,"6e37d314001a74eea434e72a7ace2e9f6dfc33cf32d283298377d9ace78dbb49"),
+            new Expected("data/sprite/menu_p_crown_mes_C1.png",26124,"1617b75440ccd21ed3d7170efa956422aadf87aac1dd64a942319f5907c5926e"),
+            new Expected("data/sprite/menu_p_crown_mes_all.png",42185,"73888c0dd3802ea0d8191ba7235b1a767dd96b5ae7b28fd3193d6fb71ad57be7"),
+            new Expected("data/sprite/menu_p_crown_mes_fk.tga",262188,"67200d0abb2b1c34246909a4d40268d3a30d97076132f509da6dcc7b5e9b2bd4"),
+            new Expected("data/sprite/menu_p_crown_mes_hk.png",34982,"9ff7bf1c9bd0ce6bb2cc5aaefcf8aa22e778f146084a573cd2663d463e1537a0"),
+            new Expected("data/sprite/menu_p_crown_mes_ng.png",35575,"24ebac2b41be848ce6ad0a8fd099f50059abc361755d9e124799e660fab14f80"),
+            new Expected("data/sprite/menu_p_crown_mes_os.png",32882,"79e8d327620a2b01df06d065ebf5fcfae0c393cda2c2fa52c00095d1d9804bff"),
+            new Expected("data/sprite/menu_p_crown_mes_sk.png",42060,"7ef6d8abab032dac1f3d128d26b2e4b5b4abe9bbcd8f0637852b06358e303022"),
+            new Expected("data/sprite/menu_p_crown_mes_wg.png",41825,"356b006c1cc6fbb2271cd8d8c8ac3efc02a01ecd59c2ef1a7c58495be8f9d170"),
+            new Expected("data/sprite/menu_p_crown_mes_yk.png",44689,"916d09bfe0b2424b481df4b363d8dfdbd72969d826ae59ab71801debf58065f8"),
+            new Expected("data/sprite/menu_p_crown_title.png",22930,"c252b5f6fcee25adf4e9ccc0b04c72259363c14ed72453844fca24dbc57a8e3a"),
+            new Expected("data/sprite/menu_p_flash.png",205925,"11b80aeab5e35a6e126fe7bb00c46ae1c373cd2a8823803515c642eccbbbe7bc"),
+            new Expected("data/sprite/menu_p_topbar_mes_cardcheck_6.png",30419,"a5a2b43cd381430ea1d30901471e72b33e874df4fa6090c522aef911bd87b260"));
+
+    private static final List<Expected> TEN_BGM_SOURCES = Arrays.asList(
+            new Expected("data/sound/bgm/maxi3/ten_a1.wav",3072044,"b197e2d96b950606aa24bcad3504ef99243173959fc3e43925a65c7afde801ae"),
+            new Expected("data/sound/bgm/maxi3/ten_a2.wav",1536044,"4831a337bbc8c5cfb9d035073263ffb95ad653c0f5612f6243dafbca5b1702bf"),
+            new Expected("data/sound/bgm/maxi3/ten_a3.wav",1536044,"90486780618e00fbd953dc4e4cd8e63358857ff401a032a42dd74c3ff99ead45"),
+            new Expected("data/sound/bgm/maxi3/ten_a4.wav",1536044,"94a0b6512f55b2a4bd29ab371d55c5b3cb1d1d958829b656cf1ef588ec7b6af0"),
+            new Expected("data/sound/bgm/maxi3/ten_a5.wav",1536044,"568025c0088c6c58f04864159355d4baa64651de5be904141267bd1f288cfc55"),
+            new Expected("data/sound/bgm/maxi3/ten_a6.wav",1536044,"f77eb6fe5b33f6857ecbcc9f6227413ced76cadb4cdaf7125cd9be37c96916fa"),
+            new Expected("data/sound/bgm/maxi3/ten_a7.wav",3072044,"f245b09fa3e23c6bc3c12ccca2ad0c93bf7d2c417097b12acd321b4a0c8b8c7e"),
+            new Expected("data/sound/bgm/maxi3/ten_a8.wav",3264044,"88fa4b32044e41a2a21315ce3f3476851a5f58e78ab7fae5ee878ae6c717338b"),
+            new Expected("data/sound/bgm/maxi3/ten_a9.wav",6144044,"073818bd1aa76b80a983b9bc869ccdef263d57cf72a5b01a9460e3bfbf70c409"),
+            new Expected("data/sound/bgm/maxi3/ten_b1.wav",1536044,"cf2381d42c568c77f10fb4e16ca1166a831f4095782b5c0e3488446d6ca2b6ae"),
+            new Expected("data/sound/bgm/maxi3/ten_b2.wav",1536044,"341c1f0e95a3d0664708727c7e48a94ae0b7b6a32a41107cf540d8902d113b3c"),
+            new Expected("data/sound/bgm/maxi3/ten_b3.wav",1536044,"63cbfd16c7b3bbffee69043c7fb144ed521eeecfa1e959ef47ac19a3f707a32b"),
+            new Expected("data/sound/bgm/maxi3/ten_b4.wav",1536044,"df0b12c910538e2a53736594096956570480a540cde44b22ddd7303ee0332d7b"),
+            new Expected("data/sound/bgm/maxi3/ten_b5.wav",1536044,"320966c7c32d414f7521f27968f480ed839e3f630fd1c78347dfaff7c0b9f660"),
+            new Expected("data/sound/bgm/maxi3/ten_b6.wav",3072044,"2d4ef4cc8d572ee4ee0d12548da89f6e7c0a9303e84f7f8803dd42eeb5de75b3"),
+            new Expected("data/sound/bgm/maxi3/ten_b7.wav",3072044,"f837529c2da573358173c325481133196da5e2065f10f2b4b3d135c904054507"),
+            new Expected("data/sound/bgm/maxi3/ten_b8.wav",6144044,"0f292a0a89287e95c21b4ac4ad4ec3d1f0fff54aeb553ba9a6f245fc75f92cd3"),
+            new Expected("data/sound/bgm/maxi3/ten_c1.wav",3072044,"d9ba5fb2f37a7d02f758a4219fd15bf76ad6c1eb105ce5746bed4af97a1ec105"),
+            new Expected("data/sound/bgm/maxi3/ten_c2.wav",3072044,"8eb9ad2523ec64b2c3ed1103bbd6cb239f7e5babc6ad58e6cb0638f15e414877"),
+            new Expected("data/sound/bgm/maxi3/ten_c3.wav",6144044,"6072cea9aef743fbcb3dd8e7bf40d47e53eefdb1a106930a0047a04b880931b8"),
+            new Expected("data/sound/bgm/maxi3/ten_c4.wav",6144044,"da31e40c87156e3404a4daac3eb57364316de64dccc4c5ed0585c4ccf16984f7"),
+            new Expected("data/sound/bgm/maxi3/ten_c5.wav",6144044,"833af7edc278213428108136e77deac5596ee4eaac13256b7d8007f7c7063fc4"),
+            new Expected("data/sound/bgm/maxi3/ten_c6.wav",3840044,"a70bb6b17ab910f9af8b15d5a69a9ce718e46d51a5b4f5e8b89f24ea90426004"),
+            new Expected("data/sound/bgm/maxi3/ten_c7.wav",3072044,"b11b47b6a4b25c8c1699d748e0e1070ce48b019ee9eed0ce98b891ecfeba2405"),
+            new Expected("data/sound/bgm/maxi3/ten_c8.wav",4608044,"2b8fd09d851c7391cf3f1406f4a3746daef9acb322217161e6f67c8b2ea8778d"),
+            new Expected("data/sound/bgm/maxi3/ten_d1.wav",4736940,"86feb990533102f15ab2fdd383fd396dd6411e0a50ddd1ee420b1c0327f39229"),
+            new Expected("data/sound/bgm/maxi3/ten_d2.wav",9473836,"f505e53384c8ad4b1b72b88a18cf56041ba513c8b59ca40ddf8e172fc6bdf5ab"),
+            new Expected("data/sound/bgm/maxi3/ten_d3.wav",4736944,"9cebe46eab910aa828aa4650bea705df65cd47f0412bffce6339d15289c88241"),
+            new Expected("data/sound/bgm/maxi3/ten_d4.wav",9473836,"bc7c9d6fc1a7e8185db40fe8e84dd8bd045ce039aef17c5b66f7338ad835228c"),
+            new Expected("data/sound/bgm/maxi3/ten_d5.wav",5329052,"92c35c0f010be4d55c456ea580d9f4c0c96d6174e1609c02c70b029c13ea590e"),
+            new Expected("data/sound/bgm/maxi3/ten_d6.wav",9473836,"6c611e3993f42245197eac01d4b551df9d42824579cce14613a791bbcd2203b9"),
+            new Expected("data/sound/bgm/maxi3/ten_e1.wav",4736940,"ae6d2a32e877be2685db7a2bce539da68905437dc10f074cd8df3ebd7fca4bb9"),
+            new Expected("data/sound/bgm/maxi3/ten_e2.wav",4736940,"ac693740ceaf70abe2d4c03644fc93bc887ec6fffc61aa9dc89a6d4672bd691a"),
+            new Expected("data/sound/bgm/maxi3/ten_e3.wav",7105388,"f366d30c6344e769a3d647cc3c97defd045b0538f9426d1e85a1f9048d7110e5"),
+            new Expected("data/sound/bgm/maxi3/ten_e4.wav",4736940,"3fd96d0d200047feaa6cb81caa694cd270741d21b5938f79302d76ef9a2a9485"),
+            new Expected("data/sound/bgm/maxi3/ten_e5.wav",4736940,"cb3672a112ecb927d2cdf9c2fbaeeb4939abc8c749c6803d7f695d9840219cbf"),
+            new Expected("data/sound/bgm/maxi3/ten_e6.wav",2368492,"21be37f752afe3f693438dae0ee6ee363afbe26a2962021a1e00cdc5642a55aa"),
+            new Expected("data/sound/bgm/maxi3/ten_e7.wav",8289616,"0cdb097cd06544550d6c294fd3735791165594f0ae19eff2fd0cc14c16f65806"));
+
+    private static final List<Expected> GHOST_WHEEL_SOURCES = Arrays.asList(
+            new Expected("data/changewheel/gem_lman/lman_mid.igb",306825,"31df4c9e831196bc685cdd882053707a1f0e9c2f55c6f1426da6f92f134d1798"),
+            new Expected("data/changewheel/gem_lman/lman_mid_col1.tga",786476,"780ed1904457a6fb483745736eb4a681671c1755373f92fc545174131e3b454f"));
+
+    private static final List<Expected> GHOST_MATCH_SOURCES = Arrays.asList(
+            new Expected("data/sprite/menu_p_crown_L_C1.png",84861,"8fed58e3ce85a04803b751b24b860a693734b6cb6e369ed3db8253c6d3e2f58a"),
+            new Expected("data/sprite/menu_p_crown_L_fk.png",60749,"2cbc6e70166c0180b647010e1e905f67b6a830b6c7e39eaf7d142b814ad4aaff"),
+            new Expected("data/sprite/menu_p_crown_L_hk.png",85101,"c3a033c86411449e3445fc3d51db6a91528e9fa1d2740695f7c4db1a3783156e"),
+            new Expected("data/sprite/menu_p_crown_L_ng.png",88877,"a4bcd3a1d6ebf8a7a70c5091d52c9745fa7c96d17bc890f24e632210dc6a06fd"),
+            new Expected("data/sprite/menu_p_crown_L_os.png",81838,"7cb42837f25c049742f2d0d5ed77e1a8cfd9dbb0da1210d77167d0192c539ca2"),
+            new Expected("data/sprite/menu_p_crown_L_sk.png",86648,"58946640f43626ac1684b8c786f75b7e58c92796e75cf830873867b04d40ad3c"),
+            new Expected("data/sprite/menu_p_crown_L_wg.png",89671,"75b251fdf1c12d783dd1abe3b6661854113ff0995125bb51f2a0b1bf8a50f3fa"),
+            new Expected("data/sprite/menu_p_crown_L_yk.png",88340,"1c4e8a8f887f7262173be7f80370eada9ec80a52c7def35ffb161e4e8f65c04b"),
+            new Expected("data/sprite/menu_p_car1_waku_w_2.png",4043,"ed42cf68ca42bf590cf2a7525a584ce807b8bc3159e800fea55928a77f2415c6"),
+            new Expected("data/sprite/menu_p_pre_tg_rival_great.png",11811,"40fdd4ef933278508b4a3720e707983f01fae1e4e324c5e053beca7e5c7a4c39"));
+
+    private static final List<Expected> MILEAGE_MENU_SOURCES = Arrays.asList(
+            new Expected("data/anime/menu_layout_milage.anm",100392,"98f38619f40def58335c863e78be0c33e80144f21df982d61d049293d7f2ce77"),
+            new Expected("data/sprite/menu_p_milage_0.png",4149,"6733e3a9b37904ba04c6573fbb460af0a1d68f9143aa4b31d9dfe4ba1b37a5b9"),
+            new Expected("data/sprite/menu_p_milage_1.png",3705,"b2803157ac3847ec36919d6c6fac6396b3c4708015a8267e1f681f4acfa431ed"),
+            new Expected("data/sprite/menu_p_milage_2.png",4138,"0940fb1f57dbe962b16833234dec93fd08c40b8d780c5530879d4f7e3be9ef99"),
+            new Expected("data/sprite/menu_p_milage_3.png",4177,"cf6f92bbca4b24a0ef1b5975797c2a2083ffebf6261de758d208f91fac4c7717"),
+            new Expected("data/sprite/menu_p_milage_4.png",4046,"80469e1ea598db093d3d68b94afde68371a36770cce3d2cbffae02c42b4eb77c"),
+            new Expected("data/sprite/menu_p_milage_5.png",4033,"ce36fbf11d99622a65ae4782a5455a99f875f582eaa0efd183471728009e3477"),
+            new Expected("data/sprite/menu_p_milage_6.png",4110,"1fff1f03f996dbb62dfc8bceae98fa63a6a6f075019259848a8581d92be9e091"),
+            new Expected("data/sprite/menu_p_milage_7.png",3836,"68b1abe5a87a31db2a481ae75316de59e40a286b13c6aaeca99f5c4182c8ae4f"),
+            new Expected("data/sprite/menu_p_milage_8.png",4116,"287ab45cc0b3ca24c581c5187a87662918d05948dc239b14c33b5845d2b4b917"),
+            new Expected("data/sprite/menu_p_milage_9.png",4094,"e8d64ea7a02ed2bccdaa2adb011a24ee61767134cc35edbfb14a3641a9c4dacd"),
+            new Expected("data/sprite/menu_p_milage_a.png",4336,"6deeb84dd727a0816fefd40ed05e538e7ac4c2e63cd53032f1ed4b8994c120fc"),
+            new Expected("data/sprite/menu_p_milage_bg.png",59459,"d9cda4719d3442c7c09358d7559cb7c4f113035e9bd577402a5c1f433bfdb763"),
+            new Expected("data/sprite/menu_p_milage_comma.png",3444,"cbbd3dd56caabb3039aeb5427030c42715c4466e05524a6b07aa50a49ec86c3e"),
+            new Expected("data/sprite/menu_p_milage_km.png",4566,"204ced5c1b974c26268cfb0f794a9199223b9525bacfed16a4c6a199715c9685"));
+
     static final class Plan {
         final List<Expected> files; final long bytes;
         Plan(List<Expected> sources) throws IOException {
@@ -510,27 +679,65 @@ public final class OriginalSourceBroker {
             long done = 0;
             for (int i = 0; i < plan.files.size(); i++) {
                 Expected expected = plan.files.get(i);
-                op.check(); area.verify(); requireSpace(space, area.root, expected.length);
-                Path target = area.target(incoming, expected.path);
-                try (FileChannel output = area.newFile(target)) {
-                    ReadHandle source = provider.open(documents.get(i), op);
-                    if (source == null) throw new IOException("Provider returned no source descriptor");
-                    op.track(source);
-                    try {
-                        CopiedFile result = transfer(source, output, expected.path, expected.length,
-                                expected.sha256, op, progress, done, plan.bytes, space, area.root);
-                        op.check(); area.verify(); output.force(true);
-                        // CREATE_NEW established 0600 (non-executable). The later
-                        // VerifiedSnapshot worker, not this provisional broker, owns 0400 sealing.
-                        copied.add(result); done += result.length;
-                    } finally { op.release(source); }
-                }
+                CopiedFile result = copyExpected(provider, documents.get(i), expected, area, incoming,
+                        op, progress, done, plan.bytes, space);
+                copied.add(result); done += result.length;
             }
+            // Keep the core receipt and progress tied to the sealed 0.74 profile.
+            copyOptionalSources(AURA_SOURCES, provider, namespace, selected, area, incoming, op, space);
+            copyOptionalSources(MILEAGE_MENU_SOURCES, provider, namespace, selected, area, incoming, op, space);
+            copyOptionalSources(GHOST_MATCH_SOURCES, provider, namespace, selected, area, incoming, op, space);
+            copyOptionalSources(GHOST_WHEEL_SOURCES, provider, namespace, selected, area, incoming, op, space);
+            copyOptionalSources(FINISH_MENU_SOURCES, provider, namespace, selected, area, incoming, op, space);
+            copyOptionalSources(CROWN_SCENE_SOURCES, provider, namespace, selected, area, incoming, op, space);
+            copyOptionalSources(TEN_BGM_SOURCES, provider, namespace, selected, area, incoming, op, space);
             op.check(); area.verify(); report(progress, "staged-provisional", done, plan.bytes);
             op.check(); area.verify();
             return new Receipt(copied, done);
         }
     }
+    private static void copyOptionalSources(List<Expected> sources, Provider provider,
+                                            Namespace namespace, Located selected, JobArea area,
+                                            Path incoming, Operation op, Space space) throws IOException {
+        try {
+            List<Document> documents = new ArrayList<>();
+            List<Expected> missing = new ArrayList<>();
+            for (Expected expected : sources) {
+                // Shared assets may already be in the signed core or another optional group.
+                // The converter still authenticates each member against its read-set.
+                if (Files.isRegularFile(area.target(incoming, expected.path), NOFOLLOW)) continue;
+                documents.add(resolve(namespace, selected, expected));
+                missing.add(expected);
+            }
+            for (int i = 0; i < missing.size(); i++) {
+                Expected expected = missing.get(i);
+                copyExpected(provider, documents.get(i), expected, area, incoming,
+                        op, null, 0, expected.length, space);
+            }
+        } catch (IOException unavailable) {
+            op.check();
+            area.verify();
+        }
+    }
+
+    private static CopiedFile copyExpected(Provider provider, Document document, Expected expected,
+                                            JobArea area, Path incoming, Operation op, Progress progress,
+                                            long done, long total, Space space) throws IOException {
+        op.check(); area.verify(); requireSpace(space, area.root, expected.length);
+        Path target = area.target(incoming, expected.path);
+        try (FileChannel output = area.newFile(target)) {
+            ReadHandle source = provider.open(document, op);
+            if (source == null) throw new IOException("Provider returned no source descriptor");
+            op.track(source);
+            try {
+                CopiedFile result = transfer(source, output, expected.path, expected.length,
+                        expected.sha256, op, progress, done, total, space, area.root);
+                op.check(); area.verify(); output.force(true);
+                return result;
+            } finally { op.release(source); }
+        }
+    }
+
     static Receipt copyZip(Provider provider, JobArea area, Cancel cancel,
                            Progress progress, Space space) throws IOException {
         try (Operation op = new Operation(cancel)) {

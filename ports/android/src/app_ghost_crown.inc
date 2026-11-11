@@ -39,16 +39,12 @@ static int app_profile_bind(const ghost_crown_record *record,unsigned area,uint6
     binding->rival.gears==race->owner.gears && !memcmp(binding->race_field,race->race_field,24);
 }
 
-static void app_profile_row(const ghost_crown_record *record,unsigned area,unsigned index,
-                            unsigned source_kind,const car_ghost_arcade_binding *binding) {
-  menu_ghost_directory_row *row=&AC.rows[AC.row_count++];
-  *row=(menu_ghost_directory_row){.record_index=index,.id1=(uint32_t)record->revision,
-    .id2=(uint32_t)(record->revision>>32),.source_kind=source_kind};
-  memcpy(row->name,record->name,sizeof row->name);
-  row->areas[area]=(menu_ghost_directory_area){
+static menu_ghost_directory_area app_profile_area(const ghost_crown_record *record,
+                                                  const car_ghost_arcade_binding *binding) {
+  menu_ghost_directory_area area={
     .level=binding->target_level,.native_available=1,.ramp=binding->ramp,.route=binding->raw_route,
     .pack=binding->pack,.paint=binding->paint,.raw_model=record->raw_model,
-    .power=binding->rival.power,.handling=binding->rival.handling,.title=record->title,
+    .power=binding->rival.power,.handling=binding->rival.handling,.title=record->title,.class_id=record->class_id,
     .native_type=(int)binding->rival.type,.base_paint=binding->base_paint,.custom_color=binding->custom_color,
     .aero=(int)record->aero,.mirror=(int)record->mirror,.wing=(int)record->wing,.bonnet=(int)record->bonnet,
     .wheel=record->wheel==143u?0:(int)record->wheel+1,.neon=(int)record->neon,.vinyl=(int)record->vinyl,
@@ -56,28 +52,48 @@ static void app_profile_row(const ghost_crown_record *record,unsigned area,unsig
   time_t stamp=(time_t)record->race.recorded_at;
   struct tm date;
   if (stamp>0 && (uint64_t)stamp==record->race.recorded_at && localtime_r(&stamp,&date))
-    row->areas[area].recorded=app_ghost_record_date(date.tm_year+1900,date.tm_mon+1,date.tm_mday,
-                                                   date.tm_hour,date.tm_min);
+    area.recorded=app_ghost_record_date(date.tm_year+1900,date.tm_mon+1,date.tm_mday,
+                                       date.tm_hour,date.tm_min);
+  return area;
+}
+
+static void app_profile_row(const ghost_crown_record *record,unsigned area,unsigned index,
+                            unsigned source_kind,const car_ghost_arcade_binding *binding) {
+  menu_ghost_directory_row *row=&AC.rows[AC.row_count++];
+  *row=(menu_ghost_directory_row){.record_index=index,.id1=(uint32_t)record->revision,
+    .id2=(uint32_t)(record->revision>>32),.source_kind=source_kind};
+  memcpy(row->name,record->name,sizeof row->name);
+  row->areas[area]=app_profile_area(record,binding);
+}
+
+/* A saved crown is displayable only when the same race binding is playable. */
+static int app_crown_load_bound(const char *root,const char *physics,unsigned area,
+                                ghost_crown_record *record,car_ghost_arcade_binding *binding) {
+  car_ghost_arcade_spec spec;
+  short glyph[5];
+  if(ghost_crown_load(root,area,physics,record)!=GHOST_STORE_OK)return 0;
+  if(menu_ghost_name_glyphs(glyph,record->name) &&
+     app_profile_bind(record,area,1,app_crown_source(area),1,&spec,binding) &&
+     car_ghost_arcade_validate_trail(binding,record->race.trail,record->race.trail_bytes))return 1;
+  ghost_crown_free(record);
+  return 0;
 }
 static void app_crown_directory(void) {
   const char *physics=car_ghost_physics_id(),*root=app_crown_root();
   if (!root || !physics) return;
   for (unsigned area=0;area<GHOST_CROWN_AREAS;++area) {
     ghost_crown_record record={0};
-    if (ghost_crown_load(root,area,physics,&record)!=GHOST_STORE_OK) continue;
-    short glyph[5];
-    car_ghost_arcade_spec spec;car_ghost_arcade_binding binding;
-    if (menu_ghost_name_glyphs(glyph,record.name) &&
-        app_profile_bind(&record,area,1,app_crown_source(area),1,&spec,&binding) &&
-        car_ghost_arcade_validate_trail(&binding,record.race.trail,record.race.trail_bytes))
+    car_ghost_arcade_binding binding;
+    if (app_crown_load_bound(root,physics,area,&record,&binding)) {
       app_profile_row(&record,area,area,MENU_GHOST_SOURCE_LOCAL_CROWN,&binding);
-    ghost_crown_free(&record);
+      ghost_crown_free(&record);
+    }
   }
 }
 
 static void app_crown_arm(void) {
   const menu_state *m=&G.menu;
-  int record=app_crown_root() && !m->save_skip && m->name[0]>=0 && AG.arcade_card_born>0;
+  int record=(AG.cloud_crown || app_crown_root()) && !m->save_skip && m->name[0]>=0 && AG.arcade_card_born>0;
   AG.crown_challenge=car_ghost_arm_local_crown(AG.token,record);
   if (AG.crown_challenge && record) AG.config.record_player=1;
 }
@@ -94,10 +110,10 @@ static int app_profile_requested(unsigned request,const ghost_crown_record *reco
     car_ghost_arcade_prepare(&spec,&binding);
   if (!ok) {
     car_ghost_clear();
-    (void)menu_ghost_complete(m,request,0,crown?"LOCAL CHAMPION RECORD CHANGED OR INVALID":"CLOUD REPLAY UNAVAILABLE");
+    (void)menu_ghost_complete(m,request,0,crown?"CHAMPION RECORD CHANGED OR INVALID":"CLOUD REPLAY UNAVAILABLE");
     return 0;
   }
-  if (!menu_ghost_complete(m,request,1,crown?"LOCAL CHAMPION PREPARED":"CLOUD REPLAY PREPARED") ||
+  if (!menu_ghost_complete(m,request,1,crown?"CHAMPION PREPARED":"CLOUD REPLAY PREPARED") ||
       !menu_ghost_begin_pre(m)) {
     app_ghost_clear();
     return 0;
@@ -188,12 +204,14 @@ static int app_ghost_capture_profile(int export_ready,ghost_crown_record *out) {
     app_replay_capture(out,(unsigned)AG.arcade_area,AG.token,car_ghost_export);
 }
 
-static const char *app_crown_publish(const ghost_crown_record *record, char *error, size_t error_size) {
+static const char *app_crown_publish(const ghost_crown_record *record, char *error, size_t error_size,
+                                    int *committed) {
   const char *root=app_crown_root();
   if (!root) return "LOCAL CROWN STORAGE UNAVAILABLE";
   if (!AG.config.record_player) return "LOCAL CROWN REQUIRES A REGISTERED CARD";
   if (!record) return "INCOMPLETE WINNER TRAIL - PREVIOUS CHAMPION KEPT";
   ghost_store_result result=ghost_crown_save(root,(unsigned)AG.arcade_area,record,AG.crown_revision);
+  *committed=result==GHOST_STORE_OK || result==GHOST_STORE_COMMITTED_UNSYNCED;
   if (result==GHOST_STORE_OK) return "LOCAL COURSE CHAMPION UPDATED";
   if (result==GHOST_STORE_COMMITTED_UNSYNCED) return "LOCAL CHAMPION UPDATED - DURABILITY UNCONFIRMED";
   snprintf(error, error_size, "CROWN SAVE FAILED - %s", ghost_store_error(result));

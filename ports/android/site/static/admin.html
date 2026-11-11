@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>管理 — Project Cinder</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap site-inner">
+    <a class="brand" href="/"><span class="mark"></span>PROJECT CINDER<small>ONLINE</small></a>
+    <nav class="main">
+      <a href="/">首页</a>
+      <a href="/ta">计时榜</a>
+      <a href="/ghost">店内鬼王</a>
+      <a href="/device">设备验证</a>
+      <a href="/admin" class="active">管理</a>
+      <a href="https://afdian.com/a/ProjectCinder">赞助</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap" style="max-width:760px">
+    <p class="eyebrow">Admin</p>
+    <h1>设备管理</h1>
+
+    <div id="login">
+      <p class="lead">输入管理口令以批准或撤销设备。</p>
+      <div class="card">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <input id="pw" type="password" placeholder="管理口令" autocomplete="current-password"
+                 style="flex:1;min-width:220px">
+          <button class="primary" id="login-btn">登录</button>
+        </div>
+        <div class="result" id="login-result"></div>
+      </div>
+    </div>
+
+    <div id="panel" class="hidden">
+      <div class="toolbar">
+        <span class="pill" id="count">0 台已授权</span>
+        <button class="ghost" id="logout">退出</button>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-bottom:14px">批准新设备</h3>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <input id="new-id" type="text" placeholder="32 位设备 ID" maxlength="32"
+                 style="flex:1;min-width:240px" spellcheck="false" autocomplete="off">
+          <button class="primary" id="allow-btn">批准</button>
+        </div>
+        <div class="result" id="action-result"></div>
+      </div>
+
+      <h2 class="mt">已授权设备</h2>
+      <div class="card" id="list" style="padding:6px 20px"></div>
+    </div>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">Project Cinder · 管理后台</div>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function say(el, ok, title, body) {
+  el.className = 'result show ' + (ok ? 'ok' : 'no');
+  el.innerHTML = `<div class="headline">${esc(title)}</div>${body || ''}`;
+}
+
+async function login() {
+  const password = $('pw').value;
+  if (!password) return;
+  $('login-btn').disabled = true;
+  try {
+    const r = await fetch('/api/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '登录失败');
+    $('login').classList.add('hidden');
+    $('panel').classList.remove('hidden');
+    load();
+  } catch (e) {
+    say($('login-result'), false, '登录失败', esc(e.message));
+  } finally {
+    $('login-btn').disabled = false;
+  }
+}
+
+async function load() {
+  const r = await fetch('/api/admin/devices');
+  if (r.status === 401) {
+    $('panel').classList.add('hidden');
+    $('login').classList.remove('hidden');
+    return;
+  }
+  const d = await r.json();
+  const items = d.devices || [];
+  $('count').textContent = items.length + ' 台已授权';
+  if (!items.length) {
+    $('list').innerHTML = '<p class="muted small" style="padding:14px 0">还没有已授权的设备。</p>';
+    return;
+  }
+  $('list').innerHTML = items.map(id => `<div class="device-row">
+      <span>${esc(id)}</span>
+      <button class="ghost danger" data-id="${esc(id)}">撤销</button>
+    </div>`).join('');
+  $('list').querySelectorAll('button[data-id]').forEach(b => {
+    b.onclick = () => act(b.dataset.id, 'revoke');
+  });
+}
+
+async function act(id, action) {
+  try {
+    const r = await fetch('/api/admin/device', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, action })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '操作失败');
+    say($('action-result'), true, action === 'allow' ? '已批准' : '已撤销', `<span class="mono small">${esc(id)}</span>`);
+    load();
+  } catch (e) {
+    say($('action-result'), false, '操作失败', esc(e.message));
+  }
+}
+
+$('login-btn').onclick = login;
+$('pw').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+$('allow-btn').onclick = () => {
+  const id = $('new-id').value.trim().toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(id)) {
+    say($('action-result'), false, '格式不对', '设备 ID 应该是 32 位小写十六进制字符。');
+    return;
+  }
+  act(id, 'allow');
+  $('new-id').value = '';
+};
+$('new-id').addEventListener('input', e => {
+  e.target.value = e.target.value.replace(/[^0-9a-fA-F]/g, '').slice(0, 32);
+});
+$('logout').onclick = () => { document.cookie = 'cinder_admin=; Max-Age=0; Path=/'; location.reload(); };
+
+fetch('/api/admin/devices').then(r => {
+  if (r.ok) { $('login').classList.add('hidden'); $('panel').classList.remove('hidden'); load(); }
+});
+</script>
+</body>
+</html>

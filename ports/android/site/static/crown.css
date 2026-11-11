@@ -1,0 +1,78 @@
+.crown-stage {
+  position: relative;
+  margin: 0 0 30px;
+  padding: clamp(14px, 3vw, 30px);
+  overflow: hidden;
+  border: 1px solid #3a3223;
+  border-radius: 18px;
+  background: radial-gradient(ellipse at 50% 28%, #2b2c2d 0, #101218 65%, #0d0f13 100%);
+  text-align: center;
+  scroll-margin-top: 112px;
+}
+.crown-banner {
+  display: block;
+  width: min(66%, 460px);
+  height: auto;
+  margin: 0 auto -1%;
+  position: relative;
+  z-index: 1;
+}
+.crown-area-picker { position: relative; width: min(100%, 780px); margin: 0 auto; }
+.crown-area-picker img { display: block; width: 100%; height: auto; }
+.crown-areas {
+  position: absolute;
+  inset: 0 3% 8%;
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+}
+.crown-areas button {
+  min-width: 0;
+  color: transparent;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.crown-areas button:focus-visible { outline: 2px solid #ffdb65; outline-offset: -3px; }
+.crown-arrow {
+  width: clamp(20px, 4vw, 39px);
+  aspect-ratio: 2;
+  margin: -2% auto 10px;
+  background: linear-gradient(135deg, #ffdb5c 34%, #fff7bd 49%, #bd7d13 78%);
+  clip-path: polygon(0 0, 25% 0, 50% 48%, 75% 0, 100% 0, 50% 100%);
+}
+.crown-display {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  align-items: center;
+  justify-items: center;
+  min-height: clamp(170px, 31vw, 320px);
+}
+.crown-driver { grid-area: 1 / 1; align-self: start; z-index: 1; text-shadow: 0 2px 4px #07080a; }
+.crown-course { color: #f4ca76; font-size: 0.8rem; }
+.crown-driver h2 { margin: 0.12em 0; font-size: clamp(1.6rem, 5vw, 2.75rem); }
+.crown-driver p { margin: 0; color: #d4dbe8; font-size: 0.9rem; }
+.crown-car {
+  grid-area: 2 / 1;
+  align-self: end;
+  width: min(100%, 510px);
+  height: auto;
+  animation: crown-appear 340ms ease-out both;
+}
+.crown-no-preview { grid-area: 2 / 1; align-self: end; margin-bottom: 32px; color: var(--muted); }
+.crown-stock-note { grid-area: 3 / 1; margin: 0; color: var(--muted); font-size: 0.8rem; }
+.crown-motion { margin-top: 8px; }
+.crown-view { margin-top: 14px; }
+.king-card .meta { flex-wrap: wrap; gap: 9px 20px; }
+.king-card .meta b { font-size: 14px; }
+@keyframes crown-appear {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .crown-car { animation: none; }
+}
+@media (max-width: 480px) {
+  .crown-stage { padding: 14px 8px; }
+  .crown-driver p { font-size: 0.75rem; }
+  .crown-display { min-height: 205px; }
+}

@@ -4,6 +4,7 @@ import argparse, csv, hashlib, os, re, struct
 from pathlib import Path
 
 SHA256 = "2e6591153d7e599437465f736a42e27b01a3b56c881bee58365fb21d0678b1f6"
+ROOT = Path("/Volumes/CodexWork")
 STORY = 0x973a5c0
 COUNTS = 0x93dd760
 GROUPS = 0x93dd780
@@ -104,11 +105,9 @@ def emit(rows):
 
 def main():
  ap=argparse.ArgumentParser(description=__doc__)
- ap.add_argument("--elf",required=True,type=Path);ap.add_argument("--menu",required=True,type=Path);ap.add_argument("--output",required=True,type=Path);ap.add_argument("--private-root",required=True,type=Path);ap.add_argument("--cross-check-csv",type=Path);a=ap.parse_args()
- root=a.private_root.resolve(strict=True); parent=a.output.parent.resolve(strict=True)
- if not root.is_dir(): raise Invalid("private root must be a directory")
- if not parent.is_relative_to(root) or a.output.name in ('', '.', '..'): raise Invalid("output must be inside private root")
- out=parent/a.output.name
+ ap.add_argument("--elf",required=True,type=Path);ap.add_argument("--menu",required=True,type=Path);ap.add_argument("--output",required=True,type=Path);ap.add_argument("--cross-check-csv",type=Path);a=ap.parse_args()
+ out=a.output.resolve(); root=ROOT.resolve(strict=True)
+ if not out.is_relative_to(root) or out==root: raise Invalid("output must be inside /Volumes/CodexWork")
  elf=Elf(a.elf.read_bytes());rows=extract(elf,parse_menu(a.menu.read_text(encoding="utf-8")))
  if a.cross_check_csv: check_csv(rows,a.cross_check_csv)
  fd=os.open(out,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)

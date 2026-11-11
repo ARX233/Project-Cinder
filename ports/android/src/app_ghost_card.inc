@@ -2,7 +2,7 @@
  * reported by challengers of this card's uploaded ghost. */
 static struct {
   char card[33],requested_card[33];
-  int waiting,visible;
+  int waiting,visible,crown_online;
   double refresh_after;
 } AGC;
 
@@ -37,12 +37,26 @@ static void app_ghost_card_defense(const unsigned char *packet,size_t bytes,
   memcpy(stats->defense_recent,recent,sizeof recent);
 }
 
+static unsigned app_ghost_local_crowns(void) {
+  const char *physics=car_ghost_physics_id(),*root=app_crown_root();
+  if(!root || !physics)return 0;
+  unsigned mask=0;
+  for(unsigned area=0;area<GHOST_CROWN_AREAS;++area) {
+    ghost_crown_record crown={0};
+    if(ghost_crown_load(root,area,physics,&crown)==GHOST_STORE_OK &&
+       car_ghost_crown_area_matches(area,(int)crown.raw_ramp) &&
+       app_replay_is_current_card(&crown))mask|=1u<<area;
+    ghost_crown_free(&crown);
+  }
+  return mask;
+}
+
 static void app_ghost_card_menu(void) {
   menu_state *m=&G.menu;
   char key[33]={0};
   int visible=m->screen==MENU_CARD && app_ghost_card_key(key);
   menu_card_ghost_stats *stats=&m->card_ghost_stats;
-  if(visible && (!AGC.visible || strcmp(key,AGC.card))) {
+  if(visible && (!AGC.visible || strcmp(key,AGC.card) || AGC.crown_online!=GC.crown_online)) {
     memset(stats,0,sizeof *stats);
     memcpy(AGC.card,key,sizeof key);
     AGC.refresh_after=0;
@@ -54,17 +68,12 @@ static void app_ghost_card_menu(void) {
     /* finiTarget grants one Maxi Coin on ordinary wins. Existing local
      * history never enabled the original revenge bonus. */
     stats->coins=wins>999999u?999999u:(unsigned)wins;
-    const char *physics=car_ghost_physics_id(),*root=app_crown_root();
-    if(root && physics) {
-      for(unsigned area=0;area<GHOST_CROWN_AREAS;++area) {
-        ghost_crown_record crown={0};
-        if(ghost_crown_load(root,area,physics,&crown)==GHOST_STORE_OK &&
-           app_replay_is_current_card(&crown)) stats->crown_mask|=1u<<area;
-        ghost_crown_free(&crown);
-      }
-    }
+    if(!android_ghost_cloud_configured()) stats->crown_mask=app_ghost_local_crowns();
   } else if(!visible && AGC.visible) memset(stats,0,sizeof *stats);
+  if(visible && GC.crown_online)
+    stats->crown_mask=GC.crown_ready && !strcmp(key,GC.crown_card)?GC.crown_owned:0;
   AGC.visible=visible;
+  AGC.crown_online=GC.crown_online;
   if(AGC.waiting) {
     unsigned char *packet=NULL;
     size_t bytes=0;

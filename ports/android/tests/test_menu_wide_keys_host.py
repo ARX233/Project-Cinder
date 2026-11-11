@@ -3,7 +3,7 @@
 
 No GPU/device/resource reads: both backends' real primitives are recorded on CPU.
 An optional CINDER_HUD_BASELINE directory provides unchanged hud.c/native .inc for
-byte-exact zero-edge command comparison. Private headers are compile inputs only.
+byte-exact comparison of unchanged controls. Private headers are compile inputs only.
 """
 from pathlib import Path
 import hashlib
@@ -44,7 +44,7 @@ GLuint gl_compile_program(const char *,const char *,const char **,int);
 typedef struct {int topology,count;float xy[132],projection[16],rgba[4];} command;
 static command commands[128],zero[128];
 static int command_n,zero_n;
-static uint64_t zero_digest=1469598103934665603ULL;
+static uint64_t zero_digest=1469598103934665603ULL,stable_digest=1469598103934665603ULL;
 static void near(float a,float b){assert(fabsf(a-b)<.002f);}
 static void reset_capture(void){command_n=0;memset(commands,0,sizeof commands);}
 static void record(int topology,int count,const float *xy,const float *projection,const float *rgba){
@@ -91,11 +91,12 @@ static void draw_case(int op,int held){
   else if(op==1)hud_draw_menu_dress(1024,768,held);
   else if(op==2)hud_draw_menu_hidden(1024,768,held);
   else if(op==3||op==4)hud_draw_menu_erase(1024,768,held,op==4);
-  else hud_draw_menu_keys(1024,768,held,op==5||op==6,op==5||op==7);
+  else hud_draw_menu_keys(1024,768,held,(op==5||op==6) ? (MID_KEYS ? 3 : 1) : 0,op==5||op==7);
 }
 static float expected_shift(int op,int draw,float edge){
   if(op==2||op==8)return 0;
   if(op<=4||op==7)return edge;
+  if(MID_KEYS)return draw<2?-edge*.5f:draw<4?edge*.5f:edge;
   /* Actual production draw order: left panel, right panel, their chevrons,
    * then the return panel and glyph. Every panel has three primitives. */
   return draw<3||draw==6?-edge:edge;
@@ -112,11 +113,15 @@ static void compare_wide(int op,float edge){
 }
 static void hit_contract(float edge){
   const rect base[5]={MENU_LEFT,MENU_RIGHT,MENU_BACK,MENU_OPTION,MENU_HIDDEN};
+  if (EXPECT_WIDE) near(MENU_HIDDEN.y+MENU_HIDDEN.h*.5f,MENU_FOOTER_CENTER*1.6f);
+#if !MID_KEYS
+  if (EXPECT_WIDE) near(MENU_LEFT.y+MENU_LEFT.h*.5f,MENU_FOOTER_CENTER*1.6f);
+#endif
   const int answer[5]={-1,1,HUD_MENU_BACK,HUD_MENU_OPTION,HUD_MENU_HIDDEN};
   for(int i=0;i<5;++i){
-    rect r=base[i];r.x+=i==0?-edge:i<4?edge:0;
+    rect r=base[i];r.x+=i==0?-edge*(MID_KEYS?.5f:1):i==1?edge*(MID_KEYS?.5f:1):i<4?edge:0;
     assert(hud_menu_key(r.x+r.w*.5f,r.y+r.h*.5f)==answer[i]);
-    float slop=i<2?14:0;
+    float slop=i<2?(MID_KEYS?4:14):0;
     assert(hud_menu_key(r.x-slop,r.y+r.h*.5f)==answer[i]);
     assert(hud_menu_key(r.x+r.w+slop,r.y+r.h*.5f)==answer[i]);
     assert(hud_menu_key(r.x-slop-.25f,r.y+r.h*.5f)!=answer[i]);
@@ -129,11 +134,27 @@ static void hit_contract(float edge){
   }
 }
 static void menu_matrix(void){
+  if(MID_KEYS){
+    hud_wide(160,1);
+    assert(hud_menu_key(112-160,680)==0&&hud_menu_key(900+160,680)==0);
+    for(int side=0;side<2;++side){
+      reset_capture();hud_draw_menu_keys(1024,768,0,1<<side,0);
+      assert(command_n==2&&commands[1].topology==1&&commands[1].count==24);
+      near(commands[1].rgba[0],1);near(commands[1].rgba[1],1);near(commands[1].rgba[2],1);
+      assert(commands[1].rgba[3]>.95f);
+      for(int i=0;i<24;++i)
+        assert(hud_menu_key(commands[1].xy[i*2],commands[1].xy[i*2+1])==(side?1:-1));
+    }
+  }
   const int helds[]={-1,0,1,HUD_MENU_BACK,HUD_MENU_OPTION,HUD_MENU_HIDDEN};
   const float sizes[][2]={{1024,768},{1920,1080},{2160,1080},{2340,1080},{2400,1080},{1920,882}};
   for(int op=0;op<9;++op)for(unsigned h=0;h<sizeof helds/sizeof *helds;++h){
     hud_wide(0,1);reset_capture();draw_case(op,helds[h]);zero_n=command_n;memcpy(zero,commands,sizeof zero);
-    for(size_t i=0;i<(size_t)command_n*sizeof(command);++i)zero_digest=(zero_digest^((const unsigned char *)commands)[i])*1099511628211ULL;
+    for(size_t i=0;i<(size_t)command_n*sizeof(command);++i){
+      unsigned char byte=((const unsigned char *)commands)[i];
+      zero_digest=(zero_digest^byte)*1099511628211ULL;
+      if(op!=2&&(MID_KEYS||(op!=5&&op!=6)))stable_digest=(stable_digest^byte)*1099511628211ULL;
+    }
 #if EXPECT_WIDE
     for(unsigned s=0;s<sizeof sizes/sizeof *sizes;++s){
       float edge=(sizes[s][0]*768/sizes[s][1]-1024)*.5f;
@@ -141,7 +162,7 @@ static void menu_matrix(void){
     }
 #endif
   }
-  printf("ZERO_DIGEST %llu\n",(unsigned long long)zero_digest);
+  printf("ZERO_DIGEST %llu\nSTABLE_DIGEST %llu\n",(unsigned long long)zero_digest,(unsigned long long)stable_digest);
   (void)sizes;
 }
 #if EXPECT_WIDE
@@ -218,8 +239,8 @@ int main(void){prog=1;menu_matrix();
 '''
 
 
-def run(source_dir, native, changed, temporary):
-    source = temporary / f"menu-{native}-{changed}.c"
+def run(source_dir, native, changed, temporary, mid=False):
+    source = temporary / f"menu-{native}-{changed}-{mid}.c"
     source.write_text(PREFIX)
     binary = source.with_suffix("")
     flags = ["-I", str(ROOT / "src"), "-I", str(ROOT / "test")]
@@ -231,22 +252,27 @@ def run(source_dir, native, changed, temporary):
                "-Werror", "-Wno-unused-function", "-Wno-unused-parameter", "-fsanitize=undefined", "-fno-sanitize-recover=all",
                "-ffunction-sections", "-fdata-sections", *gc, *flags,
                f'-DHUD_SOURCE="{source_dir / "hud.c"}"', f"-DTEST_NATIVE={native}",
-               f"-DEXPECT_WIDE={changed}", str(source), "-lm", "-lz", "-o", str(binary)]
+               f"-DEXPECT_WIDE={changed}", f"-DMID_KEYS={int(mid)}",
+               *(["-DWMMT_MID_MENU_KEYS_TEST"] if mid else []), str(source), "-lm", "-lz", "-o", str(binary)]
     env = dict(os.environ, TMPDIR=str(TMP), TMP=str(TMP), TEMP=str(TMP),
                UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1", PYTHONDONTWRITEBYTECODE="1")
     subprocess.run(command, check=True, cwd=temporary, env=env, timeout=120)
     result = subprocess.run([str(binary)], check=True, cwd=temporary, env=env,
                             text=True, stdout=subprocess.PIPE, timeout=30)
-    print(f"{'NativeVulkan' if native else 'GLES'} {'updated' if changed else 'baseline'}\n{result.stdout}", end="")
-    return re.search(r"ZERO_DIGEST (\d+)", result.stdout).group(1)
+    print(f"{'NativeVulkan' if native else 'GLES'} {'middle row' if mid else 'legacy'}\n{result.stdout}", end="")
+    return tuple(re.search(rf"{kind}_DIGEST (\d+)", result.stdout).group(1) for kind in ("ZERO", "STABLE"))
 
 
 with tempfile.TemporaryDirectory(prefix="menu-wide-keys-", dir=TMP) as directory:
     directory = Path(directory)
     digests = [run(ROOT / "src", native, 1, directory) for native in (0, 1)]
+    assert digests[0] == digests[1], "zero-edge full command stream differs between backends"
+    print("PASS exact zero-edge command digest", digests[0][0], "(both backends)")
     if BASELINE is not None:
-        digests += [run(BASELINE, native, 0, directory) for native in (0, 1)]
-    assert len(set(digests)) == 1, "zero-edge full command stream differs between source/backend/baseline"
-    print("PASS exact zero-edge command digest", digests[0], "(both backends" + (" + unchanged baseline)" if BASELINE else ")"))
+        baseline = [run(BASELINE, native, 0, directory)[1] for native in (0, 1)]
+        assert all(digest == digests[0][1] for digest in baseline), "unchanged control stream differs from baseline"
+        print("PASS zero-edge digest for controls outside the footer", digests[0][1])
+    middle = [run(ROOT / "src", native, 1, directory, mid=True) for native in (0, 1)]
+    assert middle[0] == middle[1], "middle-row command stream differs between backends"
 for name in ("hud.c", "hud_native_vk.inc"):
     print(name, "sha256", hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest())

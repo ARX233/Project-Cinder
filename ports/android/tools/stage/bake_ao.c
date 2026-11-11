@@ -40,8 +40,11 @@ typedef struct { float a[3], e1[3], e2[3]; } tri;
 typedef struct { float lo[3], hi[3]; int first, count; } node; /* count 0: inner, its left child next, first the right one */
 typedef struct { tri *t; int n; node *nodes; int n_nodes; int *order; } bvh;
 
-static uint8_t *file;
-static size_t file_size;
+#ifndef AO_JOB_STORAGE
+#define AO_JOB_STORAGE
+#endif
+static AO_JOB_STORAGE uint8_t *file;
+static AO_JOB_STORAGE size_t file_size;
 
 static float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static void cross3(const float *a, const float *b, float *o) {
@@ -53,8 +56,8 @@ static void norm3(float *a) {
 }
 
 /* ---- the triangles' tree (median splits on the longest axis of the centres) ---- */
-static float *cen;
-static int axis_sort;
+static AO_JOB_STORAGE float *cen;
+static AO_JOB_STORAGE int axis_sort;
 static int by_axis(const void *x, const void *y) {
   float a = cen[3 * *(const int *)x + axis_sort], b = cen[3 * *(const int *)y + axis_sort];
   return a < b ? -1 : a > b;
@@ -190,7 +193,7 @@ static int add_tris(const batch *bs, int nb, int want_group, tri **out, int *n, 
   return 0;
 }
 
-static uint32_t rng_state;
+static AO_JOB_STORAGE uint32_t rng_state;
 static float rnd(void) {
   rng_state ^= rng_state << 13, rng_state ^= rng_state >> 17, rng_state ^= rng_state << 5;
   return (float)(rng_state >> 8) / 16777216.0f;

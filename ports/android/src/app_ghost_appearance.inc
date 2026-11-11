@@ -5,6 +5,7 @@ static struct {ghost_paint_reader*reader;app_ghost_paint_cache cache;uint64_t co
 
 /* The rival spin box shows up to six actual models during a slide. Preview
  * cache entries belong to those visible materials, never the player's paint. */
+static int app_arcade_paint_apply(wpk_scene *scene,app_ghost_paint_scope *scope,app_player_paint_scope *local_scope);
 static app_ghost_paint_cache ghost_preview_paint[6];
 static int ghost_preview_base_paint[6];
 /* A locally saved champion uses the verified MAIN paint pages it raced with.
@@ -12,6 +13,7 @@ static int ghost_preview_base_paint[6];
 static player_body_paint_cache local_crown_preview_paint,local_crown_race_paint;
 
 static int app_ghost_preview_is_local(const menu_car *car) {
+ if (car->ghost_row<0) return 1; /* standby profiles carry the MAIN paint identity */
  unsigned kind=G.menu.ghost.directory.rows[car->ghost_row-1].source_kind;
  return kind==MENU_GHOST_SOURCE_LOCAL_CROWN || kind==MENU_GHOST_SOURCE_CLOUD;
 }
@@ -48,6 +50,8 @@ static app_ghost_paint_cache *app_ghost_preview_cache(const menu_car *car,const 
 }
 
 static void app_ghost_preview_prepare(const menu_scene *shown) {
+ /* The matchup uses the frozen rival material already prepared for the race. */
+ if (menu_ghost_preparing(&G.menu)) shown=NULL;
  unsigned keep=0;
  int local_visible=0;
  for (int i=0;shown&&i<shown->n;++i) {
@@ -104,6 +108,7 @@ static int app_ghost_preview_apply(const menu_car *car,wpk_scene *scene,story_bo
  if (!area || !story_body_view_capture_model(body,area->pack,(int)area->raw_model,area->native_type,
                                             area->power,area->handling,0)) return 0;
  if (!area->custom_color) return 1;
+ if (menu_ghost_preparing(&G.menu)) return app_arcade_paint_apply(scene,scope,local_scope);
  if (app_ghost_preview_is_local(car)) {
   menu_body_color_view v=app_ghost_local_preview_view(area);
   player_body_paint_apply(&local_crown_preview_paint,app_body_identity(&v),scene,local_scope);
@@ -145,7 +150,14 @@ static int app_arcade_appearance_ready(void){
  if(pack<0||pack>=NPACKS||G.seen.pack[pack]!=1||!paint_ready(pack,AG.rival_paint)||aero_id<0||aero_id>3)return 0;
  wpk_scene*stock=car_pack(pack),*aero=NULL,*scene=stock;if(!stock||stock==&G.fd3s)return 0;
  if(aero_id){menu_aero_want(pack,aero_id);aero=menu_aero(pack,aero_id);if(!aero)return 0;scene=aero;}
- vs_dress_t d;app_ghost_arcade_apply_dress(&d);if(d.wheel&&!wheel_model(d.wheel))return 0;
+ vs_dress_t d;
+ app_ghost_arcade_apply_dress(&d);
+ if (d.wheel && !wheel_model(d.wheel)) {
+  int slot = wheel_find(d.wheel);
+  /* Existing verified packs predate this model. The stock rim is only a
+   * visual fallback; the rival identity, tyres and route stay bound. */
+  if (d.wheel != MENU_WHEEL_LEMANS || slot < 0 || G.wheel_state[slot] != WHEEL_MISSING) return 0;
+ }
  car_paint_for_draw(stock,aero,AG.rival_paint);
  if(!AG.arcade_binding.custom_color){
   if(d.vinyl){const char*page=NULL;uint32_t texture=vinyl_tex(pack,aero_id,AG.rival_paint,d.vinyl,d.bonnet,&page);

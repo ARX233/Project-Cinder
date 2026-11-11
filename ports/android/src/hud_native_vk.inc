@@ -574,9 +574,24 @@ void hud_draw_menu_erase(float screen_w, float screen_h, int held, int armed) {
 }
 
 void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int back) {
-  rect left = menu_place(MENU_LEFT, KEY_LEFT), right = menu_place(MENU_RIGHT, KEY_RIGHT);
+  rect left = menu_arrow_place(MENU_LEFT, -1), right = menu_arrow_place(MENU_RIGHT, 1);
   rect ret = menu_place(MENU_BACK, KEY_RIGHT);
   hud_native_paint paint = hud_native_paint_for(screen_ortho(screen_w, screen_h));
+#if defined(__ANDROID__) || defined(WMMT_MID_MENU_KEYS_TEST)
+  for (int i = 0; i < 2; ++i) {
+    if (!(keys & (1 << i))) continue;
+    int direction = i ? 1 : -1;
+    rect r = i ? right : left;
+    float v[48];
+    menu_arrow_vertices(r, direction, 2, v);
+    paint.mul = (hud_native_rgba){0.13f, 0.13f, 0.15f, 0.65f};
+    hud_native_solid(paint, v, sizeof v, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 24);
+    menu_arrow_vertices(r, direction, 0, v);
+    float shade = held == direction ? 0.78f : 1.0f;
+    paint.mul = (hud_native_rgba){shade, shade, shade, 0.97f};
+    hud_native_solid(paint, v, sizeof v, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 24);
+  }
+#else
   if (keys) {
     hud_native_button(paint, left, held < 0);
     hud_native_button(paint, right, held == 1);
@@ -584,6 +599,7 @@ void hud_draw_menu_keys(float screen_w, float screen_h, int held, int keys, int 
     hud_native_chevron(paint, left.x + left.w / 2 - 6, left.y + left.h / 2, 22, -1, 0);
     hud_native_chevron(paint, right.x + right.w / 2 + 6, right.y + right.h / 2, 22, 1, 0);
   }
+#endif
   if (back) {
     /* a return arrow: shaft and hook, with a chevron head pointing left */
     hud_native_button(paint, ret, held == HUD_MENU_BACK);

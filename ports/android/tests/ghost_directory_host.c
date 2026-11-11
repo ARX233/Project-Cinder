@@ -10,7 +10,7 @@ static unsigned draw_calls,part_calls,source_hits,source_draws;
 static int saw_disabled_history,saw_disabled_revenge,saw_win,saw_lose,last_result_frame;
 static int topbar_message;
 static unsigned menu_option_draws;
-static int crown_sprite_drawn;
+static int crown_sprite_drawn, ghost_vs_drawn, matchup_quads;
 static float crown_sprite_bounds[4];
 static FILE *trace_file;
 static int collect_fields,field_count,field_parts[20],no_date_digits;
@@ -55,7 +55,8 @@ void anm_draw_xy(int a,int f,float alpha,float x,float y,float sx,float sy,const
 void anm_draw_xf(int a,int f,float alpha,float x,float y,float z,const anm_swap*s,int n){trace_anm(a,f,alpha,x,y,z,s,n);observe(a,f);}
 void anm_draw_sprite(int s,float x,float y,float a){(void)s;(void)x;(void)y;(void)a;++part_calls;}
 void anm_draw_part(int s,const float src[4],const float dst[4],float a){
- if(s>=1737&&s<=1744){crown_sprite_drawn=s;memcpy(crown_sprite_bounds,dst,sizeof crown_sprite_bounds);}
+ if((s>=1737&&s<=1744)||(s>=1773&&s<=1781)){crown_sprite_drawn=s;memcpy(crown_sprite_bounds,dst,sizeof crown_sprite_bounds);}
+ if(s==4868)ghost_vs_drawn=1;
  if(collect_fields){assert(field_count<COUNT(field_parts));field_parts[field_count++]=s;}
  if(trace_file)fprintf(trace_file,"{\"part\":%d,\"src\":[%.9g,%.9g,%.9g,%.9g],\"dst\":[%.9g,%.9g,%.9g,%.9g],\"alpha\":%.9g}\n",s,src[0],src[1],src[2],src[3],dst[0],dst[1],dst[2],dst[3],a);
 for(int i=0;i<4;++i)assert(isfinite(src[i])&&isfinite(dst[i]));assert(src[2]>src[0]&&src[3]>src[1]);++part_calls;}
@@ -63,6 +64,11 @@ void anm_fill(float r,float g,float b,float a){(void)r;(void)g;(void)b;(void)a;}
 float anm_edge(void){return test_edge*1.6f;}
 void hud_ui_begin(float w,float h){assert(w>0&&h>0);}
 void hud_ui_end(void){}
+void hud_ui_quad(const float xy[8],float r,float g,float b,float a){
+ (void)r;(void)g;(void)b;(void)a;
+ for(int i=0;i<8;++i)assert(isfinite(xy[i]));
+ ++matchup_quads;
+}
 float hud_ui_text_width(const char*s,float px){return (float)strlen(s)*8*px;}
 float hud_ui_text(const char*s,float x,float y,float px,float r,float g,float b,float a){(void)y;(void)r;(void)g;(void)b;(void)a;return x+hud_ui_text_width(s,px);}
 void hud_draw_menu_keys(float w,float h,int held,int keys,int back){(void)w;(void)h;(void)held;(void)keys;(void)back;}
@@ -294,7 +300,21 @@ int main(void){
   assert(menu_ghost_complete(&m,id,1,NULL)&&!menu_ghost_complete(&m,id,1,NULL));assert(menu_ghost_begin_pre(&m)&&menu_ghost_preparing(&m));menu_ghost_open(&m);assert(!menu_ghost_complete(&m,id,1,"STALE")&&!menu_ghost_begin_pre(&m));++admitted;
  }
  assert(admitted==1267);
- selected_profile(&m,0,0);assert(menu_ghost_request(&m,6));unsigned id=0;assert(menu_ghost_take_action(&m,&id)==6);assert(menu_ghost_complete(&m,id,1,NULL)&&menu_ghost_begin_pre(&m));tick(&m,600);assert(!m.ghost.pre_go);m.ready=1;assert(menu_update(&m,1.0f/60.0f)==1&&m.ghost.pre_go);tick(&m,600);
+ selected_profile(&m,0,0);assert(menu_ghost_request(&m,6));unsigned id=0;assert(menu_ghost_take_action(&m,&id)==6);assert(menu_ghost_complete(&m,id,1,NULL)&&menu_ghost_begin_pre(&m));tick(&m,600);assert(!m.ghost.pre_go && !m.ghost.intro_t);
+ m.ready=1;tick(&m,1);
+ menu_scene start,held;
+ assert(menu_scene3d(&m,&start) && start.n==2 && start.env==4);
+ assert(start.cars[1].pack==REAL_ROWS[0].areas[0].pack && start.cars[1].ghost_row==1);
+ assert(start.cars[0].model[12]<0 && start.cars[0].model[12]==-start.cars[1].model[12]);
+ assert(start.cars[0].turned && start.cars[1].turned);
+ tick(&m,79); assert(m.ghost.intro_t==80);
+ assert(menu_scene3d(&m,&held) && held.eye[1]<start.eye[1] && held.cars[1].model[14]>start.cars[1].model[14]);
+ m.ready=0;tick(&m,5);assert(m.ghost.intro_t==80);m.ready=1;
+ ghost_intro_grid(&m,1024,768);assert(matchup_quads>=35);
+ ghost_vs_drawn=0;crown_sprite_drawn=0;
+ tick(&m,52);ghost_intro_overlay(&m,1024,768);assert(ghost_vs_drawn && !crown_sprite_drawn);
+ tick(&m,88);assert(m.ghost.intro_t==220);
+ assert(menu_update(&m,1.0f/60.0f)==1&&m.ghost.pre_go);tick(&m,600);
  menu_ghost_race_finished(&m,MENU_GHOST_RESULT_LOSE,0);
  assert(m.ghost.ui.page==GHOST_UI_SEARCH&&m.ghost.result==MENU_GHOST_RESULT_LOSE&&!m.ghost.claim_eligible);
  selected_profile(&m,0,0);assert(menu_ghost_request(&m,6));id=0;assert(menu_ghost_take_action(&m,&id)==6);++view.epoch;assert(menu_ghost_set_directory(&m,&view));assert(!menu_ghost_complete(&m,id,1,NULL)&&!m.ghost.active_request);

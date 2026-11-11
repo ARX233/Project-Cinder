@@ -50,12 +50,11 @@ static void app_arcade_unbind(void) {
   app_arcade_paint_close(0);
   ghost_catalog_close(AC.catalog);
   uint64_t serial=AC.epoch;
-  app_cloud_close();
   memset(&AC,0,sizeof AC); AC.epoch=serial; AC.history_slot=-1;
 }
 void app_ghost_release_assets(int context_lost) {
   app_arcade_paint_close(context_lost!=0);
-  app_ghost_clear();app_arcade_unbind();AG.entered=0;
+  app_ghost_clear();app_arcade_unbind();app_cloud_close();AG.entered=0;
 }
 static int app_arcade_path(char *path,size_t capacity) {
 #ifdef __ANDROID__
@@ -66,37 +65,37 @@ static int app_arcade_path(char *path,size_t capacity) {
   return n>0 && (size_t)n<capacity; /* exact external pin still mandatory on non-Android */
 #endif
 }
+static void app_arcade_open(void) {
+  AC.attempted=1; AC.history_slot=-1;
+  char path[4096];
+  if(!app_arcade_path(path,sizeof path)) return;
+  ghost_catalog_result result=ghost_catalog_open_verified(path,GHOST_CATALOG_APPROVED_SHA256,&AC.catalog);
+  if(result!=GHOST_CATALOG_OK || ghost_catalog_count(AC.catalog)!=GHOST_CATALOG_RECORDS) {
+    ghost_catalog_close(AC.catalog); AC.catalog=NULL;
+    app_ghost_note("ORIGINAL GHOST DATA UNAVAILABLE OR UNVERIFIED"); return;
+  }
+  if(!app_arcade_paint_open()) {
+    app_arcade_paint_close(0);ghost_catalog_close(AC.catalog);AC.catalog=NULL;
+    app_ghost_note("ORIGINAL CUSTOM PAINT DATA REJECTED");return;
+  }
+  memset(AC.rows,0,sizeof AC.rows);
+  for(unsigned i=0;i<GHOST_CATALOG_RECORDS;i++) {
+    const ghost_catalog_record_view *r=ghost_catalog_record(AC.catalog,i);
+    menu_ghost_directory_row *row=&AC.rows[i];
+    row->record_index=i;row->id_devel=r->id_devel;row->id1=r->id1;row->id2=r->id2;
+    memcpy(row->name,r->name,sizeof row->name);
+    for(unsigned a=0;a<GHOST_CATALOG_AREAS;a++) { row->areas[a].level=-1;row->areas[a].pack=-1; }
+  }
+  app_ghost_note("VERIFYING ORIGINAL NATIVE ROUTES AND CAR PROFILES");
+}
 static void app_arcade_directory(void) {
   menu_state *m=&G.menu;
   if(m->screen!=MENU_GHOST || m->ghost.ui.page==GHOST_UI_RESULT || AG.prepared || AG.active || m->ghost.active_request) return;
-  if(!AC.attempted) {
-    AC.attempted=1; AC.history_slot=-1;
-    char path[4096];
-    if(!app_arcade_path(path,sizeof path)) return;
-    ghost_catalog_result result=ghost_catalog_open_verified(path,GHOST_CATALOG_APPROVED_SHA256,&AC.catalog);
-    if(result!=GHOST_CATALOG_OK || ghost_catalog_count(AC.catalog)!=GHOST_CATALOG_RECORDS) {
-      ghost_catalog_close(AC.catalog); AC.catalog=NULL;
-      app_ghost_note("ORIGINAL GHOST DATA UNAVAILABLE OR UNVERIFIED"); return;
-    }
-    if(!app_arcade_paint_open()) {
-      app_arcade_paint_close(0);ghost_catalog_close(AC.catalog);AC.catalog=NULL;
-      app_ghost_note("ORIGINAL CUSTOM PAINT DATA REJECTED");return;
-    }
-    if(++AC.epoch==0) ++AC.epoch;
-    memset(AC.rows,0,sizeof AC.rows);
-    for(unsigned i=0;i<GHOST_CATALOG_RECORDS;i++) {
-      const ghost_catalog_record_view *r=ghost_catalog_record(AC.catalog,i);
-      menu_ghost_directory_row *row=&AC.rows[i];
-      row->record_index=i;row->id_devel=r->id_devel;row->id1=r->id1;row->id2=r->id2;
-      memcpy(row->name,r->name,sizeof row->name);
-      for(unsigned a=0;a<GHOST_CATALOG_AREAS;a++) { row->areas[a].level=-1;row->areas[a].pack=-1; }
-    }
-    app_ghost_note("VERIFYING ORIGINAL NATIVE ROUTES AND CAR PROFILES");
-  }
-  if(!AC.catalog) return;
+  if(!AC.attempted) app_arcade_open();
+  unsigned profiles=AC.catalog?GHOST_CATALOG_RECORDS*GHOST_CATALOG_AREAS:0;
   /* Budget expensive original native lookups; unpublished rows are never read by
    * menu. Rendering/presentation frequency does not advance the physics world. */
-  for(unsigned budget=0;budget<32 && AC.next_profile<GHOST_CATALOG_RECORDS*GHOST_CATALOG_AREAS;budget++,AC.next_profile++) {
+  for(unsigned budget=0;budget<32 && AC.next_profile<profiles;budget++,AC.next_profile++) {
     unsigned i=AC.next_profile/GHOST_CATALOG_AREAS,a=AC.next_profile%GHOST_CATALOG_AREAS;
     const ghost_catalog_record_view *r=ghost_catalog_record(AC.catalog,i);
     if(r->areas[a].trail.blob_index==GHOST_CATALOG_NO_BLOB) continue;
@@ -105,7 +104,7 @@ static void app_arcade_directory(void) {
     menu_ghost_directory_area *d=&AC.rows[i].areas[a];
     d->level=b.target_level;d->native_available=1;d->ramp=b.ramp;d->route=spec.raw_route;
     d->pack=b.pack;d->paint=b.paint;d->raw_model=spec.raw_model_id;
-    d->power=b.rival.power;d->handling=b.rival.handling;d->title=r->areas[a].title_;
+    d->power=b.rival.power;d->handling=b.rival.handling;d->title=r->areas[a].title_;d->class_id=r->areas[a].class_;
     const ghost_catalog_area *style=&r->areas[a];
     d->native_type=(int)b.rival.type;d->base_paint=b.base_paint;d->custom_color=b.custom_color;
     d->aero=(int)style->aero_;d->mirror=(int)style->aero_mirror_;
@@ -118,18 +117,23 @@ static void app_arcade_directory(void) {
       d->recorded=app_ghost_record_date(style->year_,style->month_,style->day_,style->hour_,style->minute_);
     AC.bound_profiles++;
   }
-  if(AC.next_profile<GHOST_CATALOG_RECORDS*GHOST_CATALOG_AREAS) return;
-  if(!AC.default_filled){AC.base_rows=AC.row_count=app_default_directory_fill(GHOST_CATALOG_RECORDS);AC.default_filled=1;}
+  if(AC.next_profile<profiles) return;
+  if(!AC.default_filled){AC.base_rows=AC.row_count=app_default_directory_fill(AC.catalog?GHOST_CATALOG_RECORDS:0);AC.default_filled=1;}
   app_arcade_history_sync();
-  if(!AC.published || m->ghost.directory.rows!=AC.rows || m->ghost.directory.epoch!=AC.epoch) {
+  if(!AC.published || (AC.row_count &&
+      (m->ghost.directory.rows!=AC.rows || m->ghost.directory.epoch!=AC.epoch))) {
     /* Result is dismissed before a new view is published. Detach the borrowed
      * immutable old view before changing its current-card history flags. */
     if(m->ghost.directory.rows==AC.rows) menu_ghost_set_directory(m,NULL);
     AC.row_count=AC.base_rows;
-    app_crown_directory();
+    if(GC.crown_online)app_cloud_crown_directory();
+    else app_crown_directory();
     app_cloud_directory();
     app_replay_directory();
+    if(!AC.epoch)AC.epoch=1;
     AC.view.rows=AC.rows;AC.view.count=AC.row_count;AC.view.epoch=AC.epoch;AC.view.player_level=-1;
+    AC.view.cloud_crowns=GC.crown_online;AC.view.cloud_crowns_ready=GC.crown_ready;
+    AC.view.cloud_crown_occupied=GC.crown_occupied;
     AC.view.player_history_available=0;AC.view.player_revenge_available=0;
     uint64_t wins=app_arcade_history_totals(NULL);
     for(unsigned i=0;i<AC.base_rows;i++)for(unsigned a=0;a<GHOST_CATALOG_AREAS;a++) {
@@ -140,10 +144,13 @@ static void app_arcade_directory(void) {
     }
     int power,handling,rank;menu_tune(m,&power,&handling);
     (void)car_ghost_arcade_difficulty(power,handling,wins>UINT32_MAX?UINT32_MAX:(uint32_t)wins,&AC.view.player_level,&rank);
-    menu_ghost_set_directory(m,&AC.view);AC.published=1;
-    if(!AC.failed_profiles && AC.bound_profiles==GHOST_CATALOG_TRAILS) m->ghost.note[0]=0;
-    else app_ghost_note("SOME ORIGINAL PROFILES ARE NOT NATIVE-COMPATIBLE");
-    if (GC.count) app_ghost_note("CLOUD REPLAYS ADDED TO LEVEL AND NAME SEARCH");
+    if(AC.row_count)menu_ghost_set_directory(m,&AC.view);
+    AC.published=1;
+    if(AC.catalog) {
+      if(!AC.failed_profiles && AC.bound_profiles==GHOST_CATALOG_TRAILS) m->ghost.note[0]=0;
+      else app_ghost_note("SOME ORIGINAL PROFILES ARE NOT NATIVE-COMPATIBLE");
+    }
+    if (app_cloud_visible()->count) app_ghost_note("CLOUD REPLAYS ADDED TO LEVEL AND NAME SEARCH");
     if (AC.crown_note[0]) {app_ghost_note(AC.crown_note);AC.crown_note[0]=0;}
   }
 }

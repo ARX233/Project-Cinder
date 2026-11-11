@@ -14,8 +14,8 @@ import java.security.SecureRandom;
 
 /** Installation-scoped identity stored separately from game saves and resources. */
 final class CloudDevice {
-    // Set these when the public service has its own domain. Either service can be left disabled.
-    static final String CLOUD_ORIGIN = "";
+    static final String CLOUD_ORIGIN = "https://niceapi.net";
+    // Room matches use a separate UDP server.
     static final String ONLINE_VS_DOMAIN = "";
 
     private final String secret;
